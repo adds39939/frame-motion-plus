@@ -1,0 +1,26 @@
+# Build output
+artifacts/
+[Bb]in/
+[Oo]bj/
+[Pp]ublish/
+*.nupkg
+*.snupkg
+
+# NVIDIA VFX SDK binaries (proprietary, downloaded locally, never committed)
+/lib/
+
+# Test results and coverage
+TestResults/
+*.trx
+coverage*.xml
+*.coverage
+
+# IDE and editor state
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+.DS_Store

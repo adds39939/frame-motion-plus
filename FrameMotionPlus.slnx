@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="global.json" />
+    <File Path="nuget.config" />
+    <File Path="README.md" />
+    <File Path=".github/workflows/ci.yml" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/FrameMotionPlus.Core/FrameMotionPlus.Core.csproj" />
+    <Project Path="src/FrameMotionPlus.App/FrameMotionPlus.App.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FrameMotionPlus.Core.Tests/FrameMotionPlus.Core.Tests.csproj" />
+  </Folder>
+</Solution>

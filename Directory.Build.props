@@ -1,0 +1,43 @@
+<Project>
+  <PropertyGroup Label="Language and framework">
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Warnings and analyzers">
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <MSBuildTreatWarningsAsErrors>true</MSBuildTreatWarningsAsErrors>
+    <!-- NuGet vulnerability advisories (low to critical) arrive without any change here; they stay visible as
+         warnings but must not turn an unchanged commit red. NuGet reads this directly, and the SDK copies it into
+         MSBuildWarningsNotAsErrors for MSBuildTreatWarningsAsErrors. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <!-- Pinned, not 'latest': a newer SDK band must not enable new rules on its own. Raise deliberately. -->
+    <AnalysisLevel>10.0-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Determinism and output">
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true' or '$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <ArtifactsPath>$(MSBuildThisFileDirectory)artifacts</ArtifactsPath>
+    <Company>FrameMotionPlus</Company>
+    <Product>Frame Motion Plus</Product>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <!-- Libraries: everything under this repository's src/ except the executable. Trim and AOT analysis then fails the
+       build on any warning. The path is taken relative to the repository root, so a checkout that itself sits under
+       a directory named 'src' (e.g. a container WORKDIR /src) does not make tests "libraries". -->
+  <PropertyGroup Condition="$([MSBuild]::MakeRelative('$(MSBuildThisFileDirectory)', '$(MSBuildProjectDirectory)').Replace('\', '/').StartsWith('src/')) and '$(MSBuildProjectName)' != 'FrameMotionPlus.App'">
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$(MSBuildProjectName.EndsWith('.Tests'))">
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+</Project>

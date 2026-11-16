@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>FrameMotionPlus.Core</RootNamespace>
+    <AssemblyName>FrameMotionPlus.Core</AssemblyName>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FrameMotionPlus.Core.Tests" />
+  </ItemGroup>
+
+</Project>
