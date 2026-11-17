@@ -76,7 +76,10 @@ public class AllocationTests
                 prevWritten.Record(producer);
                 currWritten.Record(producer);
                 released.Record(producer);
-                asInterface.Enqueue(prev, curr, (i % 7) / 7f, output, signal);
+                // Alternate the pair, so a discontinuity (which covers every call with its pair) ends at the next call
+                // and the generator's own work keeps running in the measured windows.
+                var swap = (i & 1) == 1;
+                asInterface.Enqueue(swap ? curr : prev, swap ? prev : curr, (i % 7) / 7f, output, signal);
                 if (i % 50 == 0)
                 {
                     asInterface.NotifyDiscontinuity();

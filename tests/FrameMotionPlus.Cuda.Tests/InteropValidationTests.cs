@@ -91,6 +91,7 @@ public class InteropValidationTests
             {
                 using var handle = File.OpenHandle(target);
                 var fd = (int)handle.DangerousGetHandle();
+                SettleFinalizers();
                 var open = Directory.GetFiles("/proc/self/fd").Length;
                 Assert.Throws<CudaException>(() => CudaExternalMemory.ImportOpaqueFd(env.Context, fd, 1 << 20, dedicated: true));
                 Assert.Equal(target, new FileInfo($"/proc/self/fd/{fd}").LinkTarget);
@@ -145,6 +146,7 @@ public class InteropValidationTests
         }
 
         var paths = Enumerable.Range(0, 6).Select(_ => Path.GetTempFileName()).ToArray();
+        SettleFinalizers();
         var open = Directory.GetFiles("/proc/self/fd").Length;
         try
         {
@@ -201,5 +203,17 @@ public class InteropValidationTests
         {
             Assert.Equal(path, new FileInfo($"/proc/self/fd/{fd}").LinkTarget);
         }
+    }
+
+    /// <summary>
+    /// Closes descriptors another test left to a finalizer (redirected process pipes, for one) before a baseline
+    /// count, so they cannot disappear in the middle of a measurement. Which tests ran before depends on the checkout
+    /// path, because xUnit orders test classes from it.
+    /// </summary>
+    private static void SettleFinalizers()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
     }
 }

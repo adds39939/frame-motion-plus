@@ -30,6 +30,15 @@ public readonly record struct FrameGenCapabilities
 
     /// <summary>Memory domain the generator reads and writes.</summary>
     public MemoryDomain Domain { get; init; }
+
+    /// <summary>
+    /// True when <see cref="IFrameGenerator.Enqueue"/> may block its caller until the frame is generated, including
+    /// until the GPU-side dependencies it enqueues first are met (the frames' <see cref="GpuFrame.Ready"/> signals, among
+    /// them the output slot's release). False (the default) when the call only enqueues. See
+    /// <see cref="IFrameGenerator.Enqueue"/> for what a pipeline must do when it is set. VFG with automatic shot-change
+    /// detection: true (measured: the call returns when the generation has finished).
+    /// </summary>
+    public bool EnqueueMayBlock { get; init; }
 }
 
 /// <summary>Per-stream generator configuration. Changing it may rebuild engines off-thread.</summary>

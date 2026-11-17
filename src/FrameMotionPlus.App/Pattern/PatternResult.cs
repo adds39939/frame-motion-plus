@@ -1,5 +1,6 @@
 using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Platform.Runtime;
+using FrameMotionPlus.Vfx;
 using FrameMotionPlus.Vulkan;
 
 namespace FrameMotionPlus.App.Pattern;
@@ -120,6 +121,33 @@ internal sealed class PatternResult
 
     public IReadOnlyList<Exception> TeardownErrors { get; set; } = [];
 
+    /// <summary>With --vfg: where the SDK came from.</summary>
+    public string? VfxSdk { get; set; }
+
+    /// <summary>The generator's <c>Capabilities.EnqueueMayBlock</c> (VFG with automatic shot-change detection: true).</summary>
+    public bool GeneratorMayBlock { get; set; }
+
+    /// <summary>With --vfg: the instance's load and warm-up before the loop.</summary>
+    public VfgLoadReport VfgLoad { get; set; }
+
+    /// <summary>With --vfg offscreen: generated frames scored against the true middle frame (wrapping pairs excluded).</summary>
+    public long GeneratedScored { get; set; }
+
+    /// <summary>Of those, closer to the truth than the blend, not a copy of a neighbour, static bars intact.</summary>
+    public long GeneratedGenuine { get; set; }
+
+    /// <summary>Generated frames between neighbours the box wrapped between (no middle to compare with).</summary>
+    public long GeneratedWrap { get; set; }
+
+    /// <summary>Mean absolute error (code values) over the box band: VFG against the truth, and the blend against it.</summary>
+    public double MeanToTruth { get; set; }
+
+    public double MeanBlendToTruth { get; set; }
+
+    public InterpolationScore WorstScore { get; set; }
+
+    public string? FirstBadGenerated { get; set; }
+
     /// <summary>Things that did not fail the run but limit what it shows, one line each.</summary>
     public IReadOnlyList<string> Warnings()
     {
@@ -175,6 +203,16 @@ internal sealed class PatternResult
         if (UnreapedImports > 0)
         {
             failures.Add($"{UnreapedImports} ring import(s) not freed within 3 s of the presenter letting go (their queued work never finished)");
+        }
+
+        if (GeneratedScored > GeneratedGenuine)
+        {
+            failures.Add($"{GeneratedScored - GeneratedGenuine} of {GeneratedScored} generated frame(s) were not genuine interpolations; first: {FirstBadGenerated}");
+        }
+
+        if (Options.Vfg && Options.Offscreen && Options.Verify && Failure is null && Presented > 20 && GeneratedScored == 0)
+        {
+            failures.Add("no generated frame was scored");
         }
 
         if (Mismatches > 0)

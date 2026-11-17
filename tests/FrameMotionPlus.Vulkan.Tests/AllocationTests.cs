@@ -17,6 +17,11 @@ public class AllocationTests
 {
     private const int Windows = 3;
 
+    /// <summary>The csproj's TieredPGO=false reaches the test host (see the comment there).</summary>
+    [Fact]
+    public void Test_host_runs_without_dynamic_pgo() =>
+        Assert.True(AppContext.TryGetSwitch("System.Runtime.TieredPGO", out var pgo) && !pgo, "System.Runtime.TieredPGO is not false in this host");
+
     [Fact]
     public void Test_host_runs_without_background_gc() => Assert.Equal(GCLatencyMode.Batch, GCSettings.LatencyMode);
 

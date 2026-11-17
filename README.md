@@ -18,8 +18,13 @@ Phase 2 (GPU foundation) is joined: CUDA driver-API bindings and kernels, the Vu
 exportable presentation ring, the CUDA/Vulkan bridge that imports the ring and its two timeline
 semaphores into CUDA, the platform clock and threads, and the `fmp pattern` and `fmp bench jitter`
 commands. Results: [`docs/benchmarks/phase2-interop.md`](docs/benchmarks/phase2-interop.md),
-[`docs/benchmarks/phase2-jitter.md`](docs/benchmarks/phase2-jitter.md). There is no capture, file or
-VFG code yet.
+[`docs/benchmarks/phase2-jitter.md`](docs/benchmarks/phase2-jitter.md).
+
+Phase 3 (the VFG backend and the feasibility gate) adds `FrameMotionPlus.Vfx`: bindings for the NVIDIA VFX
+SDK, loading it from a configurable directory, and `VfgGenerator`, the real frame generator behind
+`IFrameGenerator`; and the `fmp bench vfg`, `fmp bench vfg-quality` and `fmp pattern --vfg` commands.
+Results and the answers that shape the Phase 4 pipeline: [`docs/benchmarks/phase3-vfg.md`](docs/benchmarks/phase3-vfg.md).
+There is no capture or file source yet.
 
 ## Layout
 
@@ -30,17 +35,33 @@ src/FrameMotionPlus.Platform/     CLOCK_MONOTONIC clock, absolute-deadline waits
 src/FrameMotionPlus.Cuda/         CUDA driver-API bindings, streams, events, external memory/semaphores, kernels, Repeat/Blend generators
 src/FrameMotionPlus.Vulkan/       device selection, exportable presentation ring, presenter, SDL3 window, offscreen target
 src/FrameMotionPlus.CudaVulkan/   the IGpuBridge: the presenter's ring and timelines imported into CUDA (Linux, opaque FDs)
+src/FrameMotionPlus.Vfx/          NVIDIA VFX SDK bindings and loading, VfgGenerator (Video Frame Generation, CUDA domain)
 native/kernels/, native/shaders/  CUDA kernel and shader sources with the generated PTX and SPIR-V checked in
 tests/FrameMotionPlus.Core.Tests/ xUnit v3 tests of the core and the CLI (always run)
 tests/FrameMotionPlus.Platform.Tests/ tests of the platform layer and `fmp bench jitter` (Linux-specific ones skip elsewhere)
 tests/FrameMotionPlus.Cuda.Tests/   CUDA bindings, kernels against CPU references, generators (category Gpu)
 tests/FrameMotionPlus.Vulkan.Tests/ ring, presenter, offscreen and windowed presents under the validation layer (Gpu, Display)
 tests/FrameMotionPlus.Gpu.Tests/    CUDA/Vulkan interop end to end and `fmp pattern` (Gpu, Display)
+tests/FrameMotionPlus.Vfx.Tests/    SDK loading, VfgGenerator, measured SDK behaviour, the VFG commands (Vfx)
 ```
 
-Hardware tests carry the category `Gpu` (NVIDIA GPU, CUDA driver, Vulkan with the validation layer) or
-`Display` (a Wayland session and SDL3 as well) and skip, never fail, when that is missing, so hosted CI
-stays green. Vulkan tests run under the validation layer and fail on any message.
+Hardware tests carry the category `Gpu` (NVIDIA GPU, CUDA driver, Vulkan with the validation layer),
+`Display` (a Wayland session and SDL3 as well) or `Vfx` (the NVIDIA VFX SDK as well) and skip, never
+fail, when that is missing, so hosted CI stays green. Vulkan tests run under the validation layer and
+fail on any message.
+
+## The NVIDIA VFX SDK
+
+Video Frame Generation comes from NVIDIA's VFX SDK (Maxine), which is proprietary: it is never committed,
+copied into build output or referenced by a project. `fmp` loads it at run time from the first of: the
+`--vfx-sdk <dir>` option, `$FMP_VFX_SDK`, `generator.vfxSdkDirectory` in a settings file, `lib/VideoFX`
+of the repository checkout the `fmp` binary sits in (never one found from the current directory), and
+`/usr/local/VideoFX` (where NVIDIA's installer puts it).
+The directory is the SDK root (`lib/`, `external/cuda/lib/`) with the VFG feature under
+`features/nvvfxvideoframegeneration/` as the installer lays it out. No `LD_LIBRARY_PATH` is needed: the
+SDK's libraries are loaded by absolute path, dependencies first, so the SDK's own lookups by bare name
+find them (details in [`docs/benchmarks/phase3-vfg.md`](docs/benchmarks/phase3-vfg.md)). Without the SDK
+everything else works; the VFG commands exit 69 with a one-line reason.
 
 ## Build, test, publish
 
@@ -134,3 +155,33 @@ managed allocation on the present thread after the warm-up, and 69 with a one-li
 usable NVIDIA GPU, Vulkan device, Wayland session or validation layer is found. Ctrl+C or SIGTERM stops
 the run cleanly with its verdict (a second one ends it at once). The bridge needs Linux; on other
 systems the command says so.
+
+## Benchmarking VFG
+
+`fmp bench vfg` is the design doc's Phase 0 benchmark: for each of 1080p/1440p/2160p × Low/Medium/High ×
+RGBA8/RGB10A2 × 2x (t = 0.5)/4x (t = 0.25, 0.5, 0.75) it loads a VFG instance, generates frames between
+neighbouring frames of moving content into rotating outputs (rebound every run, as into ring slots) at the
+pipeline's cadence, and reports d (the GPU time of each generated frame, from CUDA events), the host time of
+each call, load and warm-up time and the instance's VRAM. Every 20th output is read back and checked to be a
+genuine interpolation (not a copy of a neighbour, and closer to the true frame than a blend where the motion
+is known). It exits 1 if the gate (1440p Medium p99 d ≤ 7 ms) fails or a check does, 69 without a GPU or SDK.
+
+```sh
+fmp bench vfg                                          # the full matrix (about 6 minutes)
+fmp bench vfg --size 1440p --mode medium --csv vfg.csv # the gate cells only
+fmp bench vfg --content pan --unpaced --scd off        # a textured pan, back to back, shot-change detection off
+fmp bench vfg --video lavfi:testsrc2=size=1920x1080:rate=60   # frames decoded by the ffmpeg CLI
+fmp bench vfg-quality                                  # SDR and PQ scenes: scores and 16-bit PNGs in out/vfg-quality
+fmp pattern --vfg --offscreen --validate --format 10   # VFG writing straight into the presentation ring, scored
+```
+
+`fmp bench vfg-quality` runs VFG at t = 0.5 on scenes with known motion (the test pattern, a textured pan,
+a photo, the PQ ramp and wedge panned, moving specular highlights, a dark gradient) in each quality mode,
+scores the output against the true middle frame, and writes before/truth/after/blend/VFG/error images as
+16-bit PNGs (PQ ones tagged BT.2020 + ST 2084) with an `index.md` into `out/vfg-quality` (git-ignored).
+`fmp pattern --vfg` puts VFG in the Phase 2 pipeline: real pattern frames alternate with VFG output at
+t = 0.5 written into the ring slots, real frames verified bit-exact and generated ones scored against the
+pattern's true middle frame (`--settings <file>` applies a settings file's SDK directory). It is a check, not
+a model: with automatic shot-change detection on (the default) VFG's `Enqueue` blocks until the frame is
+generated (`FrameGenCapabilities.EnqueueMayBlock`), and the demo calls it on its present thread, where a
+pipeline must not.

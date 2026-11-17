@@ -267,6 +267,29 @@ public class AllocationTests
     }
 
     [Fact]
+    public void Discontinuity_latch_allocates_nothing()
+    {
+        var latch = new FrameMotionPlus.Core.Abstractions.DiscontinuityLatch();
+        var a = new FrameMotionPlus.Core.Frames.GpuFrame { Address = 0x1000, ContentTimeNs = 1 };
+        var b = new FrameMotionPlus.Core.Frames.GpuFrame { Address = 0x2000, ContentTimeNs = 2 };
+        long seen = 0;
+        var allocated = Measure(() =>
+        {
+            for (var i = 0; i < 10_000; i++)
+            {
+                if (i % 7 == 0)
+                {
+                    latch.Notify();
+                }
+
+                seen += latch.Observe((i & 2) == 0 ? a : b, b) ? 1 : 0;
+            }
+        });
+        Assert.True(seen > 0);
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
     public void Csv_writer_allocates_nothing_per_record()
     {
         using var writer = new TelemetryCsvWriter(Stream.Null);

@@ -194,6 +194,22 @@ public class SettingsTests
     }
 
     [Fact]
+    public void The_vfx_sdk_directory_defaults_to_null_and_round_trips()
+    {
+        Assert.Null(new FmpSettings().Generator.VfxSdkDirectory);
+        var settings = FmpSettingsSerializer.Deserialize("""{ "generator": { "vfxSdkDirectory": "/opt/VideoFX" } }""");
+        Assert.Equal("/opt/VideoFX", settings.Generator.VfxSdkDirectory);
+        Assert.Empty(settings.Validate());
+        var json = FmpSettingsSerializer.Serialize(settings);
+        Assert.Contains("\"vfxSdkDirectory\": \"/opt/VideoFX\"", json, StringComparison.Ordinal);
+        Assert.Equal("/opt/VideoFX", FmpSettingsSerializer.Deserialize(json).Generator.VfxSdkDirectory);
+
+        var empty = FmpSettingsSerializer.Deserialize("""{ "generator": { "vfxSdkDirectory": " " } }""").Validate();
+        Assert.StartsWith("generator.vfxSdkDirectory", Assert.Single(empty), StringComparison.Ordinal);
+        Assert.Empty(FmpSettingsSerializer.Deserialize("""{ "generator": { "vfxSdkDirectory": null } }""").Validate());
+    }
+
+    [Fact]
     public void Every_known_backend_is_accepted()
     {
         foreach (var backend in GeneratorSettings.KnownBackends)

@@ -11,6 +11,11 @@ namespace FrameMotionPlus.Cuda.Tests;
 [Collection(AllocationMeasurementDefinition.Name)]
 public class GcConfigurationTests
 {
+    /// <summary>The csproj's TieredPGO=false reaches the test host (see the comment there).</summary>
+    [Fact]
+    public void Test_host_runs_without_dynamic_pgo() =>
+        Assert.True(AppContext.TryGetSwitch("System.Runtime.TieredPGO", out var pgo) && !pgo, "System.Runtime.TieredPGO is not false in this host");
+
     [Fact]
     public void Test_host_uses_workstation_gc_without_background_collections()
     {

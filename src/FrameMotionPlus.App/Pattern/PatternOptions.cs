@@ -1,5 +1,6 @@
 using System.Globalization;
 using FrameMotionPlus.App.Cli;
+using FrameMotionPlus.Core.Abstractions;
 using FrameMotionPlus.Core.Frames;
 using FrameMotionPlus.Core.Time;
 
@@ -26,6 +27,24 @@ internal sealed record PatternOptions
 
     /// <summary>A 2x generator in the loop: real frames alternate with BlendGenerator output at t = 0.5.</summary>
     public bool Blend { get; init; }
+
+    /// <summary>
+    /// VFG in the loop (2x): real frames alternate with VfgGenerator output at t = 0.5 written straight into the ring.
+    /// Source frame j is pattern frame 2j, so the true middle frame (2j + 1) is known and each generated frame is scored.
+    /// </summary>
+    public bool Vfg { get; init; }
+
+    /// <summary>VFG's quality mode with <see cref="Vfg"/>.</summary>
+    public FrameGenQuality Quality { get; init; } = FrameGenQuality.Medium;
+
+    /// <summary>The VFX SDK's directory with <see cref="Vfg"/> (else $FMP_VFX_SDK, a checkout's lib/VideoFX, /usr/local/VideoFX).</summary>
+    public string? SdkDirectory { get; init; }
+
+    /// <summary>With <see cref="Vfg"/>: a settings file whose <c>generator.vfxSdkDirectory</c> is used (after --vfx-sdk and $FMP_VFX_SDK).</summary>
+    public string? SettingsPath { get; init; }
+
+    /// <summary>True with a generator in the loop (blend or VFG): outputs alternate real and generated frames.</summary>
+    public bool Generates => Blend || Vfg;
 
     /// <summary>The Vulkan validation layer (core and synchronization checks); any message fails the run.</summary>
     public bool Validate { get; init; }
@@ -54,7 +73,7 @@ internal sealed record PatternOptions
 
     public static readonly IReadOnlySet<string> Flags = new HashSet<string>(StringComparer.Ordinal)
     {
-        "offscreen", "blend", "validate", "no-verify", "unpaced",
+        "offscreen", "blend", "vfg", "validate", "no-verify", "unpaced",
     };
 
     public static PatternOptions Parse(IReadOnlyList<string> args)
@@ -72,6 +91,10 @@ internal sealed record PatternOptions
             Frames = r.Has("frames") ? r.Int64("frames", 0, 1, 2_000_000) : null,
             Offscreen = offscreen,
             Blend = r.Flag("blend"),
+            Vfg = r.Flag("vfg"),
+            Quality = r.String("quality") is { } quality ? global::FrameMotionPlus.App.Vfg.VfgBenchOptions.ParseMode(quality) : FrameGenQuality.Medium,
+            SdkDirectory = r.String("vfx-sdk"),
+            SettingsPath = r.String("settings"),
             Validate = r.Flag("validate"),
             Verify = !r.Flag("no-verify"),
             Unpaced = r.Flag("unpaced"),
@@ -82,6 +105,16 @@ internal sealed record PatternOptions
             WarmupFrames = (int)r.Int64("warmup-frames", 30, 0, 100_000),
         };
         r.EnsureAllConsumed();
+        if (o.Vfg && o.Blend)
+        {
+            throw new UsageException("'--vfg' and '--blend' are alternatives: one generator at a time.");
+        }
+
+        if (!o.Vfg && (args.Any(static a => a.StartsWith("--quality", StringComparison.Ordinal)) || o.SdkDirectory is not null || o.SettingsPath is not null))
+        {
+            throw new UsageException("'--quality', '--vfx-sdk' and '--settings' only apply with '--vfg'.");
+        }
+
         if (!o.Verify && !offscreen)
         {
             throw new UsageException("'--no-verify' only applies with '--offscreen' (windowed frames are never read back).");

@@ -17,12 +17,14 @@
     <ProjectReference Include="..\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.Vulkan\FrameMotionPlus.Vulkan.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.CudaVulkan\FrameMotionPlus.CudaVulkan.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Vfx\FrameMotionPlus.Vfx.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="FrameMotionPlus.Core.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Platform.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Gpu.Tests" />
+    <InternalsVisibleTo Include="FrameMotionPlus.Vfx.Tests" />
   </ItemGroup>
 
 </Project>

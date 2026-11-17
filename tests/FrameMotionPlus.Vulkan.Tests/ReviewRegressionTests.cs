@@ -35,6 +35,11 @@ public unsafe class ReviewRegressionTests
             Cycle(i);
         }
 
+        // Descriptors another test left to the finalizer must be gone before the baseline, not during the loop:
+        // which tests ran before this one depends on the checkout path (xUnit orders classes from it).
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
         var before = FdCount();
         for (var i = 0; i < 90; i++)
         {

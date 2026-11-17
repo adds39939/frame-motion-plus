@@ -9,6 +9,9 @@ artifacts/
 # NVIDIA VFX SDK binaries (proprietary, downloaded locally, never committed)
 /lib/
 
+# Frame dumps and other local outputs (fmp bench vfg-quality writes out/vfg-quality)
+/out/
+
 # Test results and coverage
 TestResults/
 *.trx

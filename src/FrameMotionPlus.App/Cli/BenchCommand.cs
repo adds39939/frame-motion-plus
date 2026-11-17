@@ -11,17 +11,19 @@ namespace FrameMotionPlus.App.Cli;
 /// <summary><c>fmp bench &lt;name&gt;</c>: measurements that gates are judged against.</summary>
 internal static class BenchCommand
 {
-    public static int Run(string[] args, TextWriter output)
+    public static int Run(string[] args, TextWriter output, TextWriter error)
     {
         if (args.Length == 0)
         {
-            throw new UsageException("'fmp bench' needs a benchmark name: jitter.");
+            throw new UsageException("'fmp bench' needs a benchmark name: jitter, vfg or vfg-quality.");
         }
 
         var rest = args.AsSpan(1).ToArray();
         return args[0] switch
         {
             "jitter" => RunJitter(rest, output),
+            "vfg" => VfgBenchCommand.Run(rest, output, error),
+            "vfg-quality" => VfgQualityCommand.Run(rest, output, error),
             _ => throw new UsageException($"Unknown benchmark '{args[0]}'."),
         };
     }

@@ -25,7 +25,8 @@ internal static class PatternCommand
         var ic = CultureInfo.InvariantCulture;
         output.WriteLine(string.Create(ic,
             $"fmp pattern: {options.Width}x{options.Height} {options.FormatName}, {(options.Offscreen ? "offscreen" : "windowed")}, " +
-            $"{(options.Frames is { } f ? $"{f} frames" : $"{options.DurationSeconds:0.##} s")}{(options.Unpaced ? ", unpaced" : "")}, blend {(options.Blend ? "on (2x: real, generated, ...)" : "off")}, " +
+            $"{(options.Frames is { } f ? $"{f} frames" : $"{options.DurationSeconds:0.##} s")}{(options.Unpaced ? ", unpaced" : "")}, " +
+            $"{(options.Vfg ? $"VFG {Vfg.VfgReport.ModeName(options.Quality)} (2x: real, generated, ...)" : $"blend {(options.Blend ? "on (2x: real, generated, ...)" : "off")}")}, " +
             $"validation {(options.Validate ? "on" : "off")}"));
         output.Flush();
 
@@ -65,6 +66,18 @@ internal static class PatternCommand
         var ic = CultureInfo.InvariantCulture;
         var cudaVersion = string.Create(ic, $"{r.CudaDriverVersion / 1000}.{r.CudaDriverVersion % 1000 / 10}");
         o.WriteLine($"  device      {r.DeviceName} (UUID {r.DeviceUuid}), CUDA driver API {cudaVersion}, Vulkan driver {r.VulkanDriver}");
+        if (r.VfxSdk is { } sdk)
+        {
+            o.WriteLine(string.Create(ic,
+                $"  vfg         {sdk}; loaded in {r.VfgLoad.LoadNs / 1e6:0.0} ms, warmed up in {r.VfgLoad.WarmupNs / 1e6:0.0} ms, " +
+                $"{r.VfgLoad.DeviceBytes / 1048576.0:0} MiB; on the ring stream, output written straight into the slots"));
+        }
+
+        if (r.GeneratorMayBlock)
+        {
+            o.WriteLine("  generator   Enqueue may block until the frame is generated (Capabilities.EnqueueMayBlock); this demo calls it on the present " +
+                        "thread, which a pipeline must not do: it belongs on a generator thread of its own");
+        }
         o.WriteLine(string.Create(ic,
             $"  ring        {r.Options.Slots} slots imported into CUDA, pitch {r.PitchBytes} B, {r.SlotBytes} B per slot"));
         o.WriteLine($"  target      {r.TargetDescription}; transform {r.Transform}");
@@ -92,21 +105,26 @@ internal static class PatternCommand
             : string.Create(ic, $"  teardown    {r.AbandonedImports} ring import(s) could not be drained in time and went to the reaper; {r.UnreapedImports} not freed within 3 s of the presenter letting go"));
         if (r.Options.Offscreen)
         {
-            o.WriteLine(r.Options.Verify
-                ? string.Create(ic, $"  verified    {r.Verified} of {r.Presented} presented frames bit-exact against the CPU reference" +
-                                    $"{(r.Options.Blend ? " (generated frames as the t = 0.5 blend of their neighbours)" : "")}")
-                : "  verified    not checked (--no-verify)");
+            o.WriteLine(!r.Options.Verify
+                ? "  verified    not checked (--no-verify)"
+                : r.Options.Vfg
+                    ? string.Create(ic,
+                        $"  verified    {r.Verified} of {r.Presented} presented frames: real frames bit-exact against the CPU reference, generated frames scored " +
+                        $"against the true middle frame: {r.GeneratedGenuine} of {r.GeneratedScored} genuine ({r.GeneratedWrap} across the box's wrap not scored); " +
+                        $"box band error {r.MeanToTruth:0.000} codes on average (worst {r.WorstScore.ToTruth:0.000}) vs the blend's {r.MeanBlendToTruth:0.000}")
+                    : string.Create(ic, $"  verified    {r.Verified} of {r.Presented} presented frames bit-exact against the CPU reference" +
+                                        $"{(r.Options.Blend ? " (generated frames as the t = 0.5 blend of their neighbours)" : "")}"));
         }
 
         if (r.Series is { } s)
         {
             o.WriteLine(string.Create(ic,
                 $"  gpu (us)    after {r.WarmupFrames} warm-up frames      count      p50      p99      max     mean"));
-            Row(o, r.Options.Blend ? "source pattern draw" : "pattern into the slot", s.Pattern);
-            if (r.Options.Blend)
+            Row(o, r.Options.Generates ? "source pattern draw" : "pattern into the slot", s.Pattern);
+            if (r.Options.Generates)
             {
                 Row(o, "real frame copy to slot", s.Copy);
-                Row(o, "blend t=0.5 into slot", s.Blend);
+                Row(o, r.Options.Vfg ? "VFG t=0.5 into slot (d)" : "blend t=0.5 into slot", s.Blend);
             }
 
             Row(o, "present: slot copy", s.PresentCopy);

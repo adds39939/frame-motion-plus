@@ -8,6 +8,13 @@
          collection can move on a thread that allocated nothing. Blocking collections leave it exact
          (GcConfigurationTests guards this, as in the other test projects). -->
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- Dynamic PGO off in this test host. Under the JIT, re-compiling a LibraryImport P/Invoke stub at a higher tier (with
+         PGO, about a second into a run) binds the P/Invoke again, and binding hands the DllImport resolver a newly
+         allocated library name on the calling thread: 40 to 88 B that land in a zero-allocation window by chance
+         (seen in Phase 3: 6 of 9 runs of the Vfx AllocationTests with the per-frame calls on LibraryImport, none with
+         DOTNET_TieredPGO=0). The hot paths here call native code through the same resolver pattern; the published
+         NativeAOT binary has no tiers and is unaffected. The runtime-configuration test checks the switch reaches the host. -->
+    <TieredPGO>false</TieredPGO>
   </PropertyGroup>
 
   <ItemGroup>

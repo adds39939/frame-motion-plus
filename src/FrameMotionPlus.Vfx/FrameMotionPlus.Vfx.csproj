@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>FrameMotionPlus.Vfx</RootNamespace>
+    <AssemblyName>FrameMotionPlus.Vfx</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- The NVIDIA VFX SDK is never referenced here: it is proprietary, lives outside the repository (lib/ in a dev
+       checkout, /usr/local/VideoFX when installed) and is loaded at run time from a configurable directory (VfxSdk). -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FrameMotionPlus.Vfx.Tests" />
+  </ItemGroup>
+
+</Project>

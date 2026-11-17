@@ -79,8 +79,13 @@ public class ShaderTests
             }
 
             using var process = Process.Start(info)!;
-            var stdout = process.StandardOutput.ReadToEnd();
-            var stderr = process.StandardError.ReadToEnd();
+
+            // Disposing the process does not close redirected readers taken synchronously; left to the finalizer,
+            // their pipe descriptors disappear at some later collection and disturb tests that count descriptors.
+            using var outReader = process.StandardOutput;
+            using var errReader = process.StandardError;
+            var stdout = outReader.ReadToEnd();
+            var stderr = errReader.ReadToEnd();
             process.WaitForExit();
             Assert.True(process.ExitCode == 0, $"{file} failed: {stderr}");
             return stdout;

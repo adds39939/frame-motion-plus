@@ -37,7 +37,8 @@ lib/nvvfxvideoframegeneration/       VFG feature 1.3.0.0: libnvVFXVideoFrameGene
 A throwaway C smoke test (not in the repo) confirmed the SDK loads and interpolates on this machine
 with `LD_LIBRARY_PATH` set to `VideoFX/lib`, `VideoFX/external/cuda/lib` and the feature's `lib`.
 **Preliminary** numbers from it, on synthetic frames, wall-clock around `NvVFX_Run` + stream sync,
-explicit timestep mode. Phase 3 replaces these with proper measurements:
+explicit timestep mode. **Phase 3 has since measured this properly and confirmed the picture; use
+`docs/benchmarks/phase3-vfg.md`, not this table:**
 
 | Resolution | Low p50 / p99 (ms) | Medium p50 / p99 (ms) | High p50 / p99 (ms) |
 | --- | --- | --- | --- |
@@ -228,6 +229,48 @@ checkout); nothing from `lib/` is copied into build output or committed.
 - Smooth Motion presenter mode (`NVPRESENT_ENABLE_SMOOTH_MOTION=1` before instance creation), A/B against VFG.
 - Quality harness: 120 fps footage, drop alternate frames, regenerate, score PSNR/SSIM against originals.
 - File audio (audio as master clock) arrives with Phase 8; until then file video is timed from PTS.
+- **Decided from the Phase 3 results** (`docs/benchmarks/phase3-vfg.md`):
+  - **Go.** 1440p Medium p99 d is about 1.2 ms against the 7 ms gate; cost is almost flat in
+    resolution (4K Medium about 1.4 / 1.6 ms p50 / p99; High about 6.1 / 6.5 to 6.8 ms). 4K60 to
+    120 fits at Medium, as do the 4x modes. Default quality is Medium at the source's own resolution.
+    High is an option, not an upgrade: it disturbed dark backgrounds in the PQ highlight test, and 4K
+    High at 120 Hz is marginal (up to 8.2 ms seen against an 8.33 ms slot).
+  - **VFG runs on a dedicated generator thread.** With automatic shot-change detection on (the
+    default, as the design doc says), `NvVFX_Run` blocks its caller, spinning, for the whole
+    generation and for its `Ready` dependencies. `FrameGenCapabilities.EnqueueMayBlock` says so. The
+    generator thread must not be the present or pacing thread, nor a thread whose later action
+    writes the inputs or releases the output slot. Decide here whether to make the CUDA context
+    `BlockingSync` (measured: blocked-thread CPU 1.16 to 0.11 ms for 0.04 to 0.08 ms more wall time).
+  - Detection off makes the call enqueue-only (under 0.1 ms) but then an unreported hard cut comes
+    out as a morph of the two shots. Do not turn it off until the app has its own cut detector
+    (the Phase 5 cadence kernel is the candidate).
+  - Preload every VFG instance the session needs (RGBA8 and RGB10A2 can live in one context) and
+    switch with `TryConfigurePrepared`. `NvVFX_Load` and `NvVFX_DestroyEffect` synchronise the whole
+    context (other threads stalled about 280 to 300 ms): only at a drained point.
+  - Configure the bridge for VFG's stream operations per run: Low 28, Medium 33, High 170 (the
+    default budget is 16). High needs `OperationsPerWrite` of at least 176 and a lead of at most 5.
+  - Call `NotifyDiscontinuity` immediately before enqueueing the pair across the cut: it binds to
+    the next pair enqueued. A throwing `Enqueue` produced nothing and will not signal `done`; a
+    failed SDK call leaves the generator faulted until it is reloaded.
+  - The SDK is loaded by absolute path from a configurable directory (`--vfx-sdk`, `$FMP_VFX_SDK`,
+    settings, a dev checkout's `lib/VideoFX` beside the binary, `/usr/local/VideoFX`); no
+    `LD_LIBRARY_PATH`. The Windows loader path has never run.
+- **Generator backlog from the Phase 3 review** (approved with these tracked; settle them first,
+  before the generator thread is built on them):
+  1. `VfgGenerator.TryConfigurePrepared` is documented as safe on any thread but writes the active
+     instance and its configuration as two unsynchronised fields that `Enqueue` reads separately. A
+     switch from a control thread can run the old instance against frames validated for the new
+     configuration, which throws and faults a healthy instance. Restrict it to the thread that calls
+     `Enqueue`, or swap one immutable reference.
+  2. `DiscontinuityLatch` has three traps the `IFrameGenerator` contract must spell out or remove:
+     a notification whose pair is never enqueued (the scheduler shows real frames across a cut)
+     stays armed and makes the first pair *after* the cut output the current frame instead of
+     interpolating; a notification made mid-pair from another thread binds to the old pair; and with
+     fixed buffers and `ContentTimeNs` unset the pair key never changes, so every later run outputs
+     the current frame. Every frame must carry a distinct content time (`fmp pattern` and the tests
+     use 0 today), and the latch should be released when t does not increase.
+  3. "A call that throws produced nothing" overstates: GPU-side waits may already be queued and the
+     output partly written. Say so, and say what the pipeline does with that slot.
 - **Carried over from Phase 2:**
   - The three CUDA streams (copy, compute, high-priority generator) are created here by the pipeline.
   - `GpuFrame.Ready` now carries a frame's "safe to use" signal, so `SourceFrame.Ready` and

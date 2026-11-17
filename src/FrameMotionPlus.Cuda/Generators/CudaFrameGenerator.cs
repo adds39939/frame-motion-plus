@@ -19,8 +19,8 @@ public abstract class CudaFrameGenerator : IFrameGenerator
 {
     private readonly bool _ownsStream;
     private readonly CudaSpanTimerRing _timer;
+    private readonly DiscontinuityLatch _discontinuity = new();
     private FrameGenConfig _config;
-    private int _discontinuity;
     private bool _disposed;
 
     private protected CudaFrameGenerator(CudaContext context, CudaStream? stream, CudaStreamPriority priority)
@@ -114,7 +114,9 @@ public abstract class CudaFrameGenerator : IFrameGenerator
 
         stream.WaitValidated(output.Ready);
 
-        var discontinuity = Interlocked.Exchange(ref _discontinuity, 0) != 0;
+        // The pair after a notification stays discontinuous for every call with it (Core's "next pair"); t = 0 is prev
+        // itself either way, so only t > 0 changes.
+        var discontinuity = _discontinuity.Observe(prev, curr) && t > 0f;
         _timer.Begin(stream);
         try
         {
@@ -123,11 +125,6 @@ public abstract class CudaFrameGenerator : IFrameGenerator
         catch
         {
             _timer.Abort();
-            if (discontinuity)
-            {
-                Volatile.Write(ref _discontinuity, 1);
-            }
-
             throw;
         }
 
@@ -135,8 +132,12 @@ public abstract class CudaFrameGenerator : IFrameGenerator
         stream.SignalValidated(done);
     }
 
-    /// <summary>The next pair is not continuous: the next <see cref="Enqueue"/> outputs the current frame unchanged.</summary>
-    public void NotifyDiscontinuity() => Interlocked.Exchange(ref _discontinuity, 1);
+    /// <summary>
+    /// The next pair is not continuous (see <see cref="IFrameGenerator.NotifyDiscontinuity"/>): every <see cref="Enqueue"/>
+    /// with the pair of the next call outputs the current frame unchanged, except at t = 0 (the previous frame), until
+    /// a call with a different pair.
+    /// </summary>
+    public void NotifyDiscontinuity() => _discontinuity.Notify();
 
     /// <summary>Non-blocking: GPU time of the oldest unread finished <see cref="Enqueue"/>, ns.</summary>
     public bool TryReadGpuTime(out long nanoseconds) => _timer.TryRead(out nanoseconds);
@@ -198,8 +199,9 @@ public abstract class CudaFrameGenerator : IFrameGenerator
 }
 
 /// <summary>
-/// Shows the nearest real frame: <c>prev</c> for t &lt; 0.5, <c>curr</c> otherwise, copied with
-/// <c>cuMemcpy2DAsync</c>. The baseline for A/B tests and the fallback when VFG cannot keep up.
+/// Shows the nearest real frame: <c>prev</c> for t &lt; 0.5, <c>curr</c> otherwise (after a discontinuity: <c>curr</c>
+/// for every t &gt; 0), copied with <c>cuMemcpy2DAsync</c>. The baseline for A/B tests and the fallback when VFG cannot
+/// keep up.
 /// </summary>
 public sealed class RepeatGenerator : CudaFrameGenerator
 {
@@ -223,6 +225,7 @@ public sealed class RepeatGenerator : CudaFrameGenerator
         SupportsScaling = false,
         Formats = PixelFormatSet.All,
         Domain = MemoryDomain.CudaDevice,
+        EnqueueMayBlock = false,
     };
 
     private protected override void EnqueueWork(in GpuFrame prev, in GpuFrame curr, float t, in GpuFrame output, bool discontinuity)
@@ -268,6 +271,7 @@ public sealed class BlendGenerator : CudaFrameGenerator
         SupportsScaling = false,
         Formats = PixelFormatSet.All,
         Domain = MemoryDomain.CudaDevice,
+        EnqueueMayBlock = false,
     };
 
     private protected override void EnqueueWork(in GpuFrame prev, in GpuFrame curr, float t, in GpuFrame output, bool discontinuity)

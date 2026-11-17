@@ -11,6 +11,20 @@ namespace FrameMotionPlus.App.Pattern;
 /// the same way: blending leaves equal pixels unchanged, so only the box and counter rows differ, and those are
 /// blended here with the kernel's documented rounding. Allocation-free after construction.
 /// </summary>
+/// <summary>
+/// A generated frame's mean absolute errors (code values per colour channel) over the moving box band: against the
+/// true middle frame, the blend of its neighbours against the truth, the output against each neighbour; the worst
+/// error over the static bars; and whether the pair straddles the box's wrap (then there is no "middle").
+/// </summary>
+internal readonly record struct InterpolationScore(double ToTruth, double BlendToTruth, double ToPrev, double ToCurr, double StaticBars, bool Wrap, bool TenBit)
+{
+    /// <summary>
+    /// Closer to the truth than the blend, not a copy of a neighbour, and the static picture intact: no sampled row of
+    /// the bars off by more than 1 code on average in 8-bit, 4 codes in 10-bit (the same 0.4 % of full scale).
+    /// </summary>
+    public bool IsGenuine => ToTruth < BlendToTruth && ToPrev > 0.01 && ToCurr > 0.01 && StaticBars < (TenBit ? 4.0 : 1.0);
+}
+
 internal sealed class PatternVerifier
 {
     private const uint HalfWeight = 32768; // round(0.5 × 65536)
@@ -31,6 +45,8 @@ internal sealed class PatternVerifier
     private readonly uint[] _box;
     private readonly uint[] _counter;
     private readonly uint[] _scratch;
+    private readonly uint[] _prevBox;
+    private readonly uint[] _currBox;
 
     public PatternVerifier(int width, int height, PixelFormat format)
     {
@@ -47,6 +63,8 @@ internal sealed class PatternVerifier
         _box = new uint[width];
         _counter = new uint[width];
         _scratch = new uint[width];
+        _prevBox = new uint[width];
+        _currBox = new uint[width];
 
         var level = _tenBit ? 594u : 191u;
         var max = _tenBit ? 1023u : 255u;
@@ -80,6 +98,43 @@ internal sealed class PatternVerifier
         FillCounter(_scratch, frame + 1);
         Mix(_counter, _scratch);
         return Compare(pixels);
+    }
+
+    /// <summary>
+    /// Scores a generated frame meant to be the middle of real pattern frames <paramref name="frame"/> and
+    /// <paramref name="frame"/> + 2, whose truth is pattern frame <paramref name="frame"/> + 1 (VFG is not bit-exact
+    /// against anything, so it is measured, not compared): mean absolute error in code values over the moving box band
+    /// against the truth, against the blend of the neighbours, and against each neighbour; and over the static bars.
+    /// Allocation-free.
+    /// </summary>
+    public InterpolationScore ScoreGenerated(ReadOnlySpan<byte> pixels, uint frame)
+    {
+        var words = MemoryMarshal.Cast<byte, uint>(pixels);
+        FillBox(_box, frame + 1);
+        FillBox(_prevBox, frame);
+        FillBox(_currBox, frame + 2);
+        var blend = _scratch.AsSpan();
+        _prevBox.CopyTo(blend);
+        Mix(blend, _currBox);
+
+        // Truth rows are alike throughout the band, so the blend's error is one row's.
+        var blendError = RowError(blend, _box);
+        double toTruth = 0, toPrev = 0, toCurr = 0, bars = 0;
+        var rows = _boxEnd - _barsEnd;
+        for (var y = _barsEnd; y < _boxEnd; y++)
+        {
+            var row = words.Slice(y * _width, _width);
+            toTruth += RowError(row, _box);
+            toPrev += RowError(row, _prevBox);
+            toCurr += RowError(row, _currBox);
+        }
+
+        for (var y = 0; y < _barsEnd; y += 8)
+        {
+            bars = Math.Max(bars, RowError(words.Slice(y * _width, _width), _bars));
+        }
+
+        return new InterpolationScore(toTruth / rows, blendError, toPrev / rows, toCurr / rows, bars, BoxX(frame + 2) < BoxX(frame), _tenBit);
     }
 
     /// <summary>The frame counter of a real frame (cell centres, threshold at half scale).</summary>
@@ -120,13 +175,35 @@ internal sealed class PatternVerifier
         return true;
     }
 
+    /// <summary>Mean absolute difference per colour channel of two rows, in code values.</summary>
+    private double RowError(ReadOnlySpan<uint> a, ReadOnlySpan<uint> b)
+    {
+        long sum = 0;
+        for (var x = 0; x < a.Length; x++)
+        {
+            var p = a[x];
+            var q = b[x];
+            sum += _tenBit
+                ? Math.Abs((int)(p & 0x3FF) - (int)(q & 0x3FF)) + Math.Abs((int)((p >> 10) & 0x3FF) - (int)((q >> 10) & 0x3FF)) + Math.Abs((int)((p >> 20) & 0x3FF) - (int)((q >> 20) & 0x3FF))
+                : Math.Abs((int)(p & 0xFF) - (int)(q & 0xFF)) + Math.Abs((int)((p >> 8) & 0xFF) - (int)((q >> 8) & 0xFF)) + Math.Abs((int)((p >> 16) & 0xFF) - (int)((q >> 16) & 0xFF));
+        }
+
+        return sum / (3.0 * a.Length);
+    }
+
+    private int BoxX(uint frame)
+    {
+        var boxWidth = Math.Max(_width / 16, 1);
+        var step = (uint)Math.Max(_width / 240, 1);
+        var travel = (uint)(_width - boxWidth);
+        return travel == 0 ? 0 : (int)((frame % travel * step) % travel);
+    }
+
     private void FillBox(Span<uint> row, uint frame)
     {
         // A box max(W/16, 1) wide moving max(W/240, 1) px per frame, wrapping after W - boxWidth px.
         var boxWidth = Math.Max(_width / 16, 1);
-        var step = (uint)Math.Max(_width / 240, 1);
-        var travel = (uint)(_width - boxWidth);
-        var boxX = travel == 0 ? 0 : (int)((frame % travel * step) % travel);
+        var boxX = BoxX(frame);
         var inside = _tenBit ? 769u : 255u;
         var outside = _tenBit ? 307u : 48u;
         for (var x = 0; x < _width; x++)

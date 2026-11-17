@@ -9,6 +9,7 @@ using FrameMotionPlus.CudaVulkan;
 using FrameMotionPlus.Platform.Runtime;
 using FrameMotionPlus.Platform.Threading;
 using FrameMotionPlus.Platform.Time;
+using FrameMotionPlus.Vfx;
 using FrameMotionPlus.Vulkan;
 using FrameMotionPlus.Vulkan.Windowing;
 
@@ -58,6 +59,8 @@ internal sealed class PatternRun : IDisposable
     private CudaStream? _ringStream;
     private CudaStream? _sourceStream;
     private BlendGenerator? _blend;
+    private VfgGenerator? _vfg;
+    private IFrameGenerator? _generator;
     private CudaSpanTimerRing? _patternTimer;
     private CudaSpanTimerRing? _copyTimer;
     private readonly CudaDeviceBuffer?[] _history = new CudaDeviceBuffer?[HistorySize];
@@ -95,6 +98,15 @@ internal sealed class PatternRun : IDisposable
     private long _maxInFlight;
     private FrameRate _rate;
     private int _rateChanges;
+    private long _generatedScored;
+    private long _generatedGenuine;
+    private long _generatedWrap;
+    private double _sumToTruth;
+    private double _sumBlendToTruth;
+    private InterpolationScore _worstScore;
+    private InterpolationScore _firstBadScore;
+    private long _firstBadOutput = -1;
+    private uint _firstBadFrame;
 
     /// <param name="options">The run.</param>
     /// <param name="validationEcho">Where each validation-layer problem is written as it arrives (with --validate), so
@@ -168,6 +180,13 @@ internal sealed class PatternRun : IDisposable
         result.DeviceName = cudaDevice.Name;
         result.DeviceUuid = GpuIdentity.UuidOf(cudaDevice).ToString();
         result.CudaDriverVersion = CudaDriver.DriverVersion;
+        if (_o.Vfg)
+        {
+            // The documented lookup order: --vfx-sdk, $FMP_VFX_SDK, the settings file's generator.vfxSdkDirectory, ...
+            var settingsDirectory = _o.SettingsPath is null ? null : Cli.SettingsCommand.Load(_o.SettingsPath).Generator.VfxSdkDirectory;
+            Require(VfxSdk.TryLoad(out var why, _o.SdkDirectory, settingsDirectory), $"needs the NVIDIA VFX SDK with Video Frame Generation for --vfg: {why}");
+            result.VfxSdk = $"VFX SDK {VfxSdk.Version} from {VfxSdk.Location}";
+        }
 
         // The layer policy is process-wide and must be in place before anything touches the Vulkan loader, SDL creating
         // a Vulkan window included: the desktop session exports third-party layers that must stay out of our presents.
@@ -232,7 +251,10 @@ internal sealed class PatternRun : IDisposable
 
         _presenter = new VulkanPresenter(_device, _target, new VulkanPresenterOptions { SlotCount = _o.Slots, MeasureGpuTime = true });
         _cuda = CudaContext.RetainPrimary(cudaDevice);
-        _bridge = new CudaVulkanBridge(_cuda, _presenter);
+        // A VFG write enqueues one run (measured: about 28, 33 and 170 stream operations in Low, Medium and High) plus
+        // three waits, two timer records and the signal; declare 192 so the bridge's limit (4 writes, 768 operations)
+        // keeps the producer's stream from filling.
+        _bridge = new CudaVulkanBridge(_cuda, _presenter, _o.Vfg ? new CudaVulkanBridgeOptions { OperationsPerWrite = 192, MaxLead = 4 } : null);
         _bridge.Configure(new BridgeConfig { SlotCount = _o.Slots, Width = _o.Width, Height = _o.Height, Format = _o.Format });
         var ring = _bridge.Ring!;
         result.PitchBytes = ring.PitchBytes;
@@ -256,18 +278,34 @@ internal sealed class PatternRun : IDisposable
         _kernels = ImageKernels.Load(_cuda);
         _ringStream = CudaStream.Create(_cuda, CudaStreamPriority.High);
         _patternTimer = CudaSpanTimerRing.Create(_cuda, 32);
-        if (_o.Blend)
+        if (_o.Generates)
         {
             // Ring writes (real copies and generated frames) all go on one stream, so 'written' is signalled in order.
             _sourceStream = CudaStream.Create(_cuda);
             _copyTimer = CudaSpanTimerRing.Create(_cuda, 32);
-            _blend = new BlendGenerator(_cuda, _kernels, _ringStream);
-            ((IFrameGenerator)_blend).Configure(new FrameGenConfig { Width = _o.Width, Height = _o.Height, Format = _o.Format });
+            var config = new FrameGenConfig { Width = _o.Width, Height = _o.Height, Format = _o.Format, Quality = _o.Quality };
+            if (_o.Vfg)
+            {
+                // VFG on the ring stream itself (the caller's stream option), loaded and warmed up here, before the loop.
+                _vfg = new VfgGenerator(_cuda, new VfgOptions { Stream = _ringStream });
+                _vfg.Configure(config);
+                result.VfgLoad = _vfg.LastLoad;
+                _generator = _vfg;
+            }
+            else
+            {
+                _blend = new BlendGenerator(_cuda, _kernels, _ringStream);
+                ((IFrameGenerator)_blend).Configure(config);
+                _generator = _blend;
+            }
+
             for (var i = 0; i < HistorySize; i++)
             {
                 _history[i] = CudaDeviceBuffer.AllocateImage(_cuda, _o.Width, _o.Height, _o.Format);
                 _drawn[i] = CudaEvent.Create(_cuda);
             }
+
+            result.GeneratorMayBlock = _generator.Capabilities.EnqueueMayBlock;
         }
 
         if (_target is OffscreenTarget offscreen && _o.Verify)
@@ -335,7 +373,17 @@ internal sealed class PatternRun : IDisposable
         result.Series = _series;
         result.PresenterStats = _presenter!.Stats;
         result.OutOfOrderSignals = _bridge!.OutOfOrderSignals;
-        result.TimerDrops = (_patternTimer?.Dropped ?? 0) + (_copyTimer?.Dropped ?? 0) + (_blend?.DroppedGpuTimes ?? 0);
+        result.TimerDrops = (_patternTimer?.Dropped ?? 0) + (_copyTimer?.Dropped ?? 0) + (_blend?.DroppedGpuTimes ?? 0) + (_vfg?.DroppedGpuTimes ?? 0);
+        result.GeneratedScored = _generatedScored;
+        result.GeneratedGenuine = _generatedGenuine;
+        result.GeneratedWrap = _generatedWrap;
+        result.MeanToTruth = _generatedScored == 0 ? 0 : _sumToTruth / _generatedScored;
+        result.MeanBlendToTruth = _generatedScored == 0 ? 0 : _sumBlendToTruth / _generatedScored;
+        result.WorstScore = _worstScore;
+        result.FirstBadGenerated = _firstBadOutput < 0 ? null : string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"output {_firstBadOutput} (VFG between frames {_firstBadFrame} and {_firstBadFrame + 2}): box band error {_firstBadScore.ToTruth:0.000} " +
+            $"vs the blend's {_firstBadScore.BlendToTruth:0.000}, to the neighbours {_firstBadScore.ToPrev:0.000}/{_firstBadScore.ToCurr:0.000}, " +
+            $"worst static bar row {_firstBadScore.StaticBars:0.000}");
     }
 
     /// <summary>The present thread: paced on CLOCK_MONOTONIC, produce → signal → present per refresh slot.</summary>
@@ -559,6 +607,15 @@ internal sealed class PatternRun : IDisposable
                 break;
             }
 
+            if (_generator is { Capabilities.EnqueueMayBlock: true } && i >= slots && (output & 1) == 1)
+            {
+                // A generator whose Enqueue may block (VFG with automatic shot-change detection) would wait here for a
+                // release that only a later present on this very thread gives (IFrameGenerator.Enqueue, "Blocking"):
+                // write the next real frame instead (drawing its source, as the skipped generated frame would have).
+                DrawSource((output + 1) / 2);
+                output++;
+            }
+
             Produce(slot, output++);
             newest = slot;
         }
@@ -621,6 +678,7 @@ internal sealed class PatternRun : IDisposable
         var j = (uint)(k / 2);
         _ = _verifier.IsFrame(_readback!, j);
         _ = _verifier.IsBlend(_readback!, j);
+        _ = _verifier.ScoreGenerated(_readback!, 2 * j);
         _ = _verifier.DecodeCounter(_readback!);
     }
 
@@ -664,7 +722,7 @@ internal sealed class PatternRun : IDisposable
     {
         var kernels = _kernels!;
         var ring = _ringStream!;
-        if (_blend is null)
+        if (!_o.Generates)
         {
             ring.Wait(slot.ProducerWait);
             _patternTimer!.Begin(ring);
@@ -697,7 +755,10 @@ internal sealed class PatternRun : IDisposable
         DrawSource(j + 1);
         var a = (int)(j % HistorySize);
         var b = (int)((j + 1) % HistorySize);
-        ((IFrameGenerator)_blend).Enqueue(_sourceFrames[a], _sourceFrames[b], 0.5f, slot.ProducerView, slot.ProducerSignal);
+        // The demo calls the generator on its present thread even when its Enqueue may block (VFG): the slot it writes
+        // was released long ago at a lead of 1, so the call cannot wait for this thread, but it does hold the present
+        // thread for d. The pipeline gives such a generator a thread of its own (IFrameGenerator.Enqueue, "Blocking").
+        _generator!.Enqueue(_sourceFrames[a], _sourceFrames[b], 0.5f, slot.ProducerView, slot.ProducerSignal);
         _lastReader[a] = slot.ProducerSignal;
         _lastReader[b] = slot.ProducerSignal;
     }
@@ -710,7 +771,9 @@ internal sealed class PatternRun : IDisposable
         source.Wait(_lastReader[h]);
         var frame = _history[h]!.AsFrame(ready: _drawn[h]!.Signal);
         _patternTimer!.Begin(source);
-        _kernels!.EnqueueTestPattern(source, frame, (uint)j);
+
+        // With VFG source frame j is pattern frame 2j, so the true middle of each pair (2j + 1) is known.
+        _kernels!.EnqueueTestPattern(source, frame, (uint)(_vfg is null ? j : 2 * j));
         _patternTimer.End(source);
         _drawn[h]!.Record(source);
         _sourceFrames[h] = frame;
@@ -741,6 +804,14 @@ internal sealed class PatternRun : IDisposable
                 _series.AddBlend(ns);
             }
         }
+
+        while (_vfg is not null && _vfg.TryReadGpuTime(out var ns))
+        {
+            if (keep)
+            {
+                _series.AddBlend(ns);
+            }
+        }
     }
 
     /// <summary>Reads output frame <paramref name="k"/> back (waits for it) and checks it bit for bit.</summary>
@@ -751,8 +822,21 @@ internal sealed class PatternRun : IDisposable
         var frame = target.ReadLatest(pixels);
         var fresh = frame > _lastReadbackFrame;
         _lastReadbackFrame = frame;
-        var j = _blend is null ? (uint)k : (uint)(k / 2);
-        var ok = fresh && (_blend is null || (k & 1) == 0 ? _verifier!.IsFrame(pixels, j) : _verifier!.IsBlend(pixels, j));
+        var j = !_o.Generates ? (uint)k : (uint)(k / 2);
+        if (_vfg is not null)
+        {
+            // Real frame j is pattern frame 2j, checked bit-exact; a generated one is scored against frame 2j + 1.
+            if (fresh && (k & 1) == 1)
+            {
+                ScoreGenerated(pixels, 2 * j, k);
+                _verified++;
+                return;
+            }
+
+            j *= 2;
+        }
+
+        var ok = fresh && (!_o.Generates || (k & 1) == 0 ? _verifier!.IsFrame(pixels, j) : _verifier!.IsBlend(pixels, j));
         if (ok)
         {
             _verified++;
@@ -761,10 +845,41 @@ internal sealed class PatternRun : IDisposable
 
         if (_mismatches++ == 0)
         {
-            var kind = _blend is not null && (k & 1) == 1 ? $"blend of frames {j} and {j + 1}" : $"frame {j}";
+            var kind = _o.Generates && (k & 1) == 1 ? $"blend of frames {j} and {j + 1}" : $"frame {j}";
             _firstMismatch = fresh
                 ? $"output {k} ({kind}) differs from the reference; its counter reads {_verifier!.DecodeCounter(pixels)}"
                 : $"output {k} ({kind}) was not read back (presenter frame {frame} again)";
+        }
+    }
+
+    /// <summary>Scores generated output <paramref name="k"/> (the middle of pattern frames <paramref name="frame"/> and + 2). Allocation-free.</summary>
+    private void ScoreGenerated(byte[] pixels, uint frame, long k)
+    {
+        var score = _verifier!.ScoreGenerated(pixels, frame);
+        if (score.Wrap)
+        {
+            _generatedWrap++; // the box wraps between the neighbours: there is no middle to compare with
+            return;
+        }
+
+        _generatedScored++;
+        _sumToTruth += score.ToTruth;
+        _sumBlendToTruth += score.BlendToTruth;
+        if (score.ToTruth >= _worstScore.ToTruth)
+        {
+            _worstScore = score;
+        }
+
+        if (score.IsGenuine)
+        {
+            _generatedGenuine++;
+        }
+        else if (_firstBadOutput < 0)
+        {
+            // Kept as values and described after the loop: the present thread must not allocate, even for a failure.
+            _firstBadOutput = k;
+            _firstBadFrame = frame;
+            _firstBadScore = score;
         }
     }
 
@@ -806,6 +921,8 @@ internal sealed class PatternRun : IDisposable
         {
             errors.Add(new TimeoutException("CUDA work queued by the loop did not finish within 3 s; its buffers were not freed"));
             _blend = null;
+            _vfg = null;
+            _generator = null;
             _patternTimer = null;
             _copyTimer = null;
             Array.Clear(_history);
@@ -816,6 +933,7 @@ internal sealed class PatternRun : IDisposable
         }
 
         Try(() => _blend?.Dispose());
+        Try(() => _vfg?.Dispose());
         Try(() => _patternTimer?.Dispose());
         Try(() => _copyTimer?.Dispose());
         for (var i = 0; i < HistorySize; i++)

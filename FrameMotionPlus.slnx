@@ -15,6 +15,7 @@
     <Project Path="src/FrameMotionPlus.Platform/FrameMotionPlus.Platform.csproj" />
     <Project Path="src/FrameMotionPlus.Vulkan/FrameMotionPlus.Vulkan.csproj" />
     <Project Path="src/FrameMotionPlus.CudaVulkan/FrameMotionPlus.CudaVulkan.csproj" />
+    <Project Path="src/FrameMotionPlus.Vfx/FrameMotionPlus.Vfx.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/FrameMotionPlus.Core.Tests/FrameMotionPlus.Core.Tests.csproj" />
@@ -22,5 +23,6 @@
     <Project Path="tests/FrameMotionPlus.Gpu.Tests/FrameMotionPlus.Gpu.Tests.csproj" />
     <Project Path="tests/FrameMotionPlus.Platform.Tests/FrameMotionPlus.Platform.Tests.csproj" />
     <Project Path="tests/FrameMotionPlus.Vulkan.Tests/FrameMotionPlus.Vulkan.Tests.csproj" />
+    <Project Path="tests/FrameMotionPlus.Vfx.Tests/FrameMotionPlus.Vfx.Tests.csproj" />
   </Folder>
 </Solution>

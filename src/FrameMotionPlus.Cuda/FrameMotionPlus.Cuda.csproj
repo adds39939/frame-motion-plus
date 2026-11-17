@@ -20,6 +20,11 @@
     <!-- Its allocation test asserts, through CudaStream's path counters, that the timeline-semaphore waits and signals
          ran (they need a Vulkan exporter, which only that project has). -->
     <InternalsVisibleTo Include="FrameMotionPlus.Gpu.Tests" />
+    <!-- VfgGenerator validates frames and signals before it enqueues anything, as CudaFrameGenerator does (FrameChecks,
+         CudaStream.ValidateCudaSignal/WaitValidated/SignalValidated); its tests read the same path counters and the
+         context's reference count. -->
+    <InternalsVisibleTo Include="FrameMotionPlus.Vfx" />
+    <InternalsVisibleTo Include="FrameMotionPlus.Vfx.Tests" />
   </ItemGroup>
 
 </Project>

@@ -267,8 +267,19 @@ public sealed class GeneratorSettings
     [JsonConverter(typeof(EnumNameConverter<FrameGenQuality>))]
     public FrameGenQuality Quality { get; set; } = FrameGenQuality.Medium;
 
+    /// <summary>
+    /// Directory of the NVIDIA VFX SDK (the one holding lib/ and features/), which is never shipped with the app; null to
+    /// look in $FMP_VFX_SDK, a repository checkout's lib/VideoFX and then the installer's /usr/local/VideoFX.
+    /// </summary>
+    public string? VfxSdkDirectory { get; set; }
+
     internal void Validate(List<string> errors)
     {
+        if (VfxSdkDirectory is not null && string.IsNullOrWhiteSpace(VfxSdkDirectory))
+        {
+            errors.Add("generator.vfxSdkDirectory must be a directory or null (got an empty string).");
+        }
+
         var known = false;
         foreach (var name in KnownBackends)
         {

@@ -79,35 +79,62 @@ public class GeneratorTests
         }
     }
 
-    [Fact]
-    public void Discontinuity_outputs_the_current_frame_once()
+    /// <summary>
+    /// Core's "the next pair" (review fix): after <see cref="IFrameGenerator.NotifyDiscontinuity"/> every frame of the pair
+    /// of the next call is the current frame (2x: one t, 4x: three), whatever t, so the picture switches once and never
+    /// steps back; t = 0 is the previous frame and does not use the notification up; a different pair ends it. The old
+    /// generators applied it to one call only (the blend then mixed across the cut, the repeat stepped back to prev).
+    /// </summary>
+    [Theory]
+    [InlineData("blend", 2)]
+    [InlineData("blend", 4)]
+    [InlineData("repeat", 2)]
+    [InlineData("repeat", 4)]
+    public void A_discontinuity_covers_every_frame_of_the_next_pair(string kind, int multiplier)
     {
         var env = Gpu.Require();
         using var setup = CudaStream.Create(env.Context);
         using var a = env.Image(Width, Height, PixelFormat.Rgba8);
         using var b = env.Image(Width, Height, PixelFormat.Rgba8);
+        using var c = env.Image(Width, Height, PixelFormat.Rgba8);
         using var o = env.Image(Width, Height, PixelFormat.Rgba8);
         env.Kernels.EnqueueTestPattern(setup, a.AsFrame(), 100);
         env.Kernels.EnqueueTestPattern(setup, b.AsFrame(), 200);
+        env.Kernels.EnqueueTestPattern(setup, c.AsFrame(), 300);
         setup.Synchronize();
-        using var blend = new BlendGenerator(env.Context, env.Kernels, setup);
-        using var repeat = new RepeatGenerator(env.Context, setup);
-        var config = new FrameGenConfig { Width = Width, Height = Height, Format = PixelFormat.Rgba8 };
-        blend.Configure(config);
-        repeat.Configure(config);
+        using CudaFrameGenerator generator = kind == "blend" ? new BlendGenerator(env.Context, env.Kernels, setup) : new RepeatGenerator(env.Context, setup);
+        generator.Configure(new FrameGenConfig { Width = Width, Height = Height, Format = PixelFormat.Rgba8 });
+        Assert.False(generator.Capabilities.EnqueueMayBlock);
+        var prev = Reference.Pattern(Width, Height, 100, PixelFormat.Rgba8);
         var curr = Reference.Pattern(Width, Height, 200, PixelFormat.Rgba8);
+        uint[] Run(GpuFrame p, GpuFrame q, float t)
+        {
+            generator.Enqueue(p, q, t, o.AsFrame(), GpuSignal.None);
+            return env.Read(setup, o.AsFrame());
+        }
 
-        blend.NotifyDiscontinuity();
-        blend.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f, o.AsFrame(), GpuSignal.None);
-        Assert.Equal(curr, env.Read(setup, o.AsFrame()));
-        blend.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f, o.AsFrame(), GpuSignal.None);
-        Assert.NotEqual(curr, env.Read(setup, o.AsFrame()));
+        float[] timesteps = multiplier == 2 ? [0.5f] : [0.25f, 0.5f, 0.75f];
 
-        repeat.NotifyDiscontinuity();
-        repeat.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f, o.AsFrame(), GpuSignal.None);
-        Assert.Equal(curr, env.Read(setup, o.AsFrame()));
-        repeat.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f, o.AsFrame(), GpuSignal.None);
-        Assert.Equal(100u, Reference.DecodeCounter(env.Read(setup, o.AsFrame()), Width, Height, PixelFormat.Rgba8));
+        // Every generated frame of the pair across the cut, twice over (the pair may be revisited), is curr.
+        generator.NotifyDiscontinuity();
+        foreach (var t in timesteps.Concat(timesteps))
+        {
+            Assert.True(curr.AsSpan().SequenceEqual(Run(a.AsFrame(), b.AsFrame(), t)), $"{kind} {multiplier}x t={t} after the cut is not curr");
+        }
+
+        // t = 0 is prev itself and does not use the notification up: the pair's next generated frame is still curr.
+        generator.NotifyDiscontinuity();
+        Assert.True(prev.AsSpan().SequenceEqual(Run(a.AsFrame(), b.AsFrame(), 0f)), $"{kind} t=0 after the cut is not prev");
+        Assert.True(curr.AsSpan().SequenceEqual(Run(a.AsFrame(), b.AsFrame(), 0.25f)), $"{kind} t=0.25 after a t=0 call is not curr");
+
+        // The next pair is continuous again.
+        var next = Run(b.AsFrame(), c.AsFrame(), 0.25f);
+        var expected = kind == "blend"
+            ? Reference.Blend(curr, Reference.Pattern(Width, Height, 300, PixelFormat.Rgba8), Reference.BlendWeight(0.25f), PixelFormat.Rgba8)
+            : curr; // the repeat shows its prev (frame 200) at t = 0.25
+        Assert.True(expected.AsSpan().SequenceEqual(next), $"{kind}: the pair after the cut pair is not interpolated normally");
+        var blendLike = Run(a.AsFrame(), b.AsFrame(), 0.25f);
+        Assert.False(kind == "blend" && curr.AsSpan().SequenceEqual(blendLike), "the old pair revisited after a new one is still treated as cut");
     }
 
     [Fact]
@@ -173,7 +200,7 @@ public class GeneratorTests
     }
 
     [Fact]
-    public void A_failed_enqueue_keeps_a_pending_discontinuity_for_the_next_call()
+    public void A_failed_enqueue_keeps_the_discontinuity_for_the_rest_of_the_pair()
     {
         var env = Gpu.Require();
         using var a = env.Image(Width, Height, PixelFormat.Rgba8);
@@ -184,9 +211,11 @@ public class GeneratorTests
         generator.NotifyDiscontinuity();
         generator.FailNext = true;
         Assert.Throws<InvalidOperationException>(() => generator.Enqueue(f, f, 0.5f, f, GpuSignal.None));
-        generator.Enqueue(f, f, 0.5f, f, GpuSignal.None); // the cut was not consumed by the failed call
-        generator.Enqueue(f, f, 0.5f, f, GpuSignal.None); // and is consumed exactly once
-        Assert.Equal([true, true, false], generator.Seen);
+        generator.Enqueue(f, f, 0.5f, f, GpuSignal.None); // the cut was not lost by the failed call
+        generator.Enqueue(f, f, 0.5f, f, GpuSignal.None); // and covers the whole pair (Core's "next pair")
+        generator.Enqueue(f, f, 0f, f, GpuSignal.None);   // except t = 0, which is prev itself
+        generator.Enqueue(f with { ContentTimeNs = 1 }, f, 0.5f, f, GpuSignal.None); // another pair: continuous
+        Assert.Equal([true, true, true, false, false], generator.Seen);
         generator.Stream.Synchronize();
     }
 

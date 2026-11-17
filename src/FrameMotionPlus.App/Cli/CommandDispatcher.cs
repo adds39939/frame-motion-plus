@@ -32,7 +32,7 @@ internal static class CommandDispatcher
             {
                 "simulate" => SimulateCommand.Run(rest, output),
                 "settings" => SettingsCommand.Run(rest, output),
-                "bench" => BenchCommand.Run(rest, output),
+                "bench" => BenchCommand.Run(rest, output, error),
                 "pattern" => PatternCommand.Run(rest, output, error),
                 _ => throw new UsageException($"Unknown command '{args[0]}'."),
             };
@@ -64,6 +64,10 @@ internal static class CommandDispatcher
           fmp settings [options]    Print default settings JSON, or validate a settings file
           fmp bench jitter [options]
                                     Measure pacing-thread wake-up jitter on the real clock (design doc Phase 0)
+          fmp bench vfg [options]   Measure NVIDIA VFG's cost per generated frame over sizes, modes, formats and
+                                    multipliers, with the 1440p Medium gate (design doc Phase 0)
+          fmp bench vfg-quality [options]
+                                    VFG on SDR and PQ scenes with known motion: scores and 16-bit PNG frame dumps
           fmp pattern [options]     CUDA test pattern through the presentation ring to a window or offscreen (Phase 2)
           fmp --version
           fmp --help
@@ -125,6 +129,36 @@ internal static class CommandDispatcher
                                     Skipped slots count in the percentiles. Also exits 1 on any GC collection or
                                     hot-thread allocation in the measured time.
 
+        bench vfg options:
+          --size <list>             1080p, 1440p, 2160p or WxH, comma-separated              (1080p,1440p,2160p)
+          --mode <list>             low, medium, high                                         (low,medium,high)
+          --format <list>           8 (RGBA8) and/or 10 (RGB10A2)                             (8,10)
+          --multiplier <list>       2 (t = 0.5) and/or 4 (t = 0.25, 0.5, 0.75 per pair)       (2,4)
+          --frames <n>              Generated frames measured per cell                        (600)
+          --warmup-frames <n>       Generated frames per cell before measuring                (30)
+          --content <kind>          pattern (the test pattern's moving box), pan (a textured pan), video (pattern)
+          --video <input>           With --content video: a file, or lavfi:SPEC, decoded by the ffmpeg CLI
+          --rate <hz>               Output rate the runs are paced at (2x: rate/2 runs/s)     (120)
+          --unpaced                 Back to back instead
+          --scd <on|off>            VFG's automatic shot-change detection                     (on)
+          --verify-every <n>        Read every n-th output back and check it interpolates     (20)
+          --gate-ms <ms>            Exit 1 if 1440p Medium p99 d exceeds this                 (7)
+          --csv <path>              Write one row per cell
+          --vfx-sdk <dir>           VFX SDK directory (else $FMP_VFX_SDK, --settings, lib/VideoFX of a checkout,
+                                    /usr/local/VideoFX)
+          --settings <file>         Settings file whose generator.vfxSdkDirectory to use
+                                    Exits 1 when the gate fails or a checked output is a copy of a neighbour (or, with
+                                    known motion, not closer to the true frame than a blend); 69 without a GPU or SDK.
+
+        bench vfg-quality options:
+          --size <WxH|1080p|...>    Frame size                                                (1920x1080)
+          --mode <list>             Quality modes                                             (low,medium,high)
+          --out <dir>               Where the PNGs and index.md go             (out/vfg-quality in the checkout)
+          --no-dumps                Scores only
+          --photo <image>           A picture to pan across for the photo scenes (default: a desktop wallpaper, if any)
+          --no-photo                Skip the photo scenes
+          --vfx-sdk <dir>, --settings <file>   As for bench vfg
+
         pattern options:
           --size <WxH>              Pattern and ring size                                     (2560x1440)
           --format <8|10>           8-bit RGBA8 (SDR) or 10-bit RGB10A2 (PQ)                  (8)
@@ -135,6 +169,11 @@ internal static class CommandDispatcher
           --unpaced                 With --offscreen: no pacing, no wait for a free image; as fast as back-pressure
                                     allows (a stress test: drops and held-back slots allowed, shown frames verified)
           --blend                   2x generator in the loop: real frames alternate with BlendGenerator at t = 0.5
+          --vfg                     2x with NVIDIA VFG instead, written straight into the ring slots; offscreen each
+                                    generated frame is scored against the pattern's true middle frame
+          --quality <mode>          With --vfg: low, medium or high                           (medium)
+          --vfx-sdk <dir>           With --vfg: the VFX SDK directory
+          --settings <file>         With --vfg: a settings file whose generator.vfxSdkDirectory to use
           --validate                Vulkan validation layer with synchronization checks; any message fails the run
           --window <WxH>            Window size                                               (960x540)
           --rate <hz>               Refresh rate to pace at (offscreen 120; windowed: the display's)
