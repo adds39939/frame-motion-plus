@@ -96,7 +96,7 @@ public class DisposedStreamTests
         setup.Synchronize();
         stream.Dispose();
 
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), a.AsFrame(), 0.7f, o.AsFrame(), GpuSignal.None));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), a.AsFrame(contentTimeNs: 2), 0.7f, o.AsFrame(), GpuSignal.None));
         env.Context.Synchronize();
         Assert.All(env.Read(setup, o.AsFrame()), p => Assert.Equal(0u, p));
     }

@@ -34,6 +34,7 @@ internal static class CommandDispatcher
                 "settings" => SettingsCommand.Run(rest, output),
                 "bench" => BenchCommand.Run(rest, output, error),
                 "pattern" => PatternCommand.Run(rest, output, error),
+                "decode" => DecodeCommand.Run(rest, output, error),
                 _ => throw new UsageException($"Unknown command '{args[0]}'."),
             };
         }
@@ -69,6 +70,8 @@ internal static class CommandDispatcher
           fmp bench vfg-quality [options]
                                     VFG on SDR and PQ scenes with known motion: scores and 16-bit PNG frame dumps
           fmp pattern [options]     CUDA test pattern through the presentation ring to a window or offscreen (Phase 2)
+          fmp decode <file> [options]
+                                    Decode a video file with NVDEC into CUDA, convert it to RGB and check it (Phase 4)
           fmp --version
           fmp --help
 
@@ -187,6 +190,23 @@ internal static class CommandDispatcher
                                     Fault injection, for testing teardown: FMP_PATTERN_FAIL_AT=<slot> in the environment
                                     makes the loop fail between acquiring that slot's write and signalling it (the run
                                     then fails with that cause and must still tear down cleanly).
+
+        decode options:
+          --frames <n>              Frames to read                          (the whole file; with --loop three laps)
+          --duration-s <s>          Read for this long instead
+          --loop                    Start again at the end of the file (each new lap is a discontinuity)
+          --verify                  Check every frame: the decoded NV12/P010 bit-exact against the ffmpeg CLI's software
+                                    decode, the converted RGB bit-exact against the CPU reference
+          --ffmpeg <path>           The ffmpeg CLI for --verify (ffprobe is looked for beside it)       (ffmpeg)
+          --decode-ahead <n>        Frames decoded ahead of the consumer                      (4)
+          --no-stall-probe          Do not time another thread's CUDA calls meanwhile
+          --csv <path>              Write per-frame content times, decode and convert costs and queue depth
+                                    Prints the stream (codec, size, bit depth, rate, colour and HDR metadata), frames and
+                                    PTS statistics, per-frame GPU and decode-thread costs, queue depth, the worst stall of
+                                    another thread's CUDA calls, allocations and GC counts. Exits 1 on a mismatch,
+                                    non-increasing content times, FFmpeg frame-pool growth, a consumer-path allocation or a
+                                    file that cannot be played; 69 without a GPU, the FFmpeg 9 libraries or (for --verify)
+                                    the ffmpeg CLI.
 
         Exit codes: 0 success, 1 check or validation failed, 2 usage error, 70 internal error; 69 when a GPU or display is required but not there.
 

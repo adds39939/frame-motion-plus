@@ -6,6 +6,8 @@ namespace FrameMotionPlus.Core.Simulation;
 /// <summary>A generator that does no work. It validates its inputs and counts calls, for simulations and tests.</summary>
 public sealed class NullFrameGenerator : IFrameGenerator
 {
+    private readonly DiscontinuityLatch _discontinuity = new();
+
     public NullFrameGenerator(FrameGenCapabilities? capabilities = null)
     {
         Capabilities = capabilities ?? new FrameGenCapabilities
@@ -26,6 +28,9 @@ public sealed class NullFrameGenerator : IFrameGenerator
     public long EnqueueCount { get; private set; }
 
     public long DiscontinuityCount { get; private set; }
+
+    /// <summary>Enqueue calls whose pair spanned a notified discontinuity (Core's rule, <see cref="DiscontinuityLatch"/>).</summary>
+    public long DiscontinuousEnqueueCount { get; private set; }
 
     public float LastTimestep { get; private set; }
 
@@ -50,11 +55,20 @@ public sealed class NullFrameGenerator : IFrameGenerator
             throw new ArgumentException("Previous, current and output frames must share size and format family.", nameof(output));
         }
 
+        DiscontinuityLatch.ValidatePair(prev, curr);
         LastTimestep = t;
         EnqueueCount++;
+        if (_discontinuity.Observe(prev, curr))
+        {
+            DiscontinuousEnqueueCount++;
+        }
     }
 
-    public void NotifyDiscontinuity() => DiscontinuityCount++;
+    public void NotifyDiscontinuity(long contentTimeNs)
+    {
+        _discontinuity.Notify(contentTimeNs);
+        DiscontinuityCount++;
+    }
 
     public void Dispose() => IsDisposed = true;
 }

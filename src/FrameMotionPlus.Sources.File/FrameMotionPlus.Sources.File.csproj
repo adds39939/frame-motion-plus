@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>FrameMotionPlus.Sources.File</RootNamespace>
+    <AssemblyName>FrameMotionPlus.Sources.File</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The layout test reads every declared offset; the source tests reach the decoder's counters and test hooks. -->
+    <InternalsVisibleTo Include="FrameMotionPlus.Sources.File.Tests" />
+  </ItemGroup>
+
+</Project>

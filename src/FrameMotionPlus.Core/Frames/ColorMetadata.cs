@@ -7,6 +7,12 @@ public enum ColorPrimaries
     Bt2020 = 2,
     DciP3 = 3,
     DisplayP3 = 4,
+
+    /// <summary>BT.601 525-line (SMPTE 170M; SMPTE 240M has the same primaries): standard-definition "NTSC" video.</summary>
+    Bt601Line525 = 5,
+
+    /// <summary>BT.601 625-line (BT.470 System B/G, EBU Tech 3213): standard-definition "PAL" video.</summary>
+    Bt601Line625 = 6,
 }
 
 public enum TransferFunction
@@ -83,7 +89,16 @@ public readonly record struct ContentLightLevel(ushort MaxCll, ushort MaxFall)
     public bool IsSpecified => MaxCll > 0 || MaxFall > 0;
 }
 
-/// <summary>Colour description that travels with every frame. Blittable.</summary>
+/// <summary>
+/// Colour description that travels with every frame. Blittable.
+/// <para>
+/// It describes the pixels of the frame it travels with, as they are stored. The pipeline's frames are RGB
+/// (<see cref="PixelFormat"/>), so theirs is <see cref="MatrixCoefficients.Identity"/> and <see cref="ColorRange.Full"/>,
+/// with the primaries, transfer function and HDR metadata of the content (<see cref="SdrBt709"/>, <see cref="Hdr10"/>).
+/// A source that decodes YCbCr describes its converted frames this way; the YCbCr matrix and range it converted from
+/// belong to the source's own stream description, not to the frames.
+/// </para>
+/// </summary>
 public readonly record struct ColorMetadata
 {
     public ColorPrimaries Primaries { get; init; }

@@ -94,15 +94,19 @@ public class FrameTypesTests
     public void Null_generator_validates_inputs()
     {
         using var g = new NullFrameGenerator();
-        var f = new GpuFrame { Width = 64, Height = 64, Format = PixelFormat.Rgb10A2, Address = 1 };
+        var f = new GpuFrame { Width = 64, Height = 64, Format = PixelFormat.Rgb10A2, Address = 1, ContentTimeNs = 10 };
+        var later = f with { ContentTimeNs = 20 };
         g.Configure(new FrameGenConfig { Width = 64, Height = 64, Format = PixelFormat.Rgb10A2 });
-        g.Enqueue(f, f, 0.5f, f, GpuSignal.None);
+        g.Enqueue(f, later, 0.5f, f, GpuSignal.None);
         Assert.Equal(1, g.EnqueueCount);
-        Assert.Throws<ArgumentOutOfRangeException>(() => g.Enqueue(f, f, 0f, f, GpuSignal.None));
-        Assert.Throws<ArgumentOutOfRangeException>(() => g.Enqueue(f, f, 1f, f, GpuSignal.None));
-        Assert.Throws<ArgumentException>(() => g.Enqueue(f, f with { Format = PixelFormat.Rgba8 }, 0.5f, f, GpuSignal.None));
-        g.NotifyDiscontinuity();
+        Assert.Throws<ArgumentOutOfRangeException>(() => g.Enqueue(f, later, 0f, f, GpuSignal.None));
+        Assert.Throws<ArgumentOutOfRangeException>(() => g.Enqueue(f, later, 1f, f, GpuSignal.None));
+        Assert.Throws<ArgumentException>(() => g.Enqueue(f, later with { Format = PixelFormat.Rgba8 }, 0.5f, f, GpuSignal.None));
+        Assert.Throws<ArgumentException>(() => g.Enqueue(f, f, 0.5f, f, GpuSignal.None)); // content times must increase
+        g.NotifyDiscontinuity(later.ContentTimeNs);
         Assert.Equal(1, g.DiscontinuityCount);
+        g.Enqueue(f, later, 0.5f, f, GpuSignal.None);
+        Assert.Equal(1, g.DiscontinuousEnqueueCount);
         Assert.Equal(8, g.Capabilities.MaxMultiplier);
         Assert.False(g.Capabilities.SupportsScaling);
     }

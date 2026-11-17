@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using FrameMotionPlus.Core.Abstractions;
 using FrameMotionPlus.Core.Frames;
+using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Cuda;
 using FrameMotionPlus.Vfx;
 
@@ -115,8 +116,8 @@ internal sealed class VfgQuality
                 // The buffers are 32-bit whatever the format; only the frame descriptions differ.
                 var format = scene.Format;
                 generator.Configure(new FrameGenConfig { Width = _width, Height = _height, Format = format, Quality = mode });
-                var fp = prev.AsFrame(_width, _height, format, prev.PitchBytes);
-                var fc = curr.AsFrame(_width, _height, format, curr.PitchBytes);
+                var fp = prev.AsFrame(_width, _height, format, prev.PitchBytes) with { ContentTimeNs = 0 };
+                var fc = curr.AsFrame(_width, _height, format, curr.PitchBytes) with { ContentTimeNs = Nanoseconds.PerSecond / 60 };
                 var fo = output.AsFrame(_width, _height, format, output.PitchBytes);
                 stream.CopyFrameFromHost(scene.Prev, fp);
                 stream.CopyFrameFromHost(scene.Curr, fc);

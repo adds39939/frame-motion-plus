@@ -37,7 +37,7 @@ public class LifecycleTests
                 using var done = CudaEvent.Create(env.Context);
                 for (var i = 0; i < 4; i++)
                 {
-                    generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f * (i + 1) / 2, o.AsFrame(), done.Signal);
+                    generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.25f * (i + 1) / 2, o.AsFrame(), done.Signal);
                 }
 
                 done.Synchronize();

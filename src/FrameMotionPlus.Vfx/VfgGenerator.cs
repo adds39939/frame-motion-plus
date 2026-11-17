@@ -74,24 +74,38 @@ public readonly record struct VfgLoadReport
 /// from a generator thread of its own (see <see cref="IFrameGenerator.Enqueue"/>); see docs/benchmarks/phase3-vfg.md.
 /// </para>
 /// <para>
-/// <b>Discontinuities</b> follow Core's rule (<see cref="DiscontinuityLatch"/>): after <see cref="NotifyDiscontinuity"/>,
-/// every call with the next pair runs with VFG's manual shot-change flag (output: the current frame), t = 0 still shows
-/// the previous frame, and a call with another pair ends it.
+/// <b>Discontinuities</b> follow Core's rule (<see cref="DiscontinuityLatch"/>): every call whose pair spans a content
+/// time given to <see cref="NotifyDiscontinuity"/> runs with VFG's manual shot-change flag (output: the current frame),
+/// t = 0 still shows the previous frame, and the first pair past it ends the notification. A pair's content times must
+/// increase.
 /// </para>
 /// <para>
-/// <b>Failure.</b> A call that throws produced nothing and does not signal <c>done</c>. If the SDK failed (a
-/// <see cref="VfxException"/>), the instance is marked faulted (<see cref="IsFaulted"/>): later calls throw until
-/// <see cref="Configure"/> loads it again (a drained point).
+/// <b>Failure.</b> A call that throws does not signal <c>done</c> (see <see cref="IFrameGenerator.Enqueue"/>,
+/// "Failure"). One refused for its arguments enqueued nothing. If the SDK failed (a <see cref="VfxException"/>), the
+/// three GPU-side waits were already enqueued on <see cref="Stream"/> and the run may have queued work that partly wrote
+/// the output; the instance is marked faulted (<see cref="IsFaulted"/>): later calls throw until <see cref="Configure"/>
+/// loads it again (a drained point).
 /// </para>
 /// <para>
 /// <b>Configure and reload.</b> A configuration whose instance is already loaded (<see cref="Prepare"/>) is switched to
-/// at once, allocation-free and without any CUDA call, so switching between prepared instances (SDR/HDR) is safe
-/// during playback. Loading a new instance is not: <c>NvVFX_Load</c> (and destroying an instance) waits for all work
-/// queued in the CUDA context and blocks every other thread's CUDA calls meanwhile, so <see cref="Configure"/> of an
-/// unprepared configuration, <see cref="Prepare"/>, <see cref="ReleaseInactive"/> and <see cref="Dispose"/> belong to a
-/// drained point (production stopped, the ring drained) and never to a pacing thread.
+/// at once, without any CUDA call, so switching between prepared instances (SDR/HDR) is safe during playback. The
+/// active instance and the configuration its frames are checked against are one immutable object, published whole, and
+/// <see cref="Enqueue"/> reads it once: a switch from another thread lands before or after a call, never inside one, so
+/// a call never runs one instance on frames checked against another's configuration (frames of the old shape after a
+/// switch are refused as arguments, which does not fault anything). Loading a new instance is not safe during playback:
+/// <c>NvVFX_Load</c> (and destroying an instance) waits for all work queued in the CUDA context and blocks every other
+/// thread's CUDA calls meanwhile, so <see cref="Configure"/> of an unprepared configuration, <see cref="Prepare"/>,
+/// <see cref="ReleaseInactive"/> and <see cref="Dispose"/> belong to a drained point (production stopped, the ring
+/// drained) and never to a pacing thread.
 /// </para>
-/// <para>Enqueue, Configure, Prepare and Dispose are for one thread at a time; <see cref="NotifyDiscontinuity"/> may come from any thread.</para>
+/// <para>
+/// <b>Threads.</b> <see cref="Enqueue"/> and <see cref="TryReadGpuTime"/> belong to the generator thread.
+/// <see cref="TryConfigurePrepared"/> and <see cref="NotifyDiscontinuity"/> may come from any thread, also while that
+/// thread enqueues (a pipeline's control thread). <see cref="Configure"/>, <see cref="Prepare"/>,
+/// <see cref="ReleaseInactive"/> and <see cref="Dispose"/> are for one thread at a time, never concurrent with each other
+/// or with <see cref="TryConfigurePrepared"/>, and never concurrent with <see cref="Enqueue"/> except for a
+/// <see cref="Configure"/> that only switches to a prepared instance.
+/// </para>
 /// </summary>
 public sealed class VfgGenerator : IFrameGenerator
 {
@@ -101,8 +115,7 @@ public sealed class VfgGenerator : IFrameGenerator
     private readonly CudaSpanTimerRing _timer;
     private readonly List<VfgEffect> _instances = [];
     private readonly DiscontinuityLatch _discontinuity = new();
-    private VfgEffect? _active;
-    private FrameGenConfig _config;
+    private VfgActivation? _active; // the active instance and its configuration: replaced whole, read once per Enqueue
     private bool _disposed;
     private long _useClock;
 
@@ -169,18 +182,18 @@ public sealed class VfgGenerator : IFrameGenerator
     public CudaStream Stream { get; }
 
     /// <summary>The active configuration (default before <see cref="Configure"/>).</summary>
-    public FrameGenConfig Config => _config;
+    public FrameGenConfig Config => Volatile.Read(ref _active)?.Config ?? default;
 
-    public bool IsConfigured => _active is not null;
+    public bool IsConfigured => Volatile.Read(ref _active) is not null;
 
     /// <summary>
     /// True when the active instance failed in the SDK: <see cref="Enqueue"/> throws until <see cref="Configure"/>
     /// (same configuration or another) loads it again.
     /// </summary>
-    public bool IsFaulted => _active is { IsFaulted: true };
+    public bool IsFaulted => Volatile.Read(ref _active) is { Effect.IsFaulted: true };
 
     /// <summary>The active instance (tests).</summary>
-    internal VfgEffect? ActiveEffect => _active;
+    internal VfgEffect? ActiveEffect => Volatile.Read(ref _active)?.Effect;
 
     /// <summary>The most recent load (<see cref="Configure"/> or <see cref="Prepare"/> of a new instance).</summary>
     public VfgLoadReport LastLoad { get; private set; }
@@ -216,9 +229,9 @@ public sealed class VfgGenerator : IFrameGenerator
         {
             // A faulted instance is reloaded from scratch (destroying it synchronises the context, as the load will).
             _instances.Remove(instance);
-            if (ReferenceEquals(instance, _active))
+            if (ReferenceEquals(instance, ActiveEffect))
             {
-                _active = null;
+                Volatile.Write(ref _active, null);
             }
 
             instance.Dispose();
@@ -226,14 +239,15 @@ public sealed class VfgGenerator : IFrameGenerator
         }
 
         instance ??= Build(key);
-        instance.LastUsed = ++_useClock;
-        _active = instance;
-        _config = config;
+        Activate(instance, config);
     }
 
     /// <summary>
-    /// Switches to <paramref name="config"/> only if its instance is loaded already (and not faulted): no load, no CUDA
-    /// call, allocation-free, so it is safe on any thread during playback. False, and nothing changed, otherwise.
+    /// Switches to <paramref name="config"/> only if its instance is loaded already (and not faulted): no load and no CUDA
+    /// call, so it is safe during playback, from any thread, also while the generator thread is inside
+    /// <see cref="Enqueue"/> (see the class remarks, "Threads"): the instance and the configuration are published as one
+    /// object, which a call in progress does not see. Allocation-free when switching to a configuration the instance was
+    /// prepared, configured or switched to before (one small object otherwise). False, and nothing changed, otherwise.
     /// </summary>
     public bool TryConfigurePrepared(in FrameGenConfig config)
     {
@@ -249,9 +263,7 @@ public sealed class VfgGenerator : IFrameGenerator
             return false;
         }
 
-        instance.LastUsed = ++_useClock;
-        _active = instance;
-        _config = config;
+        Activate(instance, config);
         return true;
     }
 
@@ -270,20 +282,32 @@ public sealed class VfgGenerator : IFrameGenerator
             return default;
         }
 
-        var wasActive = false;
+        var wasActive = Volatile.Read(ref _active);
         if (existing is not null)
         {
             // Faulted: reload it from scratch (and keep it active if it was).
             _instances.Remove(existing);
-            wasActive = ReferenceEquals(existing, _active);
-            _active = wasActive ? null : _active;
+            if (ReferenceEquals(existing, wasActive?.Effect))
+            {
+                Volatile.Write(ref _active, null);
+            }
+            else
+            {
+                wasActive = null;
+            }
+
             existing.Dispose();
+        }
+        else
+        {
+            wasActive = null;
         }
 
         var instance = Build(key);
-        if (wasActive)
+        instance.Activation = new VfgActivation(instance, config);
+        if (wasActive is not null)
         {
-            _active = instance;
+            Activate(instance, wasActive.Config);
         }
 
         return LastLoad;
@@ -297,9 +321,10 @@ public sealed class VfgGenerator : IFrameGenerator
     public void ReleaseInactive()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        var active = ActiveEffect;
         for (var i = _instances.Count - 1; i >= 0; i--)
         {
-            if (!ReferenceEquals(_instances[i], _active))
+            if (!ReferenceEquals(_instances[i], active))
             {
                 var instance = _instances[i];
                 _instances.RemoveAt(i);
@@ -320,20 +345,24 @@ public sealed class VfgGenerator : IFrameGenerator
             ThrowTimestep(t);
         }
 
-        var effect = _active;
-        if (effect is null)
+        // One read: the instance that runs and the configuration the frames are checked against belong together, whatever
+        // another thread switches to meanwhile (TryConfigurePrepared).
+        var active = Volatile.Read(ref _active);
+        if (active is null)
         {
             ThrowNotConfigured();
         }
 
+        var effect = active.Effect;
         if (effect.IsFaulted)
         {
-            ThrowFaulted();
+            ThrowFaulted(active.Config);
         }
 
-        Validate(prev, nameof(prev));
-        Validate(curr, nameof(curr));
-        Validate(output, nameof(output));
+        Validate(prev, nameof(prev), active.Config);
+        Validate(curr, nameof(curr), active.Config);
+        Validate(output, nameof(output), active.Config);
+        DiscontinuityLatch.ValidatePair(prev, curr);
         CudaStream.ValidateCudaSignal(prev.Ready, nameof(prev));
         CudaStream.ValidateCudaSignal(curr.Ready, nameof(curr));
         CudaStream.ValidateCudaSignal(output.Ready, nameof(output));
@@ -351,7 +380,7 @@ public sealed class VfgGenerator : IFrameGenerator
 
         stream.WaitValidated(output.Ready);
 
-        // Core's "next pair": every call with the pair after a notification is discontinuous (t = 0 still shows prev).
+        // Core's rule: every call whose pair spans a notified cut is discontinuous (t = 0 still shows prev).
         var discontinuity = _discontinuity.Observe(prev, curr);
         _timer.Begin(stream);
         try
@@ -393,12 +422,13 @@ public sealed class VfgGenerator : IFrameGenerator
     }
 
     /// <summary>
-    /// Source switch, seek or detected cut (Core's "next pair", <see cref="DiscontinuityLatch"/>): every
-    /// <see cref="Enqueue"/> with the pair of the next call runs with VFG's manual shot-change flag, which outputs the
-    /// current frame unchanged (cleared again after each run); t = 0 shows the previous frame; a call with a different
-    /// pair ends it. Safe from any thread; call it right before enqueueing the pair across the cut.
+    /// Source switch, seek or detected cut at the frame with content time <paramref name="contentTimeNs"/> (Core's rule,
+    /// <see cref="DiscontinuityLatch"/>): every <see cref="Enqueue"/> whose pair spans it runs with VFG's manual
+    /// shot-change flag, which outputs the current frame unchanged (cleared again after each run); t = 0 shows the
+    /// previous frame; the first pair that starts at or after it ends the notification. Safe from any thread, at any time
+    /// before the pair across the cut is enqueued.
     /// </summary>
-    public void NotifyDiscontinuity() => _discontinuity.Notify();
+    public void NotifyDiscontinuity(long contentTimeNs) => _discontinuity.Notify(contentTimeNs);
 
     /// <summary>Non-blocking: GPU time of the oldest unread finished <see cref="Enqueue"/>, ns (the d of the latency model).</summary>
     public bool TryReadGpuTime(out long nanoseconds) => _timer.TryRead(out nanoseconds);
@@ -415,7 +445,7 @@ public sealed class VfgGenerator : IFrameGenerator
         }
 
         _disposed = true;
-        _active = null;
+        Volatile.Write(ref _active, null);
         foreach (var instance in _instances)
         {
             instance.Dispose();
@@ -448,9 +478,10 @@ public sealed class VfgGenerator : IFrameGenerator
         while (_instances.Count >= Options.MaxLoadedInstances)
         {
             var oldest = -1;
+            var active = ActiveEffect;
             for (var i = 0; i < _instances.Count; i++)
             {
-                if (!ReferenceEquals(_instances[i], _active) && (oldest < 0 || _instances[i].LastUsed < _instances[oldest].LastUsed))
+                if (!ReferenceEquals(_instances[i], active) && (oldest < 0 || _instances[i].LastUsed < _instances[oldest].LastUsed))
                 {
                     oldest = i;
                 }
@@ -460,7 +491,7 @@ public sealed class VfgGenerator : IFrameGenerator
             {
                 // Only the active one is loaded and the limit is 1: replace it.
                 oldest = 0;
-                _active = null;
+                Volatile.Write(ref _active, null);
             }
 
             var evicted = _instances[oldest];
@@ -533,6 +564,23 @@ public sealed class VfgGenerator : IFrameGenerator
 
     private static long ElapsedNs(long started) => (long)Stopwatch.GetElapsedTime(started).TotalNanoseconds;
 
+    /// <summary>
+    /// Makes <paramref name="instance"/> active with <paramref name="config"/>, published as one object. Reuses the
+    /// instance's last activation when the configuration is the same (no allocation).
+    /// </summary>
+    private void Activate(VfgEffect instance, in FrameGenConfig config)
+    {
+        var activation = instance.Activation;
+        if (activation is null || activation.Config != config)
+        {
+            activation = new VfgActivation(instance, config);
+            instance.Activation = activation;
+        }
+
+        instance.LastUsed = Interlocked.Increment(ref _useClock);
+        Volatile.Write(ref _active, activation);
+    }
+
     private VfgInstanceKey Validate(in FrameGenConfig config)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(config.Width, nameof(config));
@@ -550,13 +598,12 @@ public sealed class VfgGenerator : IFrameGenerator
         return VfgInstanceKey.Of(config);
     }
 
-    private void Validate(in GpuFrame frame, string paramName)
+    private static void Validate(in GpuFrame frame, string paramName, in FrameGenConfig config)
     {
-        var config = _config;
         FrameChecks.ValidateCudaImage(frame, paramName);
         if (frame.Width != config.Width || frame.Height != config.Height || frame.Format != config.Format)
         {
-            ThrowShape(frame, paramName);
+            ThrowShape(frame, paramName, config);
         }
     }
 
@@ -571,13 +618,21 @@ public sealed class VfgGenerator : IFrameGenerator
     private static void ThrowNotConfigured() => throw new InvalidOperationException("VfgGenerator.Configure has not been called.");
 
     [DoesNotReturn]
-    private void ThrowFaulted() => throw new InvalidOperationException(
-        $"The VFG instance for {_config.Width}x{_config.Height} {_config.Format} failed in the SDK earlier and is faulted; " +
+    private static void ThrowFaulted(in FrameGenConfig config) => throw new InvalidOperationException(
+        $"The VFG instance for {config.Width}x{config.Height} {config.Format} failed in the SDK earlier and is faulted; " +
         "Configure loads it again (at a drained point).");
 
     [DoesNotReturn]
-    private void ThrowShape(in GpuFrame frame, string paramName) =>
+    private static void ThrowShape(in GpuFrame frame, string paramName, in FrameGenConfig config) =>
         throw new ArgumentException(
-            $"{frame.Width}x{frame.Height} {frame.Format} does not match the configured {_config.Width}x{_config.Height} {_config.Format}.",
+            $"{frame.Width}x{frame.Height} {frame.Format} does not match the configured {config.Width}x{config.Height} {config.Format}.",
             paramName);
+}
+
+/// <summary>An instance of <see cref="VfgGenerator"/> made active with one configuration. Immutable; published whole.</summary>
+internal sealed class VfgActivation(VfgEffect effect, FrameGenConfig config)
+{
+    public VfgEffect Effect { get; } = effect;
+
+    public FrameGenConfig Config { get; } = config;
 }

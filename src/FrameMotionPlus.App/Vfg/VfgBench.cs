@@ -147,6 +147,7 @@ internal sealed class VfgBench
         var dCount = 0;
         long late = 0;
         var periodNs = _o.Rate.PeriodNs;
+        var sourcePeriodNs = (long)(periodNs * multiplier);
         var start = Monotonic.NowNs + (20 * Nanoseconds.PerMillisecond);
         var targets = outputs.Select(o => o.AsFrame()).ToArray();
         var tally = new CheckTally();
@@ -173,8 +174,13 @@ internal sealed class VfgBench
             }
 
             var output = targets[n % Outputs];
+
+            // Source frame k of the sequence has content time k source periods: the pair's times increase, as
+            // generators require, though the ping-pong order reuses the buffers backwards.
+            var prev = content.Frame(from) with { ContentTimeNs = pair * sourcePeriodNs };
+            var curr = content.Frame(to) with { ContentTimeNs = (pair + 1) * sourcePeriodNs };
             var t0 = Stopwatch.GetTimestamp();
-            generator.Enqueue(content.Frame(from), content.Frame(to), t, output, done.Signal);
+            generator.Enqueue(prev, curr, t, output, done.Signal);
             var hostNs = (long)Stopwatch.GetElapsedTime(t0).TotalNanoseconds;
             var measured = n >= _o.WarmupFrames;
             if (measured)

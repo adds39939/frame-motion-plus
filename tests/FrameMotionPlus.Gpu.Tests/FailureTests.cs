@@ -125,19 +125,26 @@ public class FailureTests
         bridge.Configure(new BridgeConfig { Width = Width, Height = Height, Format = PixelFormat.Rgba8 });
         Assert.Same(ring, bridge.Ring); // the same shape again changes nothing
 
-        // Reconfiguring the presenter behind the bridge's back is caught on the next acquire, and Configure recovers.
+        // Reconfiguring the presenter behind the bridge's back is caught on the next acquire, and Configure recovers. The
+        // old ring's writes are released from CUDA and its import goes to the reaper (bridge backlog item 2: with the
+        // presenter gone from that ring, only a GPU-side wait could tell when they finish).
         var slot = bridge.AcquireSlot();
         rig.Stream.Signal(slot.ProducerSignal);
         presenter.Configure(new PresenterConfig { Width = Width * 2, Height = Height, Format = PixelFormat.Rgba8 });
         Assert.Contains("CudaVulkanBridge.Configure", Assert.Throws<InvalidOperationException>(() => bridge.AcquireSlot()).Message, StringComparison.Ordinal);
         bridge.Configure(new BridgeConfig { Width = Width * 2, Height = Height, Format = PixelFormat.Rgba8 });
+        Assert.Equal(1, bridge.AbandonedImports);
         Assert.Same(presenter.Ring, bridge.Ring);
         var first = bridge.AcquireSlot();
         Assert.Equal(1UL, first.ProducerSignal.Value); // a fresh ring starts at write 1
         rig.Stream.Signal(first.ProducerSignal);
 
         bridge.Dispose();
-        Assert.Equal(0, bridge.AbandonedImports);
+        Assert.Equal(1, bridge.AbandonedImports); // the old ring's, from the Configure above; this ring's drained
+
+        // The old import is held while the rig's own bridge is live on the context, and freed when that one goes too.
+        rig.Bridge.Dispose();
+        Assert.True(CudaVulkanBridge.WaitForReaper(TimeSpan.FromSeconds(5)), "the old ring's import was not freed once no bridge was live");
         Assert.Throws<ObjectDisposedException>(() => bridge.AcquireSlot());
         Assert.Throws<ObjectDisposedException>(() => bridge.Configure(new BridgeConfig { Width = Width, Height = Height, Format = PixelFormat.Rgba8 }));
         bridge.Dispose();
@@ -206,8 +213,19 @@ public class FailureTests
         var start = Stopwatch.GetTimestamp();
         rig.Bridge.Dispose();
         Assert.True(Stopwatch.GetElapsedTime(start).TotalSeconds < 3, "Dispose hung");
+
+        // The bridge released every write from CUDA and handed the import to the reaper without waiting GPU-side (bridge
+        // backlog item 2), so the last write finishes on its own, shortly after.
+        var deadline = Stopwatch.GetTimestamp() + (2 * Stopwatch.Frequency);
+        while (!rig.Stream.IsIdle && Stopwatch.GetTimestamp() < deadline)
+        {
+            Thread.Sleep(1);
+        }
+
         Assert.True(rig.Stream.IsIdle, "the producer's last write never finished");
         Assert.Equal(0, rig.Bridge.LiveImportObjects);
+        Assert.Equal(1, rig.Bridge.AbandonedImports);
+        Assert.True(CudaVulkanBridge.WaitForReaper(TimeSpan.FromSeconds(5)), "the reaper never freed the import");
     });
 
     /// <summary>

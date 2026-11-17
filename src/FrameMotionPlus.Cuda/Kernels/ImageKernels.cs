@@ -6,14 +6,14 @@ namespace FrameMotionPlus.Cuda.Kernels;
 
 /// <summary>
 /// The kernels in native/kernels, loaded from the PTX embedded in this assembly: test pattern, blend, format
-/// conversion and a GPU delay. Each Enqueue method validates its frames on the host, launches on the given stream
+/// conversion, YCbCr 4:2:0 to RGB and a GPU delay. Each Enqueue method validates its frames on the host, launches on the given stream
 /// and returns; none waits on <see cref="GpuFrame.Ready"/> (callers that need it do <see cref="CudaStream.Wait(in GpuSignal)"/>).
 /// Allocation-free per call.
 /// </summary>
 public sealed unsafe class ImageKernels : IDisposable
 {
     /// <summary>Embedded module names (native/kernels/*.cu).</summary>
-    public static readonly IReadOnlyList<string> ModuleNames = ["blend", "convert", "pattern", "util"];
+    public static readonly IReadOnlyList<string> ModuleNames = ["blend", "convert", "pattern", "util", "yuv"];
 
     private static readonly CudaDim3 _block = new(32, 8);
 
@@ -26,6 +26,7 @@ public sealed unsafe class ImageKernels : IDisposable
     private readonly CudaKernel _rgb10A2ToRgba8;
     private readonly CudaKernel _swapRedBlue8;
     private readonly CudaKernel _delay;
+    private readonly CudaKernel _yuvToRgb;
 
     private ImageKernels(CudaModule[] modules)
     {
@@ -35,6 +36,7 @@ public sealed unsafe class ImageKernels : IDisposable
         var convert = modules[1];
         var pattern = modules[2];
         var util = modules[3];
+        var yuv = modules[4];
         _patternRgba8 = pattern.GetKernel("fmp_pattern_rgba8");
         _patternRgb10A2 = pattern.GetKernel("fmp_pattern_rgb10a2");
         _blendRgba8 = blend.GetKernel("fmp_blend_rgba8");
@@ -43,6 +45,7 @@ public sealed unsafe class ImageKernels : IDisposable
         _rgb10A2ToRgba8 = convert.GetKernel("fmp_rgb10a2_to_rgba8");
         _swapRedBlue8 = convert.GetKernel("fmp_swap_red_blue8");
         _delay = util.GetKernel("fmp_delay_ns");
+        _yuvToRgb = yuv.GetKernel("fmp_yuv420_to_rgb");
     }
 
     /// <summary>The context the modules are loaded in; launches must use streams of the same context.</summary>
@@ -208,6 +211,39 @@ public sealed unsafe class ImageKernels : IDisposable
         }
     }
 
+    /// <summary>
+    /// Converts the 4:2:0 YCbCr image <paramref name="source"/> into <paramref name="destination"/> (pitch-linear RGBA8 or
+    /// RGB10A2 of the same size) by <paramref name="conversion"/>: chroma upsampled bilinearly at its siting, then the
+    /// stream's matrix and range in exact integer arithmetic (native/kernels/yuv.cu). Allocation-free.
+    /// </summary>
+    public void EnqueueYuvToRgb(CudaStream stream, in YuvPlanes source, in GpuFrame destination, in YuvConversion conversion)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        FrameChecks.ValidateCudaImage(destination, nameof(destination));
+        if (!conversion.IsValid || destination.Format != conversion.Output)
+        {
+            ThrowYuvOutput(destination.Format, conversion.Output);
+        }
+
+        ValidatePlanes(source, conversion.SourceBits);
+        if (source.Width != destination.Width || source.Height != destination.Height)
+        {
+            ThrowYuvSize(source, destination);
+        }
+
+        var luma = source.Luma;
+        var lumaPitch = (uint)source.LumaPitch;
+        var chroma = source.Chroma;
+        var chromaPitch = (uint)source.ChromaPitch;
+        var dst = destination.Address + destination.Offset;
+        var dstPitch = (uint)destination.PitchBytes;
+        var width = destination.Width;
+        var height = destination.Height;
+        var parameters = conversion.Parameters;
+        var args = stackalloc void*[9] { &luma, &lumaPitch, &chroma, &chromaPitch, &dst, &dstPitch, &width, &height, &parameters };
+        _yuvToRgb.Launch(stream, Grid(width, height), _block, 0, args);
+    }
+
     /// <summary>Keeps <paramref name="stream"/> busy for <paramref name="nanoseconds"/> of GPU time (diagnostics, tests).</summary>
     public void EnqueueDelay(CudaStream stream, long nanoseconds)
     {
@@ -231,6 +267,43 @@ public sealed unsafe class ImageKernels : IDisposable
 
     private static bool SameShape(in GpuFrame a, in GpuFrame b) =>
         a.Width == b.Width && a.Height == b.Height && a.Format == b.Format;
+
+    private static void ValidatePlanes(in YuvPlanes source, int sourceBits)
+    {
+        var expected = sourceBits > 8 ? YuvSampleFormat.P010 : YuvSampleFormat.Nv12;
+        if (source.Format != expected)
+        {
+            ThrowYuvFormat(source.Format, sourceBits);
+        }
+
+        var rowBytes = (long)source.Width * source.BytesPerSample;
+        var chromaRowBytes = (long)((source.Width + 1) / 2) * 2 * source.BytesPerSample;
+        if (source.Width <= 0 || source.Height <= 0 || source.Luma == 0 || source.Chroma == 0 ||
+            source.LumaPitch < rowBytes || source.ChromaPitch < chromaRowBytes ||
+            source.Luma % (ulong)source.BytesPerSample != 0 || source.Chroma % (ulong)source.BytesPerSample != 0 ||
+            source.LumaPitch % source.BytesPerSample != 0 || source.ChromaPitch % source.BytesPerSample != 0)
+        {
+            ThrowPlanes(source);
+        }
+    }
+
+    [DoesNotReturn]
+    private static void ThrowYuvOutput(PixelFormat destination, PixelFormat conversion) =>
+        throw new ArgumentException($"The destination is {destination}; the conversion writes {conversion}.", nameof(destination));
+
+    [DoesNotReturn]
+    private static void ThrowYuvFormat(YuvSampleFormat source, int bits) =>
+        throw new ArgumentException($"{source} samples do not match a {bits}-bit conversion (NV12 is 8-bit, P010 10-bit).", nameof(source));
+
+    [DoesNotReturn]
+    private static void ThrowYuvSize(in YuvPlanes source, in GpuFrame destination) =>
+        throw new ArgumentException(
+            $"The source is {source.Width}x{source.Height} and the destination {destination.Width}x{destination.Height}; the conversion does not scale.",
+            nameof(destination));
+
+    [DoesNotReturn]
+    private static void ThrowPlanes(in YuvPlanes source) =>
+        throw new ArgumentException($"Invalid planes: {source}.", nameof(source));
 
     [DoesNotReturn]
     private static void ThrowTimestep(float t) =>

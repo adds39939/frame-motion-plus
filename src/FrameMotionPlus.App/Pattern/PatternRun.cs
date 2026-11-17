@@ -78,6 +78,7 @@ internal sealed class PatternRun : IDisposable
 
     // Loop results, written by the present thread, read after it has been joined.
     private PatternSeries _series = null!;
+    private long _sourceContentNs; // the last source frame's content time: every frame gets a distinct, later one
     private long _presented;
     private long _dropped;
     private long _skipped;
@@ -763,13 +764,18 @@ internal sealed class PatternRun : IDisposable
         _lastReader[b] = slot.ProducerSignal;
     }
 
-    /// <summary>Source frame <paramref name="j"/> into its history buffer, once the buffer's last reader is done.</summary>
+    /// <summary>
+    /// Source frame <paramref name="j"/> into its history buffer, once the buffer's last reader is done. Its content time
+    /// is when it was drawn (CLOCK_MONOTONIC), kept strictly increasing: generators match discontinuities by content time
+    /// and refuse a pair whose times do not increase.
+    /// </summary>
     private void DrawSource(long j)
     {
         var h = (int)(j % HistorySize);
         var source = _sourceStream!;
         source.Wait(_lastReader[h]);
-        var frame = _history[h]!.AsFrame(ready: _drawn[h]!.Signal);
+        _sourceContentNs = Math.Max(Monotonic.NowNs, _sourceContentNs + 1);
+        var frame = _history[h]!.AsFrame(contentTimeNs: _sourceContentNs, ready: _drawn[h]!.Signal);
         _patternTimer!.Begin(source);
 
         // With VFG source frame j is pattern frame 2j, so the true middle of each pair (2j + 1) is known.

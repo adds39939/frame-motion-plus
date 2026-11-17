@@ -34,7 +34,7 @@ public class GeneratorTests
         generator.Configure(new FrameGenConfig { Width = Width, Height = Height, Format = format });
         foreach (var t in new[] { 0.5f, 0.3f, 0f, 1f })
         {
-            generator.Enqueue(a.AsFrame(), b.AsFrame(), t, o.AsFrame(), done.Signal);
+            generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), t, o.AsFrame(), done.Signal);
             done.Synchronize();
             var expected = Reference.Blend(Reference.Pattern(Width, Height, 10, format), Reference.Pattern(Width, Height, 11, format), Reference.BlendWeight(t), format);
             var actual = env.Read(setup, o.AsFrame());
@@ -71,7 +71,7 @@ public class GeneratorTests
 
         foreach (var (t, frame) in new[] { (0.1f, 1u), (0.49f, 1u), (0.5f, 2u), (0.9f, 2u), (0f, 1u), (1f, 2u) })
         {
-            generator.Enqueue(a.AsFrame(), b.AsFrame(), t, output, GpuSignal.None);
+            generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), t, output, GpuSignal.None);
             var actual = env.Read(setup, output);
             Assert.Equal(frame, Reference.DecodeCounter(actual, Width, Height, format));
             Assert.Equal(Reference.Pattern(Width, Height, frame, format), actual);
@@ -80,10 +80,11 @@ public class GeneratorTests
     }
 
     /// <summary>
-    /// Core's "the next pair" (review fix): after <see cref="IFrameGenerator.NotifyDiscontinuity"/> every frame of the pair
-    /// of the next call is the current frame (2x: one t, 4x: three), whatever t, so the picture switches once and never
-    /// steps back; t = 0 is the previous frame and does not use the notification up; a different pair ends it. The old
-    /// generators applied it to one call only (the blend then mixed across the cut, the repeat stepped back to prev).
+    /// Core's rule (review fixes): after <see cref="IFrameGenerator.NotifyDiscontinuity"/> names the first frame after a
+    /// cut, every frame of the pair across it is the current frame (2x: one t, 4x: three), whatever t, so the picture
+    /// switches once and never steps back; t = 0 is the previous frame and does not use the notification up; the first
+    /// pair past the cut ends it. The Phase 2 generators applied it to one call only (the blend then mixed across the cut,
+    /// the repeat stepped back to prev).
     /// </summary>
     [Theory]
     [InlineData("blend", 2)]
@@ -114,26 +115,28 @@ public class GeneratorTests
         }
 
         float[] timesteps = multiplier == 2 ? [0.5f] : [0.25f, 0.5f, 0.75f];
+        var fa = a.AsFrame(contentTimeNs: 100);
+        var fb = b.AsFrame(contentTimeNs: 200);
+        var fc = c.AsFrame(contentTimeNs: 300);
 
-        // Every generated frame of the pair across the cut, twice over (the pair may be revisited), is curr.
-        generator.NotifyDiscontinuity();
+        // Every generated frame of the pair across the cut (at b), twice over (the pair may be revisited), is curr.
+        generator.NotifyDiscontinuity(fb.ContentTimeNs);
         foreach (var t in timesteps.Concat(timesteps))
         {
-            Assert.True(curr.AsSpan().SequenceEqual(Run(a.AsFrame(), b.AsFrame(), t)), $"{kind} {multiplier}x t={t} after the cut is not curr");
+            Assert.True(curr.AsSpan().SequenceEqual(Run(fa, fb, t)), $"{kind} {multiplier}x t={t} after the cut is not curr");
         }
 
         // t = 0 is prev itself and does not use the notification up: the pair's next generated frame is still curr.
-        generator.NotifyDiscontinuity();
-        Assert.True(prev.AsSpan().SequenceEqual(Run(a.AsFrame(), b.AsFrame(), 0f)), $"{kind} t=0 after the cut is not prev");
-        Assert.True(curr.AsSpan().SequenceEqual(Run(a.AsFrame(), b.AsFrame(), 0.25f)), $"{kind} t=0.25 after a t=0 call is not curr");
+        Assert.True(prev.AsSpan().SequenceEqual(Run(fa, fb, 0f)), $"{kind} t=0 after the cut is not prev");
+        Assert.True(curr.AsSpan().SequenceEqual(Run(fa, fb, 0.25f)), $"{kind} t=0.25 after a t=0 call is not curr");
 
-        // The next pair is continuous again.
-        var next = Run(b.AsFrame(), c.AsFrame(), 0.25f);
+        // The next pair starts at the cut: continuous again, and it ends the notification.
+        var next = Run(fb, fc, 0.25f);
         var expected = kind == "blend"
             ? Reference.Blend(curr, Reference.Pattern(Width, Height, 300, PixelFormat.Rgba8), Reference.BlendWeight(0.25f), PixelFormat.Rgba8)
             : curr; // the repeat shows its prev (frame 200) at t = 0.25
         Assert.True(expected.AsSpan().SequenceEqual(next), $"{kind}: the pair after the cut pair is not interpolated normally");
-        var blendLike = Run(a.AsFrame(), b.AsFrame(), 0.25f);
+        var blendLike = Run(fa, fb, 0.25f);
         Assert.False(kind == "blend" && curr.AsSpan().SequenceEqual(blendLike), "the old pair revisited after a new one is still treated as cut");
     }
 
@@ -144,30 +147,36 @@ public class GeneratorTests
         using var a = env.Image(Width, Height, PixelFormat.Rgba8);
         using var other = env.Image(Width, Height, PixelFormat.Rgb10A2);
         using var generator = new BlendGenerator(env.Context, env.Kernels);
-        var f = a.AsFrame();
+        var f = a.AsFrame(contentTimeNs: 1);
+        var g = f with { ContentTimeNs = 2 };
 
-        Assert.Contains("Configure", Assert.Throws<InvalidOperationException>(() => generator.Enqueue(f, f, 0.5f, f, GpuSignal.None)).Message, StringComparison.Ordinal);
+        Assert.Contains("Configure", Assert.Throws<InvalidOperationException>(() => generator.Enqueue(f, g, 0.5f, f, GpuSignal.None)).Message, StringComparison.Ordinal);
         Assert.Throws<ArgumentException>(() => generator.Configure(new FrameGenConfig { Width = Width, Height = Height, Format = PixelFormat.Unknown }));
         Assert.Throws<ArgumentOutOfRangeException>(() => generator.Configure(new FrameGenConfig { Width = 0, Height = Height, Format = PixelFormat.Rgba8 }));
         generator.Configure(new FrameGenConfig { Width = Width, Height = Height, Format = PixelFormat.Rgba8 });
 
-        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(f, f, -0.1f, f, GpuSignal.None));
-        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(f, f, 1.5f, f, GpuSignal.None));
-        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(f, f, float.NaN, f, GpuSignal.None));
-        Assert.Equal("curr", Assert.Throws<ArgumentException>(() => generator.Enqueue(f, other.AsFrame(), 0.5f, f, GpuSignal.None)).ParamName);
-        Assert.Equal("output", Assert.Throws<ArgumentException>(() => generator.Enqueue(f, f, 0.5f, f with { Width = Width - 1 }, GpuSignal.None)).ParamName);
-        Assert.Equal("prev", Assert.Throws<ArgumentException>(() => generator.Enqueue(f with { Domain = MemoryDomain.Vulkan }, f, 0.5f, f, GpuSignal.None)).ParamName);
-        Assert.Equal("prev", Assert.Throws<ArgumentException>(() => generator.Enqueue(f with { SizeBytes = 100 }, f, 0.5f, f, GpuSignal.None)).ParamName);
+        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(f, g, -0.1f, f, GpuSignal.None));
+        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(f, g, 1.5f, f, GpuSignal.None));
+        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(f, g, float.NaN, f, GpuSignal.None));
+        Assert.Equal("curr", Assert.Throws<ArgumentException>(() => generator.Enqueue(f, other.AsFrame(contentTimeNs: 2), 0.5f, f, GpuSignal.None)).ParamName);
+        Assert.Equal("output", Assert.Throws<ArgumentException>(() => generator.Enqueue(f, g, 0.5f, f with { Width = Width - 1 }, GpuSignal.None)).ParamName);
+        Assert.Equal("prev", Assert.Throws<ArgumentException>(() => generator.Enqueue(f with { Domain = MemoryDomain.Vulkan }, g, 0.5f, f, GpuSignal.None)).ParamName);
+        Assert.Equal("prev", Assert.Throws<ArgumentException>(() => generator.Enqueue(f with { SizeBytes = 100 }, g, 0.5f, f, GpuSignal.None)).ParamName);
+
+        // Content times must increase: the same frame twice, or a pair backwards, is refused.
+        Assert.Contains("content times", Assert.Throws<ArgumentException>(() => generator.Enqueue(f, f, 0.5f, f, GpuSignal.None)).Message, StringComparison.Ordinal);
+        Assert.Equal("curr", Assert.Throws<ArgumentException>(() => generator.Enqueue(g, f, 0.5f, f, GpuSignal.None)).ParamName);
 
         // A signal that belongs to another API is refused, not handed to CUDA.
         var vulkan = GpuSignal.Timeline(MemoryDomain.Vulkan, 1234, 5);
-        Assert.Throws<ArgumentException>(() => generator.Enqueue(f, f, 0.5f, f, vulkan));
-        Assert.Throws<ArgumentException>(() => generator.Enqueue(f with { Ready = vulkan }, f, 0.5f, f, GpuSignal.None));
-        Assert.Throws<ArgumentException>(() => generator.Enqueue(f, f, 0.5f, f, GpuSignal.Timeline(1, 1)));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(f, g, 0.5f, f, vulkan));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(f with { Ready = vulkan }, g, 0.5f, f, GpuSignal.None));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(f, g, 0.5f, f, GpuSignal.Timeline(1, 1)));
+        Assert.Equal(0, generator.Stream.EventWaits); // nothing was enqueued for any refused call
 
         generator.Stream.Synchronize();
         generator.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(f, f, 0.5f, f, GpuSignal.None));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(f, g, 0.5f, f, GpuSignal.None));
     }
 
     [Fact]
@@ -187,14 +196,16 @@ public class GeneratorTests
 
         // The blend fails inside the timed span (its module is gone). Before the fix the span stayed open and every
         // later call failed with "Begin while a span is open" instead.
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, o.AsFrame(), GpuSignal.None));
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, o.AsFrame(), GpuSignal.None));
+        var fa = a.AsFrame(contentTimeNs: 1);
+        var fb = b.AsFrame(contentTimeNs: 2);
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(fa, fb, 0.5f, o.AsFrame(), GpuSignal.None));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(fa, fb, 0.5f, o.AsFrame(), GpuSignal.None));
         generator.Stream.Synchronize();
         Assert.False(generator.TryReadGpuTime(out _));
 
         // The discontinuity path needs no kernels: the generator still works and times it.
-        generator.NotifyDiscontinuity();
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, o.AsFrame(), GpuSignal.None);
+        generator.NotifyDiscontinuity(fb.ContentTimeNs);
+        generator.Enqueue(fa, fb, 0.5f, o.AsFrame(), GpuSignal.None);
         Assert.Equal(Reference.Pattern(Width, Height, 9, PixelFormat.Rgba8), env.Read(generator.Stream, o.AsFrame()));
         Assert.True(generator.TryReadGpuTime(out _));
     }
@@ -206,15 +217,17 @@ public class GeneratorTests
         using var a = env.Image(Width, Height, PixelFormat.Rgba8);
         using var generator = new ScriptedGenerator(env.Context);
         generator.Configure(new FrameGenConfig { Width = Width, Height = Height, Format = PixelFormat.Rgba8 });
-        var f = a.AsFrame();
+        var f = a.AsFrame(contentTimeNs: 1);
+        var g = f with { ContentTimeNs = 2 };
+        var h = f with { ContentTimeNs = 3 };
 
-        generator.NotifyDiscontinuity();
+        generator.NotifyDiscontinuity(g.ContentTimeNs);
         generator.FailNext = true;
-        Assert.Throws<InvalidOperationException>(() => generator.Enqueue(f, f, 0.5f, f, GpuSignal.None));
-        generator.Enqueue(f, f, 0.5f, f, GpuSignal.None); // the cut was not lost by the failed call
-        generator.Enqueue(f, f, 0.5f, f, GpuSignal.None); // and covers the whole pair (Core's "next pair")
-        generator.Enqueue(f, f, 0f, f, GpuSignal.None);   // except t = 0, which is prev itself
-        generator.Enqueue(f with { ContentTimeNs = 1 }, f, 0.5f, f, GpuSignal.None); // another pair: continuous
+        Assert.Throws<InvalidOperationException>(() => generator.Enqueue(f, g, 0.5f, f, GpuSignal.None));
+        generator.Enqueue(f, g, 0.5f, f, GpuSignal.None); // the cut was not lost by the failed call
+        generator.Enqueue(f, g, 0.5f, f, GpuSignal.None); // and covers the whole pair across it
+        generator.Enqueue(f, g, 0f, f, GpuSignal.None);   // except t = 0, which is prev itself
+        generator.Enqueue(g, h, 0.5f, f, GpuSignal.None); // the pair past the cut: continuous
         Assert.Equal([true, true, true, false, false], generator.Seen);
         generator.Stream.Synchronize();
     }

@@ -45,7 +45,7 @@ public unsafe partial class CharacterizationTests
         {
             var c0 = ThreadCpuNs();
             var t0 = Stopwatch.GetTimestamp();
-            generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f + (0.25f * (i % 3)), o.AsFrame(), done.Signal);
+            generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.25f + (0.25f * (i % 3)), o.AsFrame(), done.Signal);
             var hostNs = Stopwatch.GetElapsedTime(t0).TotalNanoseconds;
             var cpuNs = ThreadCpuNs() - c0;
             done.Synchronize();
@@ -365,13 +365,15 @@ public unsafe partial class CharacterizationTests
             return times;
         }
 
-        var normal = Time(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, o.AsFrame(), done.Signal), 60);
+        var normal = Time(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, o.AsFrame(), done.Signal), 60);
         var manual = Time(() =>
         {
-            generator.NotifyDiscontinuity();
-            generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, o.AsFrame(), done.Signal);
+            generator.NotifyDiscontinuity(2);
+            generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, o.AsFrame(), done.Signal);
         }, 60);
-        var automatic = Time(() => generator.Enqueue(a.AsFrame(), cut.AsFrame(), 0.5f, o.AsFrame(), done.Signal), 60);
+
+        // Later content times (past the notified cut, which they release), so these runs rely on automatic detection.
+        var automatic = Time(() => generator.Enqueue(a.AsFrame(contentTimeNs: 3), cut.AsFrame(contentTimeNs: 4), 0.5f, o.AsFrame(), done.Signal), 60);
         Log.WriteLine($"GPU p50: normal run {Log.Ms(Median(normal))} ms, manual shot change {Log.Ms(Median(manual))} ms, " +
                       $"a real cut with automatic detection {Log.Ms(Median(automatic))} ms");
         Assert.True(Median(manual) < Median(normal) / 4, "a manual shot change was expected to skip the model");
@@ -380,7 +382,7 @@ public unsafe partial class CharacterizationTests
         var curr = env.Read(cut);
         foreach (var t in new[] { 0.25f, 0.5f, 0.75f })
         {
-            generator.Enqueue(a.AsFrame(), cut.AsFrame(), t, o.AsFrame(), done.Signal);
+            generator.Enqueue(a.AsFrame(contentTimeNs: 3), cut.AsFrame(contentTimeNs: 4), t, o.AsFrame(), done.Signal);
             done.Synchronize();
             var output = env.Read(o);
             var isPrev = output.AsSpan().SequenceEqual(prev);
@@ -454,7 +456,7 @@ public unsafe partial class CharacterizationTests
         using var done = CudaEvent.Create(env.Context);
         var quality = mode switch { VfgMode.Low => FrameGenQuality.Low, VfgMode.High => FrameGenQuality.High, _ => FrameGenQuality.Medium };
         using var generator = env.Generator(Width, Height, format, quality, new VfgOptions { AutomaticShotChangeDetection = false });
-        generator.Enqueue(a.AsFrame(), cut.AsFrame(), 0.5f, o.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), cut.AsFrame(contentTimeNs: 2), 0.5f, o.AsFrame(), done.Signal);
         done.Synchronize();
         var output = env.Read(o);
         var prev = env.Read(a);
@@ -498,7 +500,7 @@ public unsafe partial class CharacterizationTests
                 continue; // only where the truth is a whole-pixel shift
             }
 
-            generator.Enqueue(prev.AsFrame(), curr.AsFrame(), t, o.AsFrame(), done.Signal);
+            generator.Enqueue(prev.AsFrame(contentTimeNs: 1), curr.AsFrame(contentTimeNs: 2), t, o.AsFrame(), done.Signal);
             done.Synchronize();
             var truth = Images.Texture(w, h, shift, format);
             var vfg = Interior(env.Read(o), truth, w, h, motion, format);

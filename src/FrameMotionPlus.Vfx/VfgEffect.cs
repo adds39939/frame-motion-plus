@@ -60,6 +60,7 @@ internal sealed unsafe class VfgEffect : IDisposable
     private readonly ulong[] _bound = new ulong[3];
     private readonly int[] _boundPitch = new int[3];
     private nint _handle;
+    private bool _faulted;
 
     private VfgEffect(nint handle, NvCVImage* images, VfgInstanceKey key, CudaStream stream, bool automaticShotChange)
     {
@@ -79,6 +80,12 @@ internal sealed unsafe class VfgEffect : IDisposable
     public bool IsLoaded { get; private set; }
 
     public long LastUsed { get; set; }
+
+    /// <summary>
+    /// The generator's last activation of this instance (<see cref="VfgGenerator"/>), kept so switching back to the same
+    /// configuration allocates nothing.
+    /// </summary>
+    public VfgActivation? Activation { get; set; }
 
     internal nint Handle => _handle;
 
@@ -148,8 +155,15 @@ internal sealed unsafe class VfgEffect : IDisposable
     /// <summary>The descriptor the SDK holds for image <paramref name="which"/> (tests pin the lifetime invariant with it).</summary>
     internal NvCVImage* Descriptor(int which) => _images + which;
 
-    /// <summary>True once a run or bind failed: the SDK's state for this instance is unknown, so it is not run again.</summary>
-    public bool IsFaulted { get; set; }
+    /// <summary>
+    /// True once a run or bind failed: the SDK's state for this instance is unknown, so it is not run again. Set on the
+    /// generator thread, read by a thread switching configurations (volatile).
+    /// </summary>
+    public bool IsFaulted
+    {
+        get => Volatile.Read(ref _faulted);
+        set => Volatile.Write(ref _faulted, value);
+    }
 
     /// <summary>Forgets what is bound, so the next <see cref="Bind"/> of each image hands its descriptor over again.</summary>
     public void InvalidateBindings()

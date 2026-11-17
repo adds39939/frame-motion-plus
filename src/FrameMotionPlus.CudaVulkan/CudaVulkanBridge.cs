@@ -109,13 +109,15 @@ public sealed record CudaVulkanBridgeOptions
 /// producing; they block, so keep them off the pacing thread during playback. Dispose the bridge before the presenter.
 /// Nothing here ever signals a timeline to a lower value: the bridge releases from the CUDA side only once the presenter
 /// no longer owns the ring, and never forces <em>written</em>. While the presenter owns the ring a drain polls
-/// <em>written</em> from the host, so a drain that times out leaves no GPU-side wait behind. Dispose never throws or
-/// hangs: an import whose work has not finished in time is handed, with the retired semaphores, to a background reaper
-/// (<see cref="PendingReaps"/>), which frees it once its work is done and no bridge is live on its CUDA context, so a
-/// new bridge on the same ring holds it until that bridge is disposed too. The reaper never queues a GPU-side wait in
-/// the CUDA context (one that cannot complete would make every CUDA call that synchronises the context block), and
-/// neither does a drain while the presenter owns the ring, so after an abandoning Dispose the natural teardown order
-/// (bridge, CUDA buffers, presenter) still completes. Dispose every bridge: one that never is keeps the reaper from
+/// <em>written</em> from the host, so a drain that times out leaves no GPU-side wait behind; once the presenter has let
+/// go, a drain releases from CUDA and waits for nothing. Dispose never throws or hangs: an import whose work has not
+/// finished in time (or whose ring the presenter let go of) is handed, with the retired semaphores, to a background
+/// reaper (<see cref="PendingReaps"/>), which frees it once its work is done, no other abandoned import on the context
+/// is still waiting, and no bridge is live on its CUDA context, so a new bridge on the same ring holds it until that
+/// bridge is disposed too (and the last bridge's Dispose frees what is done at once). Neither the reaper nor a drain
+/// ever queues a GPU-side wait in the CUDA context (one that cannot complete would make every CUDA call that
+/// synchronises the context block), so after an abandoning Dispose any teardown order (bridge, CUDA buffers,
+/// presenter, or the presenter first) still completes. Dispose every bridge: one that never is keeps the reaper from
 /// freeing anything on its context. Dispose the presenter before the process ends, too: if one of its releases waits
 /// for a write that is never signalled, returning from <c>Main</c> without disposing it (which forces its own waits)
 /// hangs in the driver's exit path.
@@ -155,7 +157,6 @@ public sealed class CudaVulkanBridge : IGpuBridge
     private readonly List<CudaExternalSemaphore> _retired = [];
     private readonly nint _contextHandle; // the native context this bridge is live on (the reaper frees nothing there meanwhile)
     private RingImport? _import;
-    private CudaStream? _probe; // a drain's GPU-side wait that has not completed yet (only once the presenter let go of the ring)
     private ulong _next = RingProtocol.FirstWrite;
     private ulong _firstWrite = RingProtocol.FirstWrite;
     private ulong _knownWritten;
@@ -275,7 +276,12 @@ public sealed class CudaVulkanBridge : IGpuBridge
     /// <summary>CUDA objects the bridge holds for the current ring (2 per slot plus 2 semaphores), for leak checks.</summary>
     public int LiveImportObjects => _import?.LiveObjects ?? 0;
 
-    /// <summary>Imports this bridge handed to the reaper because their work had not finished when it was disposed.</summary>
+    /// <summary>
+    /// Imports this bridge handed to the reaper: at Dispose, when their work had not finished in time; and at Dispose or
+    /// a <see cref="Configure"/> that found the presenter no longer owning the ring (the bridge then releases every write
+    /// from CUDA but cannot tell when the work has finished without a GPU-side wait, so the reaper frees the import once
+    /// no bridge is live).
+    /// </summary>
     public int AbandonedImports { get; private set; }
 
     /// <summary>Waits (bounded) until the reaper has freed every import handed to it. False on timeout.</summary>
@@ -286,7 +292,9 @@ public sealed class CudaVulkanBridge : IGpuBridge
     /// current imports, lets the presenter create the ring (<see cref="VulkanPresenter.Configure"/>) and imports it; the
     /// same shape again does nothing. <see cref="BridgeConfig.SlotCount"/> is 0 (the presenter's) or must equal the
     /// presenter's. Throws <see cref="TimeoutException"/> (leaving the current ring imported and usable) if the
-    /// outstanding writes do not finish within the drain timeout. Not for the hot path.
+    /// outstanding writes do not finish within the drain timeout. If the presenter replaced its ring behind the bridge,
+    /// the old ring's writes are released from CUDA and its import goes to the reaper (see <see cref="AbandonedImports"/>).
+    /// Not for the hot path.
     /// </summary>
     public void Configure(in BridgeConfig config)
     {
@@ -311,17 +319,30 @@ public sealed class CudaVulkanBridge : IGpuBridge
                 return;
             }
 
-            if (!Drain(current, out var probe))
+            var drained = Drain(current);
+            if (drained == DrainResult.NotFinished)
             {
-                _probe = probe; // still waiting on the GPU: kept for the next drain (or the reaper) rather than left behind
                 throw new TimeoutException(
                     $"Writes up to {_next - 1} were handed out but not all of them finished within {_options.DrainTimeoutNs / 1_000_000} ms " +
                     "(every acquired slot's ProducerSignal must be enqueued, and a slow producer must catch up). The current ring stays imported.");
             }
 
-            var (written, released) = current.Retire();
-            Retain(written);
-            Retain(released);
+            if (drained == DrainResult.Finished)
+            {
+                var (written, released) = current.Retire();
+                Retain(written);
+                Retain(released);
+            }
+            else
+            {
+                // The presenter replaced its ring behind the bridge, and the drain released every write from CUDA: their
+                // work can finish now, but only a GPU-side wait could tell when, and one for a write that is never
+                // signalled would wedge the context. The reaper frees the import once no bridge is live (this one
+                // included), so its semaphores also stay alive while a stale slot may name them.
+                ImportReaper.Adopt(current, _presenter, _next - 1, releasedFromCuda: true, [], _hooks);
+                AbandonedImports++;
+            }
+
             _import = null;
             _ringGeneration = -1;
         }
@@ -433,8 +454,10 @@ public sealed class CudaVulkanBridge : IGpuBridge
 
     /// <summary>
     /// Releases every outstanding write and waits (bounded) until all of them have finished, then frees the CUDA
-    /// imports; if they have not finished in time, hands them to the reaper instead (see the class remarks). The
-    /// presenter and the ring are left alone. Dispose the bridge before the presenter. Never throws or hangs.
+    /// imports; if they have not finished in time, hands them to the reaper instead (see the class remarks). A bridge
+    /// disposed after its presenter (the wrong order) releases every write from CUDA and hands the import to the reaper
+    /// without waiting for anything GPU-side. The presenter and the ring are left alone. Dispose the bridge before the
+    /// presenter. Never throws or hangs.
     /// </summary>
     public void Dispose()
     {
@@ -449,7 +472,8 @@ public sealed class CudaVulkanBridge : IGpuBridge
             if (_import is { } import)
             {
                 _import = null;
-                if (Drain(import, out var probe))
+                var drained = Drain(import);
+                if (drained == DrainResult.Finished)
                 {
                     import.Dispose();
                 }
@@ -457,18 +481,10 @@ public sealed class CudaVulkanBridge : IGpuBridge
                 {
                     // Freeing now would block inside CUDA (cuMemFree waits for the work), possibly for good. The retired
                     // semaphores go too: destroying one synchronises the context, which waits for that same work.
-                    ImportReaper.Adopt(import, _presenter, _next - 1, probe ?? _probe, [.. _retired], _hooks);
-                    _probe = null;
+                    ImportReaper.Adopt(import, _presenter, _next - 1, releasedFromCuda: drained == DrainResult.ReleasedFromCuda, [.. _retired], _hooks);
                     _retired.Clear();
                     AbandonedImports++;
                 }
-            }
-            else
-            {
-                // Not configured (or a Configure timed out and was not retried): a drain's leftover GPU-side wait, if any,
-                // completed or not, is a stream; destroying it does not wait.
-                _probe?.Dispose();
-                _probe = null;
             }
         }
         finally
@@ -534,21 +550,36 @@ public sealed class CudaVulkanBridge : IGpuBridge
         }
     }
 
+    private enum DrainResult
+    {
+        /// <summary>Every write handed out has finished: the import can be freed now.</summary>
+        Finished,
+
+        /// <summary>Not finished in time (or the release through the presenter failed); nothing was queued GPU-side.</summary>
+        NotFinished,
+
+        /// <summary>
+        /// The presenter no longer owns the ring; every write was released from CUDA, so the work can finish by itself,
+        /// but nothing tells when without a GPU-side wait: the import goes to the reaper.
+        /// </summary>
+        ReleasedFromCuda,
+    }
+
     /// <summary>
     /// Has every write handed out finish (bounded by <see cref="CudaVulkanBridgeOptions.DrainTimeoutNs"/>). While the
     /// presenter owns the ring (and so its Vulkan objects are alive on this thread) it releases through the presenter and
     /// polls <em>written</em> from the host: no GPU-side wait is queued, so a write that never finishes leaves nothing
     /// behind. Once the presenter has let go (replaced the ring outside the bridge, or been disposed) nothing else will
-    /// release, so it releases from the CUDA side and waits on a stream of its own, which <paramref name="probe"/>
-    /// returns while still waiting. False when the work has not finished in time.
+    /// release, and <em>written</em> can no longer be read from the host, so it releases from the CUDA side and queues no
+    /// wait at all (one for a write whose signal is never enqueued would never complete, and every later free in the
+    /// context would block behind it).
     /// </summary>
-    private bool Drain(RingImport import, out CudaStream? probe)
+    private DrainResult Drain(RingImport import)
     {
-        probe = null;
         var last = _next - 1;
         if (_next == _firstWrite)
         {
-            return true;
+            return DrainResult.Finished;
         }
 
         var deadline = Environment.TickCount64 + Math.Max(1, _options.DrainTimeoutNs / 1_000_000);
@@ -558,20 +589,20 @@ public sealed class CudaVulkanBridge : IGpuBridge
             {
                 if (!ReleaseThroughPresenter(import, last, deadline))
                 {
-                    return false;
+                    return DrainResult.NotFinished;
                 }
 
                 while (import.Ring.ReadWrittenValue() < last)
                 {
                     if (Environment.TickCount64 > deadline)
                     {
-                        return false;
+                        return DrainResult.NotFinished;
                     }
 
                     Thread.Sleep(1);
                 }
 
-                return true;
+                return DrainResult.Finished;
             }
 
             // The presenter let go of the ring: nothing else will release these writes, nor signal 'released' again
@@ -584,27 +615,11 @@ public sealed class CudaVulkanBridge : IGpuBridge
                 stream.Synchronize();
             }
 
-            // Writes complete in order, so every one has finished once written >= last.
-            probe = _probe ?? CudaStream.Create(_context);
-            _probe = null;
-            import.Written.Wait(probe, last);
-            while (!probe.IsIdle)
-            {
-                if (Environment.TickCount64 > deadline)
-                {
-                    return false;
-                }
-
-                Thread.Sleep(1);
-            }
-
-            probe.Dispose();
-            probe = null;
-            return true;
+            return DrainResult.ReleasedFromCuda;
         }
         catch (Exception e) when (e is CudaException or VulkanException or ObjectDisposedException)
         {
-            return false;
+            return DrainResult.NotFinished;
         }
     }
 

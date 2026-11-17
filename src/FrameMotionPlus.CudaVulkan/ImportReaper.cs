@@ -19,6 +19,18 @@ namespace FrameMotionPlus.CudaVulkan;
 /// created meanwhile waits for that free (which by then has nothing left to wait for). Holding costs one ring's imports
 /// per abandoned bridge, on an error path.
 /// </para>
+/// <para>
+/// <b>It frees nothing on a context while another of its entries on that context is not done</b> (still waiting for
+/// writes the presenter has not released, or not looked at yet): a free waits for all queued work in the context, so
+/// freeing a finished import while another one's writes are stuck would wait for those writes, holding the lock a new
+/// bridge's constructor takes. Entries on a context are freed together once all of them are done.
+/// </para>
+/// <para>
+/// <b>The moment the last bridge on a context is disposed</b> (the end of its Dispose), every entry on it that the
+/// reaper already found done is freed, under the same lock, before any new bridge can become live there. So a
+/// pipeline that restarts its bridge at once does not keep abandoned imports until it shuts down, and nothing is ever
+/// freed while a bridge is live.
+/// </para>
 /// <list type="bullet">
 /// <item>While the presenter owns the ring it queues nothing on the GPU (a GPU-side wait that cannot complete makes
 /// every free in the context block): it polls <em>written</em> from the host
@@ -26,13 +38,13 @@ namespace FrameMotionPlus.CudaVulkan;
 /// it has reached the last write handed out, the work is done and the import can be freed (when no bridge is
 /// live).</item>
 /// <item>Once the presenter has let go of the ring (replaced it or been disposed) nothing else will release these
-/// writes, so the reaper releases them from the CUDA side if the presenter had not (never to a lower value: not when a
-/// later bridge has handed out writes on that ring, and what the presenter released is read generation-checked).
-/// After that, every write's queued work can finish: a write whose signal was never enqueued has no work queued at
-/// all. So it queues no GPU-side wait (one for a write that never comes would wedge the context for good) and frees
-/// the import, when no bridge is live; the free's own wait covers whatever producer work is still running. Only a
-/// probe the bridge's own drain queued (once the presenter had let go before the bridge was disposed) is waited for,
-/// by polling, before freeing.</item>
+/// writes, so the reaper releases them from the CUDA side if neither the presenter nor the bridge had (never to a lower
+/// value: not when a later bridge has handed out writes on that ring, and what the presenter released is read
+/// generation-checked). After that, every write's queued work can finish: a write whose signal was never enqueued has
+/// no work queued at all. So it queues no GPU-side wait (one for a write that never comes would wedge the context for
+/// good) and frees the import, when no bridge is live and no other entry on the context is waiting; the free's own wait
+/// covers whatever producer work is still running. An import the bridge already released from CUDA this way (a bridge
+/// disposed or reconfigured after the presenter let go) is done from the moment it is handed over.</item>
 /// <item>An entry whose CUDA context is gone is dropped, not polled for ever: the driver reports the context destroyed,
 /// deinitialised or invalid, or it hit a sticky error (an illegal address, a failed launch, …: every later call fails
 /// the same way), or the <see cref="CudaContext"/> object was disposed before the reaper could create the stream it
@@ -41,7 +53,8 @@ namespace FrameMotionPlus.CudaVulkan;
 /// </list>
 /// Off the present and pacing threads; the thread is a background thread, so it never keeps the process alive. It sleeps
 /// between looks; the only call in which it can wait is the free itself, made once nothing is live and the work is done
-/// (or, after the presenter let go, while the abandoned producer's own remaining GPU work finishes).
+/// (or, after the presenter let go, while the abandoned producer's own remaining GPU work finishes). The free pass at
+/// the last bridge's disposal runs on the disposing thread, under the same conditions.
 /// </summary>
 internal static class ImportReaper
 {
@@ -70,7 +83,11 @@ internal static class ImportReaper
         }
     }
 
-    /// <summary>That bridge is no longer live (the end of its Dispose); the reaper may free on the context once none is.</summary>
+    /// <summary>
+    /// That bridge is no longer live (the end of its Dispose). When it was the last one on the context, frees at once
+    /// every entry on the context the reaper has found done (if all of them are), under the lock bridges register with,
+    /// so no bridge becomes live during that free.
+    /// </summary>
     public static void BridgeDisposed(nint context)
     {
         lock (LiveGate)
@@ -79,24 +96,25 @@ internal static class ImportReaper
             if (count > 0)
             {
                 LiveBridges[context] = count;
+                return;
             }
-            else
-            {
-                LiveBridges.Remove(context);
-            }
+
+            LiveBridges.Remove(context);
+            FreeDone(context);
         }
     }
 
     /// <summary>
-    /// Hands <paramref name="import"/> over, with semaphores to free after it. <paramref name="probe"/>, if any, already
-    /// waits GPU-side for written ≥ <paramref name="last"/>, after the bridge's drain released from CUDA; the bridge
-    /// passes one only when the presenter no longer owns the ring. Call on the presenter's thread (it reads the
-    /// presenter's state). Makes no CUDA call.
+    /// Hands <paramref name="import"/> over, with semaphores to free after it. <paramref name="releasedFromCuda"/>: the
+    /// bridge's drain found the presenter no longer owning the ring and released every write handed out from the CUDA
+    /// side, so the import's queued work can finish by itself and the entry is done at once (nothing queued waits for
+    /// it). Call on the presenter's thread (it reads the presenter's state). Makes no CUDA call.
     /// </summary>
-    public static void Adopt(RingImport import, VulkanPresenter presenter, ulong last, CudaStream? probe, CudaExternalSemaphore[] retired, BridgeTestHooks? hooks = null)
+    public static void Adopt(RingImport import, VulkanPresenter presenter, ulong last, bool releasedFromCuda, CudaExternalSemaphore[] retired, BridgeTestHooks? hooks = null)
     {
         var owned = ReferenceEquals(presenter.Ring, import.Ring);
-        var entry = new Entry(import, presenter, last, probe, retired)
+        var done = !owned && releasedFromCuda;
+        var entry = new Entry(import, presenter, last, retired)
         {
             Hook = hooks?.BeforeReapStep,
             ReleaseHook = hooks?.BeforeReapRelease,
@@ -104,11 +122,14 @@ internal static class ImportReaper
             Generation = owned ? presenter.RingGeneration : -1,
             KnownReleased = owned ? presenter.LastReleasedWrite : 0,
             LetGo = !owned,
-
-            // A probe comes from the bridge's drain once the presenter had let go: that drain has already released
-            // from CUDA what needed it.
-            ReleasedFromCuda = probe is not null,
+            ReleasedFromCuda = !owned && releasedFromCuda,
+            WorkDone = done,
         };
+        if (done)
+        {
+            entry.MarkDone();
+        }
+
         lock (Gate)
         {
             Entries.Add(entry);
@@ -142,6 +163,7 @@ internal static class ImportReaper
 
     private static void Run()
     {
+        var contexts = new HashSet<nint>();
         while (true)
         {
             Entry[] snapshot;
@@ -155,16 +177,39 @@ internal static class ImportReaper
                 snapshot = [.. Entries];
             }
 
+            contexts.Clear();
             foreach (var entry in snapshot)
             {
-                if (Step(entry))
+                contexts.Add(entry.Context);
+                if (entry.IsDone)
                 {
-                    lock (Gate)
-                    {
-                        Entries.Remove(entry);
-                    }
+                    continue; // never looked at again: only a free (here, or at a bridge's disposal) touches it now
+                }
 
-                    Interlocked.Decrement(ref _pending);
+                switch (Step(entry))
+                {
+                    case Outcome.Done:
+                        entry.MarkDone();
+                        break;
+                    case Outcome.Dropped:
+                        lock (Gate)
+                        {
+                            Entries.Remove(entry);
+                        }
+
+                        Interlocked.Increment(ref _dropped);
+                        Interlocked.Decrement(ref _pending);
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            lock (LiveGate)
+            {
+                foreach (var context in contexts)
+                {
+                    FreeDone(context);
                 }
             }
 
@@ -172,8 +217,18 @@ internal static class ImportReaper
         }
     }
 
-    /// <summary>One look at an entry; true once it is done with (freed, or dropped).</summary>
-    private static bool Step(Entry e)
+    private enum Outcome
+    {
+        Waiting,
+        Done,
+        Dropped,
+    }
+
+    /// <summary>
+    /// One look at an entry that is not done yet: <see cref="Outcome.Done"/> once its queued work is done or can finish by
+    /// itself (the free then waits for no one else's action), <see cref="Outcome.Dropped"/> when its context is gone.
+    /// </summary>
+    private static Outcome Step(Entry e)
     {
         var context = e.Import.Written.Context;
         try
@@ -193,7 +248,7 @@ internal static class ImportReaper
                     e.KnownReleased = Math.Max(e.KnownReleased, released);
                     if (written < e.Last)
                     {
-                        return false; // still working (or never signalled): nothing queued, look again later
+                        return Outcome.Waiting; // still working (or never signalled): nothing queued, look again later
                     }
 
                     e.WorkDone = true; // every write handed out has finished
@@ -206,14 +261,7 @@ internal static class ImportReaper
 
             if (!e.WorkDone)
             {
-                if (e.Probe is { } probe)
-                {
-                    if (!probe.IsIdle)
-                    {
-                        return false;
-                    }
-                }
-                else if (!e.ReleasedFromCuda)
+                if (!e.ReleasedFromCuda)
                 {
                     // Nothing will release these writes now. Released never exceeds the last write handed out on the
                     // ring; if a later bridge handed out more, the presenter or that bridge's own teardown released past
@@ -233,47 +281,83 @@ internal static class ImportReaper
                 e.WorkDone = true; // what is queued can finish now; the free waits for it
             }
 
-            return TryFree(e);
+            return Outcome.Done;
         }
         catch (CudaException ex) when (IsGone(ex.Result))
         {
-            Interlocked.Increment(ref _dropped);
-            return true;
+            return Outcome.Dropped;
         }
         catch (ObjectDisposedException) when (context.IsDisposed)
         {
-            Interlocked.Increment(ref _dropped);
-            return true;
+            return Outcome.Dropped;
         }
         catch (Exception ex) when (ex is CudaException or VulkanException or ObjectDisposedException or InvalidOperationException)
         {
             // A driver going away or a transient failure: look again later.
-            return false;
+            return Outcome.Waiting;
         }
     }
 
     /// <summary>
-    /// Frees the entry unless a bridge is live on its context (then false: held, look again later). Under the lock that
-    /// bridges register with, so none can become live while the free runs.
+    /// Frees every entry on <paramref name="context"/>, provided no bridge is live there and every one of them is done
+    /// (otherwise frees nothing: a free waits for all queued work in the context, the stuck writes of an entry that is
+    /// not done included). The caller holds <see cref="LiveGate"/>, the lock bridges register with, so none can become
+    /// live while the free runs.
     /// </summary>
-    private static bool TryFree(Entry e)
+    private static void FreeDone(nint context)
     {
-        lock (LiveGate)
+        if (LiveBridges.ContainsKey(context))
         {
-            if (LiveBridges.ContainsKey(e.Context))
+            return;
+        }
+
+        List<Entry>? batch = null;
+        lock (Gate)
+        {
+            foreach (var e in Entries)
             {
-                return false;
+                if (e.Context != context)
+                {
+                    continue;
+                }
+
+                if (!e.IsDone)
+                {
+                    return;
+                }
+
+                (batch ??= []).Add(e);
             }
 
-            e.Import.Dispose();
-            e.Stream?.Dispose();
-            e.Probe?.Dispose();
-            foreach (var semaphore in e.Retired)
+            if (batch is null)
             {
-                semaphore.Dispose();
+                return;
             }
 
-            return true;
+            foreach (var e in batch)
+            {
+                Entries.Remove(e);
+            }
+        }
+
+        foreach (var e in batch)
+        {
+            try
+            {
+                e.Import.Dispose();
+                e.Stream?.Dispose();
+                foreach (var semaphore in e.Retired)
+                {
+                    semaphore.Dispose();
+                }
+            }
+            catch (Exception ex) when (ex is CudaException or ObjectDisposedException)
+            {
+                // The context went away under the free: nothing more can be freed.
+                Interlocked.Increment(ref _dropped);
+            }
+
+            Interlocked.Decrement(ref _pending);
         }
     }
 
@@ -347,8 +431,10 @@ internal static class ImportReaper
         }
     }
 
-    private sealed class Entry(RingImport import, VulkanPresenter presenter, ulong last, CudaStream? probe, CudaExternalSemaphore[] retired)
+    private sealed class Entry(RingImport import, VulkanPresenter presenter, ulong last, CudaExternalSemaphore[] retired)
     {
+        private int _done;
+
         public RingImport Import { get; } = import;
 
         public VulkanPresenter Presenter { get; } = presenter;
@@ -357,8 +443,11 @@ internal static class ImportReaper
 
         public CudaExternalSemaphore[] Retired { get; } = retired;
 
-        /// <summary>A GPU-side wait for written ≥ <see cref="Last"/> that the bridge's own drain queued, or null.</summary>
-        public CudaStream? Probe { get; } = probe;
+        /// <summary>
+        /// Set (last, by the reaper's thread or at adoption) once <see cref="WorkDone"/>: from then on the entry is only
+        /// ever freed, by whichever thread holds <see cref="LiveGate"/> when no bridge is live, and never looked at again.
+        /// </summary>
+        public bool IsDone => Volatile.Read(ref _done) != 0;
 
         public Action? Hook { get; init; }
 
@@ -381,5 +470,7 @@ internal static class ImportReaper
 
         /// <summary>The import's queued work is done, or can finish without anyone else (so a free will not wait for good).</summary>
         public bool WorkDone { get; set; }
+
+        public void MarkDone() => Volatile.Write(ref _done, 1);
     }
 }

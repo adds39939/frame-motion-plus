@@ -68,6 +68,7 @@ public class AllocationTests
         long times = 0;
         var stream = generator.Stream;
         var (waitsBefore, signalsBefore) = (stream.EventWaits, stream.EventSignals);
+        long clock = 0;
 
         var allocated = Measure(() =>
         {
@@ -76,13 +77,14 @@ public class AllocationTests
                 prevWritten.Record(producer);
                 currWritten.Record(producer);
                 released.Record(producer);
-                // Alternate the pair, so a discontinuity (which covers every call with its pair) ends at the next call
-                // and the generator's own work keeps running in the measured windows.
+                // Alternate the buffers and move the pair on in time, so a discontinuity (which covers every call whose
+                // pair spans it) ends at the next call and the generator's own work keeps running in the measured windows.
                 var swap = (i & 1) == 1;
-                asInterface.Enqueue(swap ? curr : prev, swap ? prev : curr, (i % 7) / 7f, output, signal);
+                var time = clock++;
+                asInterface.Enqueue((swap ? curr : prev) with { ContentTimeNs = time }, (swap ? prev : curr) with { ContentTimeNs = time + 1 }, (i % 7) / 7f, output, signal);
                 if (i % 50 == 0)
                 {
-                    asInterface.NotifyDiscontinuity();
+                    asInterface.NotifyDiscontinuity(time + 2);
                 }
 
                 while (generator.TryReadGpuTime(out _))

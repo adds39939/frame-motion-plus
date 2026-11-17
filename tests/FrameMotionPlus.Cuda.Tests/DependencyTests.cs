@@ -43,7 +43,7 @@ public class DependencyTests
         written.Record(producer);
         var ready = withReady ? written.Signal : GpuSignal.None;
 
-        generator.Enqueue(a.AsFrame(ready: ready), b.AsFrame(ready: ready), 0.5f, o.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1, ready: ready), b.AsFrame(contentTimeNs: 2, ready: ready), 0.5f, o.AsFrame(), done.Signal);
         done.Synchronize();
         var actual = env.Read(producer, o.AsFrame());
 
@@ -87,7 +87,7 @@ public class DependencyTests
         released.Record(consumer);
         var target = slot.AsFrame(ready: withReady ? released.Signal : GpuSignal.None);
 
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f, target, done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.25f, target, done.Signal);
         done.Synchronize();
         consumer.Synchronize();
 
@@ -156,8 +156,8 @@ public class DependencyTests
 
                 var prevSlot = (i - 1) % 3;
                 generator.Enqueue(
-                    history[prevSlot].AsFrame(ready: written[prevSlot].Signal),
-                    history[slot].AsFrame(ready: written[slot].Signal),
+                    history[prevSlot].AsFrame(contentTimeNs: i - 1, ready: written[prevSlot].Signal),
+                    history[slot].AsFrame(contentTimeNs: i, ready: written[slot].Signal),
                     0.5f,
                     outputs[i].AsFrame(),
                     consumed[i].Signal);

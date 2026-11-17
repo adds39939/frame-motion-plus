@@ -105,8 +105,8 @@ public class StaleSignalTests
         var history = a.AsFrame(ready: drawn.Signal);
         drawn.Dispose();
 
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(history, history, 0.5f, o.AsFrame(), done.Signal));
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), a.AsFrame(), 0.5f, o.AsFrame(), history.Ready));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(history, history with { ContentTimeNs = 1 }, 0.5f, o.AsFrame(), done.Signal));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), a.AsFrame(contentTimeNs: 1), 0.5f, o.AsFrame(), history.Ready));
         generator.Stream.Synchronize();
         Assert.False(generator.TryReadGpuTime(out _));
         Assert.Equal(0, generator.Stream.EventWaits + generator.Stream.EventSignals);

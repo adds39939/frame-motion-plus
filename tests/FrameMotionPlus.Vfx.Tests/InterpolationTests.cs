@@ -36,7 +36,7 @@ public class InterpolationTests
         using var generator = env.Generator(Width, Height, format);
         using var done = CudaEvent.Create(env.Context);
 
-        generator.Enqueue(prev.AsFrame(), curr.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(prev.AsFrame(contentTimeNs: 1), curr.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
 
         var (y0, y1) = BoxBand();
@@ -77,7 +77,7 @@ public class InterpolationTests
         using var generator = env.Generator(Width, Height, format);
         using var done = CudaEvent.Create(env.Context);
 
-        generator.Enqueue(prev.AsFrame(), curr.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(prev.AsFrame(contentTimeNs: 1), curr.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
 
         var o = env.Read(output);
@@ -114,7 +114,7 @@ public class InterpolationTests
         var truths = new List<double>();
         for (var i = 1; i <= 7; i++)
         {
-            generator.Enqueue(prev.AsFrame(), curr.AsFrame(), i / 8f, output.AsFrame(), done.Signal);
+            generator.Enqueue(prev.AsFrame(contentTimeNs: 1), curr.AsFrame(contentTimeNs: 2), i / 8f, output.AsFrame(), done.Signal);
             done.Synchronize();
             using var truth = env.Pattern(Width, Height, format, (8 * k) + (uint)i);
             var o = env.Read(output);

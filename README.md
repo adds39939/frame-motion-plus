@@ -24,7 +24,11 @@ Phase 3 (the VFG backend and the feasibility gate) adds `FrameMotionPlus.Vfx`: b
 SDK, loading it from a configurable directory, and `VfgGenerator`, the real frame generator behind
 `IFrameGenerator`; and the `fmp bench vfg`, `fmp bench vfg-quality` and `fmp pattern --vfg` commands.
 Results and the answers that shape the Phase 4 pipeline: [`docs/benchmarks/phase3-vfg.md`](docs/benchmarks/phase3-vfg.md).
-There is no capture or file source yet.
+
+Phase 4a (decode) adds `FrameMotionPlus.Sources.File`: FFmpeg demux and NVDEC decode through FFmpeg's CUDA hwaccel
+in the application's CUDA context, the NV12/P010-to-RGB convert kernel, the frame history, and `fmp decode`, which
+checks a file against a software decode. Results: [`docs/benchmarks/phase4a-decode.md`](docs/benchmarks/phase4a-decode.md).
+The playback pipeline (`fmp play`) is Phase 4b.
 
 ## Layout
 
@@ -36,6 +40,7 @@ src/FrameMotionPlus.Cuda/         CUDA driver-API bindings, streams, events, ext
 src/FrameMotionPlus.Vulkan/       device selection, exportable presentation ring, presenter, SDL3 window, offscreen target
 src/FrameMotionPlus.CudaVulkan/   the IGpuBridge: the presenter's ring and timelines imported into CUDA (Linux, opaque FDs)
 src/FrameMotionPlus.Vfx/          NVIDIA VFX SDK bindings and loading, VfgGenerator (Video Frame Generation, CUDA domain)
+src/FrameMotionPlus.Sources.File/ FFmpeg 9 bindings, NVDEC decode into CUDA, the file IFrameSource and its frame history
 native/kernels/, native/shaders/  CUDA kernel and shader sources with the generated PTX and SPIR-V checked in
 tests/FrameMotionPlus.Core.Tests/ xUnit v3 tests of the core and the CLI (always run)
 tests/FrameMotionPlus.Platform.Tests/ tests of the platform layer and `fmp bench jitter` (Linux-specific ones skip elsewhere)
@@ -43,11 +48,13 @@ tests/FrameMotionPlus.Cuda.Tests/   CUDA bindings, kernels against CPU reference
 tests/FrameMotionPlus.Vulkan.Tests/ ring, presenter, offscreen and windowed presents under the validation layer (Gpu, Display)
 tests/FrameMotionPlus.Gpu.Tests/    CUDA/Vulkan interop end to end and `fmp pattern` (Gpu, Display)
 tests/FrameMotionPlus.Vfx.Tests/    SDK loading, VfgGenerator, measured SDK behaviour, the VFG commands (Vfx)
+tests/FrameMotionPlus.Sources.File.Tests/ FFmpeg layouts, the convert kernel, decode against software, `fmp decode` (Media)
 ```
 
 Hardware tests carry the category `Gpu` (NVIDIA GPU, CUDA driver, Vulkan with the validation layer),
-`Display` (a Wayland session and SDL3 as well) or `Vfx` (the NVIDIA VFX SDK as well) and skip, never
-fail, when that is missing, so hosted CI stays green. Vulkan tests run under the validation layer and
+`Display` (a Wayland session and SDL3 as well), `Vfx` (the NVIDIA VFX SDK as well) or `Media` (FFmpeg 9's
+shared libraries and the `ffmpeg` CLI, which makes the test clips at test time) and skip, never fail, when
+that is missing, so hosted CI stays green. Vulkan tests run under the validation layer and
 fail on any message.
 
 ## The NVIDIA VFX SDK
@@ -62,6 +69,15 @@ The directory is the SDK root (`lib/`, `external/cuda/lib/`) with the VFG featur
 SDK's libraries are loaded by absolute path, dependencies first, so the SDK's own lookups by bare name
 find them (details in [`docs/benchmarks/phase3-vfg.md`](docs/benchmarks/phase3-vfg.md)). Without the SDK
 everything else works; the VFG commands exit 69 with a one-line reason.
+
+## FFmpeg
+
+File playback uses the system's FFmpeg 9 shared libraries (`libavcodec.so.63`, `libavformat.so.63`,
+`libavutil.so.61`) with its CUDA hwaccel, loaded at run time by soname (or from `$FMP_FFMPEG_DIR`), through
+hand-written source-generated bindings whose structure offsets and field sizes, constants and prototypes (C types
+mapped to the C# signatures, parameter by parameter) a test checks against the installed headers. Another major
+version is refused by name; so is any platform but x86-64 Linux, where those layouts are checked. Without FFmpeg
+everything else works and `fmp decode` exits 69 with a one-line reason.
 
 ## Build, test, publish
 
@@ -155,6 +171,26 @@ managed allocation on the present thread after the warm-up, and 69 with a one-li
 usable NVIDIA GPU, Vulkan device, Wayland session or validation layer is found. Ctrl+C or SIGTERM stops
 the run cleanly with its verdict (a second one ends it at once). The bridge needs Linux; on other
 systems the command says so.
+
+## Decoding a file
+
+`fmp decode <file>` plays a file through the real source path as fast as it decodes: FFmpeg demuxes it, NVDEC
+decodes it into CUDA memory in the application's context, the convert kernel turns each NV12/P010 picture into
+RGBA8 (8-bit) or RGB10A2 (10-bit) in the frame history. It prints the stream (codec, size, bit depth, rate,
+colour and HDR metadata), the content-time statistics (with any jumps in the stream's own timestamps, such as
+concatenated recordings, and timestamps repaired), loops and seeks, per-frame GPU and decode-thread costs, the
+queue depth, the worst stall of another thread's CUDA calls meanwhile, and the allocation and GC counts. The
+verdict fails, naming each reason, on a mismatch, a frame too few or too many in the software decode, content
+times that do not increase or that bunch up, corrupt or truncated input, a loop that could not be made, frame-pool
+growth or an allocation on a per-frame path.
+
+```sh
+fmp decode clip.mkv                         # the whole file
+fmp decode clip.mkv --verify                # every frame bit-exact against the ffmpeg CLI's software decode,
+                                            #   and every RGB frame against the CPU reference of the conversion
+fmp decode clip.mkv --loop --frames 3000 --csv decode.csv
+fmp decode clip.h264 --loop --verify        # an elementary stream loops too (from its first byte)
+```
 
 ## Benchmarking VFG
 

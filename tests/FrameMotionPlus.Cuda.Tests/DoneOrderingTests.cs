@@ -49,10 +49,10 @@ public class DoneOrderingTests
         setup.Synchronize();
         if (discontinuity)
         {
-            generator.NotifyDiscontinuity();
+            generator.NotifyDiscontinuity(2);
         }
 
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.25f, o.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.25f, o.AsFrame(), done.Signal);
         consumer.Wait(done.Signal);
         consumer.Copy2DAsync(tail.Address, Size * 4L, o.Address + ((ulong)(Size - TailRows) * (ulong)o.PitchBytes), o.PitchBytes, Size * 4L, TailRows);
         var seen = new uint[TailRows * Size];

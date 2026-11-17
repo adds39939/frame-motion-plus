@@ -49,8 +49,8 @@ public class AllocationTests
         aDrawn.Record(stream);
         kernels.EnqueueTestPattern(stream, b.AsFrame(), 2);
         bDrawn.Record(stream);
-        var prev = a.AsFrame(ready: aDrawn.Signal);
-        var curr = b.AsFrame(ready: bDrawn.Signal);
+        var prev = a.AsFrame(contentTimeNs: 1, ready: aDrawn.Signal);
+        var curr = b.AsFrame(contentTimeNs: 2, ready: bDrawn.Signal);
         using var blend = new BlendGenerator(cuda, kernels, stream);
         IFrameGenerator generator = blend;
         generator.Configure(new FrameGenConfig { Width = 1280, Height = 720, Format = format });

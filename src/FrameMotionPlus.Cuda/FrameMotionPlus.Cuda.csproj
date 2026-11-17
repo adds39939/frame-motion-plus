@@ -25,6 +25,9 @@
          context's reference count. -->
     <InternalsVisibleTo Include="FrameMotionPlus.Vfx" />
     <InternalsVisibleTo Include="FrameMotionPlus.Vfx.Tests" />
+    <!-- The file source's tests read the stream counters and the context's reference count, and compare the YCbCr
+         conversion's kernel parameters with an independent derivation. -->
+    <InternalsVisibleTo Include="FrameMotionPlus.Sources.File.Tests" />
   </ItemGroup>
 
 </Project>

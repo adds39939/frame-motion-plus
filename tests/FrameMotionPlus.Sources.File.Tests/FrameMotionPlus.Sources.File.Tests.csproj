@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>FrameMotionPlus.Sources.File.Tests</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The zero-allocation tests read GC.GetAllocatedBytesForCurrentThread(), which a background (concurrent) gen2
+         collection triggered by another thread can move by a few KB on a thread that allocated nothing. Blocking
+         collections leave it exact (GcConfigurationTests guards this, as in the other hardware test projects). -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- Dynamic PGO off in this test host, as in the other hardware test projects: re-compiling a LibraryImport stub at
+         a higher tier binds the P/Invoke again, and binding allocates the library name on the calling thread, which
+         would land in a zero-allocation window by chance. The NativeAOT binary has no tiers. -->
+    <TieredPGO>false</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3.mtp-off" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="RepositoryRoot" Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../'))" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
+    <!-- fmp decode is tested in-process through the dispatcher and out of process for the no-FFmpeg and no-GPU paths;
+         its CPU reference of the conversion (YuvReference) is the one the kernel is checked against. -->
+    <ProjectReference Include="..\..\src\FrameMotionPlus.App\FrameMotionPlus.App.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- One GPU hardware test assembly at a time on a machine: see the remarks in the file. -->
+    <Compile Include="..\Shared\GpuMachineLock.cs" Link="Support\GpuMachineLock.cs" />
+    <!-- The repository and external-tool helpers (gcc for the layout test). -->
+    <Compile Include="..\FrameMotionPlus.Cuda.Tests\Support\Repo.cs" Link="Support\Repo.cs" />
+  </ItemGroup>
+
+</Project>

@@ -45,6 +45,7 @@ public class AllocationTests
             var signal = done.Signal;
             var stream = generator.Stream;
             long times = 0;
+            long clock = 0;
 
             void Window()
             {
@@ -60,12 +61,15 @@ public class AllocationTests
                         9 => 1f,
                         _ => (i % 10) / 10f,
                     };
+                    // The pair moves on in time with every call; a cut at its curr makes this call's pair discontinuous
+                    // and the next one, which starts at the cut, ends it.
+                    var time = clock++;
                     if (i % 17 == 0)
                     {
-                        asInterface.NotifyDiscontinuity();
+                        asInterface.NotifyDiscontinuity(time + 1);
                     }
 
-                    asInterface.Enqueue(swap ? frameB : frameA, swap ? frameA : frameB, t, targets[i % targets.Length], signal);
+                    asInterface.Enqueue((swap ? frameB : frameA) with { ContentTimeNs = time }, (swap ? frameA : frameB) with { ContentTimeNs = time + 1 }, t, targets[i % targets.Length], signal);
                     while (generator.TryReadGpuTime(out _))
                     {
                         times++;

@@ -18,7 +18,7 @@ proven*.
 | clang / LLVM | 23.1.5 with the `nvptx64` target | CUDA kernels compile to PTX without the CUDA toolkit |
 | CUDA toolkit (`nvcc`, NVRTC) | **Not installed** | Use the driver API only; kernels via clang NVPTX |
 | NVIDIA VFX SDK (Maxine VFG) | 1.3.0.0, unpacked under `lib/` (git-ignored, never committed) | Phase 3 is unblocked. See "VFX SDK layout" below |
-| Capture card | **No `/dev/video*`** | **Blocks the Phase 5 hardware gate.** `vivid` kernel module is available as a stand-in (`sudo modprobe vivid`) |
+| Capture card | Elgato 4K X (`0fd9:009b`) on a 10 Gbps USB link, `/dev/video0` (capture) and `/dev/video1` (metadata) through `uvcvideo`; readable by the desktop user without sudo (logind ACL) | Phase 5 can run on real hardware. Uncompressed NV12 up to 2160p60, 1440p144 and 1080p240; **10-bit P010 up to 1440p60 and 2160p30** (answers the design doc's open question); also YUYV, YU12, BGR3; MJPG only is offered for 2160p120/144. `vivid` (`sudo modprobe vivid`) remains an optional stand-in for tests without a signal |
 | sudo | Needs a password | Agents cannot install system packages or load kernel modules |
 
 ### VFX SDK layout
@@ -216,17 +216,30 @@ checkout); nothing from `lib/` is copied into build output or committed.
 - **Automated gate:** 1440p Medium p99 d under 7 ms; VFG writes into the Vulkan-exported ring and the
   result presents. If 1440p fails, the report recommends 1080p or Low mode and later phases retarget.
 - **Manual gate:** Adam looks at the PQ dumps for highlight, gradient and banding artefacts.
+  **Passed 2026-11-17:** "The images from phase 3 look good."
 
 ### Phase 4: File playback, first light
 
 *Design doc: milestone 1.*
+
+This phase is built, reviewed and committed in three steps, because Phase 2 showed that a large
+step reviewed in one go costs more rounds than several small ones:
+
+- **4a, decode:** the generator and bridge backlogs below; FFmpeg demux + NVDEC into the app's CUDA
+  context; the convert kernel; frame history; `fmp decode` to verify a file against a software decode.
+- **4b, pipeline:** source, scheduler, generator and present threads joined by SPSC rings; `fmp play`
+  with repeat, blend and VFG; telemetry CSV; the 10-minute gate run.
+- **4c, around it:** HUD and the quality harness.
 
 - FFmpeg demux + NVDEC (`hwaccel cuda`) sharing the app's CUDA context; convert kernel
   (NV12/P010 to RGBA8/RGB10A2, chroma upsample, matrix and range); frame history; PTS timing.
 - Full pipeline assembly: source, scheduler and present threads joined by SPSC rings; generator
   selectable (repeat, blend, VFG 2x); fixed-refresh presenter.
 - HUD (frame-time graph, d, D, dropped/repeated, detected frame rate) and telemetry CSV export.
-- Smooth Motion presenter mode (`NVPRESENT_ENABLE_SMOOTH_MOTION=1` before instance creation), A/B against VFG.
+- **Smooth Motion is dropped for now** (owner's decision, 2026-11-17: focus on VFG). The design doc's
+  second backend, NVIDIA's driver-level Smooth Motion as a presenter mode with an A/B against VFG,
+  is not built in this phase. The presenter's layer policy can already enable the driver layer, so
+  it can be picked up later without restructuring; it is listed under "Deferred" at the end.
 - Quality harness: 120 fps footage, drop alternate frames, regenerate, score PSNR/SSIM against originals.
 - File audio (audio as master clock) arrives with Phase 8; until then file video is timed from PTS.
 - **Decided from the Phase 3 results** (`docs/benchmarks/phase3-vfg.md`):
@@ -306,13 +319,59 @@ checkout); nothing from `lib/` is copied into build output or committed.
      disposing the presenter while a release waits on a never-signalled write hangs in the driver's
      exit path; N or more consecutive never-signalled writes wedge later bridges on that ring until
      the presenter is disposed; a second pipeline on the same CUDA context is unsupported.
+- **Decided and found in step 4a** (`docs/benchmarks/phase4a-decode.md`, "What the pipeline must
+  know", is the reference for 4b):
+  - FFmpeg is bound with hand-written `LibraryImport` bindings checked against the system headers,
+    not FFmpeg.AutoGen (it binds through runtime marshalling and lacks `AVCUDADeviceContext`).
+  - FFmpeg shares the app's primary CUDA context through `AV_CUDA_USE_CURRENT_CONTEXT`; its copies
+    run on the source's own copy stream, which nothing else may use. Steady decoding makes no
+    allocation, free or context synchronise; opening and closing a file do, so they are drained
+    points. The decode thread waits for the GPU once per frame inside NVDEC and stops whenever the
+    compute stream is held.
+  - `NotifyDiscontinuity(contentTimeNs)` names the first frame after the cut; generators refuse a
+    pair whose content times do not increase. A frame's `ColorMetadata` describes the pixels in the
+    buffer (converted frames: identity matrix, full range); the YCbCr description stays with the
+    source.
+  - A backward timestamp step, or a forward step over 10 s, is a discontinuity. The real gap is
+    kept on continuous timelines (MP4, Matroska) and collapsed only for formats whose clocks jump
+    (MPEG-TS/PS). Matroska's whole-millisecond timestamps (16/17/17 ms at 60 fps) are not a variable
+    frame rate.
+  - `IFrameSource.Release` should carry the GPU signal of the last reader (today only the concrete
+    file source has that overload); `SourceFrame.Ready` and `Frame.Ready` are still duplicated.
+- **Decode backlog from the 4a review** (approved with these tracked):
+  1. Every MPEG-TS seek restarts at the first byte and decodes forward to the target, because the
+     keyframe check accepts a landing only if the first packet read is itself a keyframe: correct,
+     but the cost grows with position (a seek to 50 s decoded 1,500 frames). After landing, read
+     forward to the next keyframe and accept it when it is at or before the target.
+  2. `fmp decode` leaves the step across a discontinuity out of its interval statistics, so a file
+     with a kept 12 s gap prints "constant frame rate"; `Seek`'s summary still says "nothing
+     changed" on failure although a multi-probe search may have moved the demuxer.
+  3. Untested: a file that grows while it plays; MPEG-PS (handled like TS); the Windows path, which
+     reports file playback as unavailable.
 - **Automated gate:** 1440p60 file to 120 Hz with zero missed slots over 10 minutes; zero gen0
   collections in that run; quality harness produces scores for each generator.
-- **Manual gate:** Smooth Motion vs VFG A/B looks right.
+- **Manual gate:** VFG file playback looks right to Adam (smooth motion, no visible pacing hitches).
 
 ### Phase 5: Capture card (V4L2)
 
 *Design doc: milestone 2.* **Prerequisite for the hardware gate: a capture card, PS5 HDCP off.**
+
+- **Owner's target mode (2026-11-17): 4K HDR, 30 to 60.** The Elgato 4K X offers uncompressed 10-bit
+  P010 at 2160p only at 30 / 29.97 fps (2160p60 is 8-bit NV12 or MJPG), so this mode captures
+  `3840x2160 P010 @ 30` and generates to 60. A capture in that mode streams at 30.00 fps on this
+  machine (tested with no input signal: black frames). VFG cost is no obstacle (4K Medium about
+  1.4 ms, High about 6.5 ms, against a 16.7 ms slot). What has to be established first, with a real
+  PS5 signal, because the PS5 outputs 60 Hz and the card does the 60 to 30 reduction itself:
+  1. How the card reduces 60 Hz to 30: which copy of each repeated frame it keeps (up to one
+     refresh, 16.7 ms, of extra latency if it keeps the second), whether that phase is stable, and
+     whether it ever blends frames.
+  2. What happens when the game's pacing is uneven or the game runs at 60 fps: a frame shown for a
+     single refresh can be dropped by the card, and the app cannot see it. Cadence detection cannot
+     help in this mode, because every captured frame is already unique.
+  3. The V4L2 format reports sRGB / Rec. 709 for P010 here, so HDR is not signalled: the manual HDR
+     override from the design doc is required, and metadata comes from defaults.
+  The alternative for games that run at 60 fps is `2560x1440 P010 @ 60` to 120 with the presenter
+  scaling to 4K. Both modes are built; the app should say which one a given signal calls for.
 
 - V4L2 ioctl bindings with struct layouts checked against the kernel headers; `USERPTR` buffers from
   `cudaHostAlloc` with `MMAP` + `cudaHostRegister` fallback; real-time dequeue thread, newest-wins;
@@ -440,3 +499,15 @@ need no VFG (interop proof, runtime jitter) are Phase 2, and the VFG measurement
 core comes first because it needs no hardware or SDK and everything else builds on it. The go/no-go
 still lands before any pipeline code depends on VFG, and the preliminary numbers above already point
 to "go".
+
+## Deferred
+
+Things the design doc includes that are deliberately not being built yet.
+
+- **NVIDIA Smooth Motion as a second backend** (design doc: "NVIDIA Smooth Motion as a second
+  backend"). Dropped for now on 2026-11-17 to focus on VFG. When wanted: a presenter mode that sets
+  `NVPRESENT_ENABLE_SMOOTH_MOTION=1` before the Vulkan instance is created, presents only unique real
+  frames at their content cadence, and is flagged in capabilities as a mode with no generator. The
+  layer policy in `FrameMotionPlus.Vulkan` already has an NVIDIA-present-layer setting. Open
+  questions from the design doc remain open: whether it respects present timing, and how it behaves
+  with HDR.

@@ -97,6 +97,7 @@ public abstract class CudaFrameGenerator : IFrameGenerator
         Validate(prev, nameof(prev));
         Validate(curr, nameof(curr));
         Validate(output, nameof(output));
+        DiscontinuityLatch.ValidatePair(prev, curr);
         CudaStream.ValidateCudaSignal(prev.Ready, nameof(prev));
         CudaStream.ValidateCudaSignal(curr.Ready, nameof(curr));
         CudaStream.ValidateCudaSignal(output.Ready, nameof(output));
@@ -114,8 +115,8 @@ public abstract class CudaFrameGenerator : IFrameGenerator
 
         stream.WaitValidated(output.Ready);
 
-        // The pair after a notification stays discontinuous for every call with it (Core's "next pair"); t = 0 is prev
-        // itself either way, so only t > 0 changes.
+        // A pair that spans a notified cut is discontinuous for every call with it (Core's rule); t = 0 is prev itself
+        // either way, so only t > 0 changes.
         var discontinuity = _discontinuity.Observe(prev, curr) && t > 0f;
         _timer.Begin(stream);
         try
@@ -133,11 +134,11 @@ public abstract class CudaFrameGenerator : IFrameGenerator
     }
 
     /// <summary>
-    /// The next pair is not continuous (see <see cref="IFrameGenerator.NotifyDiscontinuity"/>): every <see cref="Enqueue"/>
-    /// with the pair of the next call outputs the current frame unchanged, except at t = 0 (the previous frame), until
-    /// a call with a different pair.
+    /// The frame at <paramref name="contentTimeNs"/> starts a new shot (see <see cref="IFrameGenerator.NotifyDiscontinuity"/>):
+    /// every <see cref="Enqueue"/> whose pair spans it outputs the current frame unchanged, except at t = 0 (the previous
+    /// frame); the first pair that starts at or after it ends the notification. Safe from any thread.
     /// </summary>
-    public void NotifyDiscontinuity() => _discontinuity.Notify();
+    public void NotifyDiscontinuity(long contentTimeNs) => _discontinuity.Notify(contentTimeNs);
 
     /// <summary>Non-blocking: GPU time of the oldest unread finished <see cref="Enqueue"/>, ns.</summary>
     public bool TryReadGpuTime(out long nanoseconds) => _timer.TryRead(out nanoseconds);
@@ -199,7 +200,7 @@ public abstract class CudaFrameGenerator : IFrameGenerator
 }
 
 /// <summary>
-/// Shows the nearest real frame: <c>prev</c> for t &lt; 0.5, <c>curr</c> otherwise (after a discontinuity: <c>curr</c>
+/// Shows the nearest real frame: <c>prev</c> for t &lt; 0.5, <c>curr</c> otherwise (across a discontinuity: <c>curr</c>
 /// for every t &gt; 0), copied with <c>cuMemcpy2DAsync</c>. The baseline for A/B tests and the fallback when VFG cannot
 /// keep up.
 /// </summary>

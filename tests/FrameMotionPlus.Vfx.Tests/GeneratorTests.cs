@@ -59,8 +59,8 @@ public class GeneratorTests
             // Reference outputs, each made into a fresh buffer of its own.
             using var refForward = env.Image(Width, Height, format);
             using var refBackward = env.Image(Width, Height, format);
-            generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, refForward.AsFrame(), done.Signal);
-            generator.Enqueue(b.AsFrame(), a.AsFrame(), 0.5f, refBackward.AsFrame(), done.Signal);
+            generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, refForward.AsFrame(), done.Signal);
+            generator.Enqueue(b.AsFrame(contentTimeNs: 1), a.AsFrame(contentTimeNs: 2), 0.5f, refBackward.AsFrame(), done.Signal);
             done.Synchronize();
             var forward = env.Read(refForward);
             var backward = env.Read(refBackward);
@@ -70,7 +70,7 @@ public class GeneratorTests
             for (var i = 0; i < outputs.Length; i++)
             {
                 var swap = (i & 1) == 1;
-                generator.Enqueue(swap ? b.AsFrame() : a.AsFrame(), swap ? a.AsFrame() : b.AsFrame(), 0.5f, outputs[i].AsFrame(), done.Signal);
+                generator.Enqueue((swap ? b : a).AsFrame(contentTimeNs: 1), (swap ? a : b).AsFrame(contentTimeNs: 2), 0.5f, outputs[i].AsFrame(), done.Signal);
                 done.Synchronize();
                 for (var j = 0; j < outputs.Length; j++)
                 {
@@ -113,7 +113,7 @@ public class GeneratorTests
         using var reference = env.Image(w, h, format);
         using var generator = env.Generator(w, h, format);
         using var done = CudaEvent.Create(env.Context);
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, reference.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, reference.AsFrame(), done.Signal);
         done.Synchronize();
         var expected = env.Read(reference);
 
@@ -129,7 +129,7 @@ public class GeneratorTests
             s.Synchronize();
         }
 
-        generator.Enqueue(frameA, b.AsFrame(), 0.5f, frameO, done.Signal);
+        generator.Enqueue(frameA with { ContentTimeNs = 1 }, b.AsFrame(contentTimeNs: 2), 0.5f, frameO, done.Signal);
         done.Synchronize();
         Assert.True(env.Read(frameO).AsSpan().SequenceEqual(expected), "tight-pitch frames gave a different output");
 
@@ -147,7 +147,7 @@ public class GeneratorTests
 
         for (var i = 0; i < 3; i++)
         {
-            generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, view, done.Signal);
+            generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, view, done.Signal);
         }
 
         done.Synchronize();
@@ -197,7 +197,7 @@ public class GeneratorTests
         using var consumer = CudaStream.Create(env.Context);
         using var control = CudaStream.Create(env.Context);
 
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, expectedBuffer.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, expectedBuffer.AsFrame(), done.Signal);
         done.Synchronize();
         var expected = env.Read(expectedBuffer);
 
@@ -209,7 +209,7 @@ public class GeneratorTests
         gate.Record(gateStream);
         var prev = a.AsFrame() with { Ready = gate.Signal };
         var watch = Stopwatch.StartNew();
-        generator.Enqueue(prev, b.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(prev with { ContentTimeNs = 1 }, b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         var enqueueMs = watch.Elapsed.TotalMilliseconds;
         control.CopyFrameAsync(output.AsFrame(), unwaited.AsFrame());
         consumer.Wait(done.Signal);
@@ -249,7 +249,7 @@ public class GeneratorTests
         using var reference = env.Image(Width, Height, format);
         using var generator = env.Generator(Width, Height, format, options: new VfgOptions { AutomaticShotChangeDetection = false });
         using var done = CudaEvent.Create(env.Context);
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, reference.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, reference.AsFrame(), done.Signal);
         done.Synchronize();
         var expected = env.Read(reference);
 
@@ -298,8 +298,8 @@ public class GeneratorTests
             }
 
             generator.Enqueue(
-                prev.AsFrame() with { Ready = which == "prev" ? signal : GpuSignal.None },
-                curr.AsFrame() with { Ready = which == "curr" ? signal : GpuSignal.None },
+                prev.AsFrame(contentTimeNs: 1) with { Ready = which == "prev" ? signal : GpuSignal.None },
+                curr.AsFrame(contentTimeNs: 2) with { Ready = which == "curr" ? signal : GpuSignal.None },
                 0.5f,
                 output.AsFrame() with { Ready = which == "output" ? signal : GpuSignal.None },
                 done.Signal);
@@ -348,15 +348,17 @@ public class GeneratorTests
         using var done = CudaEvent.Create(env.Context);
         var prev = env.Read(a);
         var curr = env.Read(cut);
+        // Content times: a, then cut (the first frame of the new shot), then after.
+        long TimeOf(CudaDeviceBuffer x) => x == a ? 1 : x == cut ? 2 : 3;
         uint[] Run(CudaDeviceBuffer p, CudaDeviceBuffer q, float t)
         {
-            generator.Enqueue(p.AsFrame(), q.AsFrame(), t, output.AsFrame(), done.Signal);
+            generator.Enqueue(p.AsFrame(contentTimeNs: TimeOf(p)), q.AsFrame(contentTimeNs: TimeOf(q)), t, output.AsFrame(), done.Signal);
             done.Synchronize();
             return env.Read(output);
         }
 
         float[] timesteps = multiplier == 2 ? [0.5f] : [0.25f, 0.5f, 0.75f];
-        generator.NotifyDiscontinuity();
+        generator.NotifyDiscontinuity(TimeOf(cut));
         foreach (var t in timesteps.Concat(timesteps))
         {
             Assert.True(Run(a, cut, t).AsSpan().SequenceEqual(curr), $"{multiplier}x t={t} across the cut is not the current frame");
@@ -365,11 +367,10 @@ public class GeneratorTests
         Assert.Equal(2 * timesteps.Length, generator.ShotChangeRuns);
 
         // t = 0 is prev itself, and the pair stays cut after it.
-        generator.NotifyDiscontinuity();
         Assert.True(Run(a, cut, 0f).AsSpan().SequenceEqual(prev), "t = 0 after a cut is not the previous frame");
         Assert.True(Run(a, cut, 0.5f).AsSpan().SequenceEqual(curr), "a t = 0 call used the notification up");
 
-        // The next pair (the new shot moving on) is interpolated, not copied.
+        // The next pair (the new shot moving on) starts at the cut: interpolated, not copied.
         var next = Run(cut, after, 0.5f);
         Assert.False(next.AsSpan().SequenceEqual(curr), "the pair after the cut was treated as a cut too");
         Assert.False(next.AsSpan().SequenceEqual(env.Read(after)), "the pair after the cut was treated as a cut too");
@@ -392,6 +393,7 @@ public class GeneratorTests
         using var done = CudaEvent.Create(env.Context);
         using var generator = env.Generator(Width, Height, format, options: new VfgOptions { AutomaticShotChangeDetection = false });
         (CudaDeviceBuffer P, CudaDeviceBuffer Q, float T, bool Cut)[] runs = [(a, b, 0.5f, true), (b, c, 0.25f, false), (b, c, 0.75f, false), (b, c, 0.5f, false)];
+        long TimeOf(CudaDeviceBuffer x) => x == a ? 1 : x == b ? 2 : 3;
         var expected = new List<uint[]>();
         using (var reference = env.Image(Width, Height, format))
         {
@@ -399,10 +401,10 @@ public class GeneratorTests
             {
                 if (run.Cut)
                 {
-                    generator.NotifyDiscontinuity();
+                    generator.NotifyDiscontinuity(TimeOf(run.Q));
                 }
 
-                generator.Enqueue(run.P.AsFrame(), run.Q.AsFrame(), run.T, reference.AsFrame(), done.Signal);
+                generator.Enqueue(run.P.AsFrame(contentTimeNs: TimeOf(run.P)), run.Q.AsFrame(contentTimeNs: TimeOf(run.Q)), run.T, reference.AsFrame(), done.Signal);
                 done.Synchronize();
                 expected.Add(env.Read(reference));
             }
@@ -420,11 +422,11 @@ public class GeneratorTests
             {
                 if (runs[i].Cut)
                 {
-                    generator.NotifyDiscontinuity();
+                    generator.NotifyDiscontinuity(TimeOf(runs[i].Q));
                 }
 
-                var prev = runs[i].P.AsFrame() with { Ready = i == 0 ? gate.Signal : GpuSignal.None };
-                generator.Enqueue(prev, runs[i].Q.AsFrame(), runs[i].T, outputs[i].AsFrame(), done.Signal);
+                var prev = runs[i].P.AsFrame(contentTimeNs: TimeOf(runs[i].P)) with { Ready = i == 0 ? gate.Signal : GpuSignal.None };
+                generator.Enqueue(prev, runs[i].Q.AsFrame(contentTimeNs: TimeOf(runs[i].Q)), runs[i].T, outputs[i].AsFrame(), done.Signal);
             }
 
             Assert.False(gate.IsComplete, "the gate opened before every run was enqueued; the test proves nothing");
@@ -458,12 +460,12 @@ public class GeneratorTests
         using var generator = env.Generator(Width, Height, format, options: new VfgOptions { AutomaticShotChangeDetection = shotChangeDetection });
         using var done = CudaEvent.Create(env.Context);
 
-        generator.NotifyDiscontinuity();
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.NotifyDiscontinuity(2);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
         Assert.True(env.Read(output).AsSpan().SequenceEqual(env.Read(b)), "a shot-change run should output the current frame");
 
-        generator.Enqueue(b.AsFrame(), c.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(b.AsFrame(contentTimeNs: 2), c.AsFrame(contentTimeNs: 3), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
         Assert.False(env.Read(output).AsSpan().SequenceEqual(env.Read(c)), "the flag was not cleared after its pair");
         Assert.Equal(1, generator.ShotChangeRuns);
@@ -484,10 +486,10 @@ public class GeneratorTests
         {
         }
 
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0f, output.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0f, output.AsFrame(), done.Signal);
         done.Synchronize();
         Assert.True(env.Read(output).AsSpan().SequenceEqual(env.Read(a)));
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 1f, output.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 1f, output.AsFrame(), done.Signal);
         done.Synchronize();
         Assert.True(env.Read(output).AsSpan().SequenceEqual(env.Read(b)));
         Assert.Equal(2, generator.RealFrameCopies);
@@ -529,7 +531,7 @@ public class GeneratorTests
         using var b = env.Pattern(Width, Height, PixelFormat.Rgb10A2, 22);
         using var output = env.Image(Width, Height, PixelFormat.Rgb10A2);
         using var done = CudaEvent.Create(env.Context);
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
 
         // A third configuration evicts the least recently used one (sdr), not the active one.
@@ -569,6 +571,85 @@ public class GeneratorTests
     }
 
     /// <summary>
+    /// Generator backlog item 1 (Phase 3 review): a control thread switches between two prepared instances of different
+    /// sizes (a source changing resolution) as fast as it can while the generator thread enqueues frames of the small
+    /// size. The active instance and its configuration used to be two fields that Enqueue read separately, so a switch
+    /// landing between the reads ran the large instance on frames validated against the small configuration: the SDK
+    /// refused them (NVCV_ERR_MISMATCH in NvVFX_SetImage) and a healthy instance was marked faulted. Now each call sees one
+    /// consistent pair: small frames run on the small instance, or are refused as arguments while the large one is
+    /// active; nothing ever faults, and every accepted call ran. (Same-size SDR/HDR instances do not show it: the SDK runs
+    /// an RGB10A2-loaded instance on RGBA8 frames without complaint.)
+    /// </summary>
+    [Fact]
+    public void Switching_prepared_instances_from_another_thread_during_enqueues_never_faults_one()
+    {
+        var env = VfxHardware.Require();
+        const int w = 320, h = 180;
+        using var generator = new VfgGenerator(env.Context, new VfgOptions { AutomaticShotChangeDetection = false, WarmupRuns = 1 });
+        var sdr = new FrameGenConfig { Width = w, Height = h, Format = PixelFormat.Rgba8, Quality = FrameGenQuality.Low };
+        var hdr = sdr with { Width = 2 * w, Height = 2 * h };
+        generator.Configure(sdr);
+        generator.Prepare(hdr);
+        using var a = env.Pattern(w, h, PixelFormat.Rgba8, 20);
+        using var b = env.Pattern(w, h, PixelFormat.Rgba8, 22);
+        using var output = env.Image(w, h, PixelFormat.Rgba8);
+        using var done = CudaEvent.Create(env.Context);
+        var deadline = Stopwatch.GetTimestamp() + (2 * Stopwatch.Frequency);
+        long switches = 0, failedSwitches = 0;
+        var stop = 0;
+        var control = new Thread(() =>
+        {
+            while (Volatile.Read(ref stop) == 0)
+            {
+                failedSwitches += generator.TryConfigurePrepared(hdr) ? 0 : 1;
+                failedSwitches += generator.TryConfigurePrepared(sdr) ? 0 : 1;
+                switches += 2;
+            }
+        }) { IsBackground = true, Name = "control" };
+        control.Start();
+        long accepted = 0, refused = 0, n = 0;
+        Exception? unexpected = null;
+        try
+        {
+            while (Stopwatch.GetTimestamp() < deadline && unexpected is null)
+            {
+                try
+                {
+                    generator.Enqueue(a.AsFrame(contentTimeNs: n), b.AsFrame(contentTimeNs: n + 1), 0.5f, output.AsFrame(), done.Signal);
+                    accepted++;
+                }
+                catch (ArgumentException)
+                {
+                    refused++; // the large instance was active for this call: these frames are not its shape
+                }
+                catch (Exception e)
+                {
+                    unexpected = e;
+                }
+
+                n++;
+                if ((n & 15) == 0)
+                {
+                    done.Synchronize();
+                }
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref stop, 1);
+            control.Join();
+            generator.Stream.Synchronize();
+        }
+
+        Log.WriteLine($"{n} enqueues against {switches} switches: {accepted} ran, {refused} refused as the other shape; faulted {generator.IsFaulted}; {unexpected?.GetType().Name}: {unexpected?.Message}");
+        Assert.Null(unexpected);
+        Assert.False(generator.IsFaulted);
+        Assert.Equal(0, failedSwitches);
+        Assert.True(accepted > 0 && refused > 0, "both outcomes should occur; the test raced nothing");
+        Assert.Equal(accepted, generator.Runs);
+    }
+
+    /// <summary>
     /// A failed SDK call leaves the instance faulted (review: Configure with the same configuration used to be a no-op
     /// and every later call threw): the failing call enqueues no done signal, later calls say the instance is faulted,
     /// a prepared-only switch refuses it, and Configure loads it again, after which it generates normally.
@@ -583,18 +664,18 @@ public class GeneratorTests
         using var output = env.Image(Width, Height, format);
         using var done = CudaEvent.Create(env.Context);
         using var generator = env.Generator(Width, Height, format);
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
         var expected = env.Read(output);
 
         // Break the loaded instance the way CharacterizationTests found: a mode change after load.
         generator.ActiveEffect!.SetU32(Interop.VfxSelectors.Mode, (uint)VfgMode.High);
         var signals = generator.Stream.EventSignals;
-        var failure = Assert.Throws<VfxException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
+        var failure = Assert.Throws<VfxException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
         Assert.Equal(Interop.NvCVStatus.ErrInitialization, failure.Status);
         Assert.Equal(signals, generator.Stream.EventSignals); // no done for a frame that was not produced
         Assert.True(generator.IsFaulted);
-        var again = Assert.Throws<InvalidOperationException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
+        var again = Assert.Throws<InvalidOperationException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
         Assert.Contains("faulted", again.Message, StringComparison.Ordinal);
         Assert.False(generator.TryConfigurePrepared(generator.Config));
         Assert.False(generator.IsPrepared(generator.Config));
@@ -603,7 +684,7 @@ public class GeneratorTests
         generator.Configure(generator.Config);
         Assert.Equal(loads + 1, generator.Loads);
         Assert.False(generator.IsFaulted);
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
         Assert.True(env.Read(output).AsSpan().SequenceEqual(expected));
     }
@@ -622,7 +703,7 @@ public class GeneratorTests
 
         using (var unconfigured = new VfgGenerator(env.Context))
         {
-            var e = Assert.Throws<InvalidOperationException>(() => unconfigured.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
+            var e = Assert.Throws<InvalidOperationException>(() => unconfigured.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
             Assert.Contains("Configure", e.Message, StringComparison.Ordinal);
             Assert.Throws<ArgumentOutOfRangeException>(() => unconfigured.Configure(new FrameGenConfig { Width = 0, Height = 10, Format = format }));
             Assert.Throws<ArgumentException>(() => unconfigured.Configure(new FrameGenConfig { Width = 64, Height = 64, Format = PixelFormat.Unknown }));
@@ -632,33 +713,35 @@ public class GeneratorTests
         using var generator = env.Generator(Width, Height, format);
         var stream = generator.Stream;
         var (waits, signals) = (stream.EventWaits, stream.EventSignals);
-        var shape = Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, small.AsFrame(), done.Signal));
+        var shape = Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, small.AsFrame(), done.Signal));
         Assert.Contains("does not match the configured 640x360 Rgba8", shape.Message, StringComparison.Ordinal);
         Assert.Equal("output", shape.ParamName);
-        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(), tenBit.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
-        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame() with { Domain = MemoryDomain.Vulkan }, b.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
-        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame() with { SizeBytes = 100 }, b.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
-        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), float.NaN, output.AsFrame(), done.Signal));
-        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 1.5f, output.AsFrame(), done.Signal));
-        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), -0.01f, output.AsFrame(), done.Signal));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), tenBit.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1) with { Domain = MemoryDomain.Vulkan }, b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1) with { SizeBytes = 100 }, b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal)); // no content times
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 2), b.AsFrame(contentTimeNs: 1), 0.5f, output.AsFrame(), done.Signal)); // backwards
+        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), float.NaN, output.AsFrame(), done.Signal));
+        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 1.5f, output.AsFrame(), done.Signal));
+        Assert.Throws<ArgumentOutOfRangeException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), -0.01f, output.AsFrame(), done.Signal));
 
         // A signal whose event was destroyed, and one of another API's domain.
         var stale = CudaEvent.Create(env.Context);
         var staleSignal = stale.Signal;
         stale.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame() with { Ready = staleSignal }, b.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), staleSignal));
-        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), GpuSignal.Timeline(MemoryDomain.Vulkan, 1, 1)));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1) with { Ready = staleSignal }, b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), staleSignal));
+        Assert.Throws<ArgumentException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), GpuSignal.Timeline(MemoryDomain.Vulkan, 1, 1)));
 
         // Nothing was enqueued for any refused call, and the generator still works.
         Assert.Equal((waits, signals), (stream.EventWaits, stream.EventSignals));
         Assert.Equal(0, generator.Runs);
-        generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal);
+        generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal);
         done.Synchronize();
         Assert.Equal(1, generator.Runs);
 
         generator.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), b.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), b.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
         Assert.Throws<ObjectDisposedException>(() => generator.Configure(new FrameGenConfig { Width = Width, Height = Height, Format = format }));
         generator.Dispose(); // twice is fine
     }
@@ -676,7 +759,7 @@ public class GeneratorTests
         using var generator = env.Generator(Width, Height, format, options: new VfgOptions { Stream = stream });
         Assert.Same(stream, generator.Stream);
         stream.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(), a.AsFrame(), 0.5f, output.AsFrame(), done.Signal));
+        Assert.Throws<ObjectDisposedException>(() => generator.Enqueue(a.AsFrame(contentTimeNs: 1), a.AsFrame(contentTimeNs: 2), 0.5f, output.AsFrame(), done.Signal));
 
         var disposed = CudaContext.RetainPrimary(0);
         disposed.Dispose();

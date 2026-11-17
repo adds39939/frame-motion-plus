@@ -279,10 +279,13 @@ public class AllocationTests
             {
                 if (i % 7 == 0)
                 {
-                    latch.Notify();
+                    latch.Notify(b.ContentTimeNs + i);
                 }
 
-                seen += latch.Observe((i & 2) == 0 ? a : b, b) ? 1 : 0;
+                // Pairs move on through time, so cuts are spanned and then passed.
+                var prev = a with { ContentTimeNs = i };
+                var curr = b with { ContentTimeNs = i + 1 };
+                seen += latch.Observe(prev, curr) ? 1 : 0;
             }
         });
         Assert.True(seen > 0);

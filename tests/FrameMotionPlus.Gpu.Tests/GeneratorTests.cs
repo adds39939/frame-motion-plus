@@ -38,8 +38,8 @@ public class GeneratorTests
         Assert.NotEqual(SourcePitch, rig.Ring.PitchBytes);
 
         // The previous and current source frames, drawn on their own stream; their events are their Ready.
-        var prev = prevBuffer.AsFrame(Width, Height, format, SourcePitch, ready: prevDrawn.Signal);
-        var curr = currBuffer.AsFrame(Width, Height, format, SourcePitch, ready: currDrawn.Signal);
+        var prev = prevBuffer.AsFrame(Width, Height, format, SourcePitch, ready: prevDrawn.Signal) with { ContentTimeNs = 1 };
+        var curr = currBuffer.AsFrame(Width, Height, format, SourcePitch, ready: currDrawn.Signal) with { ContentTimeNs = 2 };
         rig.Kernels.EnqueueTestPattern(source, prev, 40);
         prevDrawn.Record(source);
         rig.Kernels.EnqueueTestPattern(source, curr, 41);
@@ -59,7 +59,7 @@ public class GeneratorTests
             var t = discontinuity ? 0.2f : Timesteps[i];
             if (discontinuity)
             {
-                g.NotifyDiscontinuity();
+                g.NotifyDiscontinuity(curr.ContentTimeNs);
             }
 
             var slot = rig.Bridge.AcquireSlot();
@@ -108,7 +108,7 @@ public class GeneratorTests
                 source.Wait(lastReader[h]); // the buffer's previous frame is no longer read
                 rig.Kernels.EnqueueTestPattern(source, history[h].AsFrame(), (uint)k);
                 drawn[h].Record(source);
-                return history[h].AsFrame(ready: drawn[h].Signal);
+                return history[h].AsFrame(contentTimeNs: k, ready: drawn[h].Signal);
             }
 
             var frames = new GpuFrame[3];
