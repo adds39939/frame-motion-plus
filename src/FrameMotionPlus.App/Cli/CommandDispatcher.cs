@@ -32,6 +32,8 @@ internal static class CommandDispatcher
             {
                 "simulate" => SimulateCommand.Run(rest, output),
                 "settings" => SettingsCommand.Run(rest, output),
+                "bench" => BenchCommand.Run(rest, output),
+                "pattern" => PatternCommand.Run(rest, output, error),
                 _ => throw new UsageException($"Unknown command '{args[0]}'."),
             };
         }
@@ -60,6 +62,9 @@ internal static class CommandDispatcher
         Usage:
           fmp simulate [options]    Run the real scheduler against a simulated source and display
           fmp settings [options]    Print default settings JSON, or validate a settings file
+          fmp bench jitter [options]
+                                    Measure pacing-thread wake-up jitter on the real clock (design doc Phase 0)
+          fmp pattern [options]     CUDA test pattern through the presentation ring to a window or offscreen (Phase 2)
           fmp --version
           fmp --help
 
@@ -98,7 +103,53 @@ internal static class CommandDispatcher
         settings options:
           --validate <file>         Validate a settings file instead of printing defaults
 
-        Exit codes: 0 success, 1 check or validation failed, 2 usage error, 70 internal error.
+        bench jitter options:
+          --duration-s <s>          Measured time per loop, after the warm-up                 (10)
+          --warmup-s <s>            Excluded from statistics at the start of each loop        (1)
+          --block-s <s>             The full and timer-only loops alternate in blocks this long (5)
+          --rate <hz>               Output slot rate (panel refresh): 120, 240 ...            (120)
+          --source-fps <rate>       Synthetic source frame rate                               (60)
+          --wait <sleep|hybrid>     clock_nanosleep to the deadline, or sleep then spin       (sleep)
+          --spin-us <us>            Spin window before the deadline, with --wait hybrid       (200)
+          --rt                      Ask for SCHED_FIFO (falls back to a nice value; reports what it got)
+          --rt-priority <n>         SCHED_FIFO priority 1-99                                  (10)
+          --nice <n>                Nice value to ask for, or the fallback when --rt is refused (-10)
+          --pin-core <n>            Pin the pacing thread to this CPU
+          --source-core <n>         Pin the source thread to this CPU
+          --timer-slack-ns <ns>     Per-thread timer slack, set explicitly; 50000 is the usual kernel default (1)
+          --d-ms <ms>               Generation time reported for each generated slot          (1.2)
+          --gate-ms <ms>            Exit 1 if p99 wake lateness of the full loop exceeds this (0.5)
+          --max-missed <n>          Exit 1 if the full loop misses more slots than this       (0)
+          --no-baseline             Skip the timer-only loop (no OS-versus-ours attribution)
+          --csv <path>              Write every sample of both loops
+                                    Skipped slots count in the percentiles. Also exits 1 on any GC collection or
+                                    hot-thread allocation in the measured time.
+
+        pattern options:
+          --size <WxH>              Pattern and ring size                                     (2560x1440)
+          --format <8|10>           8-bit RGBA8 (SDR) or 10-bit RGB10A2 (PQ)                  (8)
+          --duration-s <s>          Run length                                                (5)
+          --frames <n>              Run this many refresh slots instead
+          --offscreen               Headless: offscreen target, every frame read back and verified bit-exact
+          --no-verify               With --offscreen: no readback (to measure costs alone)
+          --unpaced                 With --offscreen: no pacing, no wait for a free image; as fast as back-pressure
+                                    allows (a stress test: drops and held-back slots allowed, shown frames verified)
+          --blend                   2x generator in the loop: real frames alternate with BlendGenerator at t = 0.5
+          --validate                Vulkan validation layer with synchronization checks; any message fails the run
+          --window <WxH>            Window size                                               (960x540)
+          --rate <hz>               Refresh rate to pace at (offscreen 120; windowed: the display's)
+          --slots <n>               Presentation ring depth, 4 to 6                           (4)
+          --warmup-frames <n>       Excluded from timing and allocation statistics            (30)
+                                    Exits 1 on any failure, a dropped frame offscreen, a validation message or an
+                                    allocation on the present thread; 69 when no usable GPU, driver or display is found.
+                                    Ctrl+C (SIGINT) or SIGTERM stops the run cleanly with its verdict; a second one
+                                    ends the process at once. With --validate each validation message is also written
+                                    to stderr as it arrives.
+                                    Fault injection, for testing teardown: FMP_PATTERN_FAIL_AT=<slot> in the environment
+                                    makes the loop fail between acquiring that slot's write and signalling it (the run
+                                    then fails with that cause and must still tear down cleanly).
+
+        Exit codes: 0 success, 1 check or validation failed, 2 usage error, 70 internal error; 69 when a GPU or display is required but not there.
 
         """;
 }

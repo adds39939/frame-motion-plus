@@ -7,14 +7,22 @@
     <PublishAot>true</PublishAot>
     <OptimizationPreference>Speed</OptimizationPreference>
     <ServerGarbageCollection>false</ServerGarbageCollection>
+    <!-- Concurrent (background) GC stays on: GcLatencyScope's SustainedLowLatency during playback needs it (design doc).
+         Only the test projects turn it off, for exact per-thread allocation counters. -->
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Vulkan\FrameMotionPlus.Vulkan.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.CudaVulkan\FrameMotionPlus.CudaVulkan.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="FrameMotionPlus.Core.Tests" />
+    <InternalsVisibleTo Include="FrameMotionPlus.Platform.Tests" />
+    <InternalsVisibleTo Include="FrameMotionPlus.Gpu.Tests" />
   </ItemGroup>
 
 </Project>

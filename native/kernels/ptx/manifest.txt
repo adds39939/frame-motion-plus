@@ -1,0 +1,12 @@
+# Written by native/kernels/build.sh. Do not edit; the tests check it against the sources and the PTX.
+toolchain clang 23.1.5
+target sm_75 ptx 7.0
+source fmp_cuda.h 9b9c10dd0db70768cfce00147b07dc97dd395f6dc00ff8a6583bb1407a0e474a
+source blend.cu cf88f42fc7fb8534547577f6adacce081078d7e87d5e4f5bc54c139ebf3d7035
+source convert.cu 78f1bb29f1c3d9a421780b1f13bdde20bd3c41ab3ee52fb179eea2156707b1c2
+source pattern.cu 967579358981745998ef602012560bdb42b317269b25923a4317251a479ecdfd
+source util.cu c327288a32764005f1fd85612ee7147e19d835e3b0b9a7c35de6ac5ee3cc10f7
+ptx blend.ptx 526e141129e52fd8dd71e0713d22cccb68782df7665cc66aad350ea6c6a4d62a
+ptx convert.ptx 9ca0b383c4f75c9608edc2eca3cbad3d0faaeee8aa67dc90f61536ec601c5b56
+ptx pattern.ptx 5aa6bd3a7ce2d7b456ba7a43320ec52a2c903ab23383fea73824964f03907568
+ptx util.ptx 45b0e7dce1b76c289a2de67fb8d61d1aa4eafdb9b353b11b1f39c286dd34cfe6

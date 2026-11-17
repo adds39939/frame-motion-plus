@@ -16,6 +16,11 @@ public interface IFrameGenerator : IDisposable
     /// <summary>
     /// GPU-async: enqueues generation of the frame at <paramref name="t"/> (0 = prev, 1 = curr) into
     /// <paramref name="output"/> and never waits. Signals <paramref name="done"/> when the output is written.
+    /// <para>
+    /// Input dependencies travel with the frames: the generator's GPU work first waits, GPU-side, on
+    /// <paramref name="prev"/>.<see cref="GpuFrame.Ready"/> and <paramref name="curr"/>.<see cref="GpuFrame.Ready"/>
+    /// (content written) and on <paramref name="output"/>.<see cref="GpuFrame.Ready"/> (target released).
+    /// </para>
     /// </summary>
     void Enqueue(in GpuFrame prev, in GpuFrame curr, float t, in GpuFrame output, in GpuSignal done);
 

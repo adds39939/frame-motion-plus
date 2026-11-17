@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>FrameMotionPlus.Vulkan</RootNamespace>
+    <AssemblyName>FrameMotionPlus.Vulkan</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.Vulkan" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+  </ItemGroup>
+
+  <!-- Checked-in SPIR-V (regenerate with native/shaders/build.sh), so a build needs no shader compiler. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\native\shaders\spirv\*.spv" LogicalName="FrameMotionPlus.Vulkan.Shaders.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FrameMotionPlus.Vulkan.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -61,6 +61,11 @@ public sealed class NullPresenter : IPresenter
         return true;
     }
 
+    /// <summary>Nothing to release without a display; only counted.</summary>
+    public void Release(in PresentRequest request) => ReleaseCount++;
+
+    public long ReleaseCount { get; private set; }
+
     public bool TryGetFeedback(out PresentFeedback feedback) => _feedback.TryDequeue(out feedback);
 
     public void Dispose()

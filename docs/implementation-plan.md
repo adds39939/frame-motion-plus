@@ -64,10 +64,13 @@ src/
   FrameMotionPlus.Core/          pure, no OS or GPU calls: the six interfaces, frame/colour types,
                                  scheduler, cadence tracker, SPSC rings, telemetry, settings   (P1)
   FrameMotionPlus.App/           NativeAOT executable `fmp`: CLI, pipeline assembly, threads   (P1)
+  FrameMotionPlus.Platform/      real monotonic clock, precise sleep, real-time thread helpers (P2)
   FrameMotionPlus.Cuda/          CUDA driver-API bindings, wrappers, kernels,
                                  Repeat and Blend generators                                  (P2)
-  FrameMotionPlus.Vulkan/        device selection, CUDA<->Vulkan bridge and presentation ring,
-                                 presenter, SDL3 window, HUD                                  (P2)
+  FrameMotionPlus.Vulkan/        device selection, exportable presentation ring, presenter,
+                                 SDL3 window, HUD; knows nothing about CUDA                   (P2)
+  FrameMotionPlus.CudaVulkan/    the IGpuBridge: imports the Vulkan ring and semaphores
+                                 into CUDA                                                    (P2)
   FrameMotionPlus.Vfx/           NvCVImage / NvVFX bindings, VfgGenerator                     (P3)
   FrameMotionPlus.Sources.File/  FFmpeg demux + NVDEC                                         (P4)
   FrameMotionPlus.Sources.V4l2/  capture card                                                 (P5)
@@ -104,7 +107,10 @@ docs/
 ## Workflow for every phase
 
 1. Implementation by Opus 5.5 sub-agents, working from this plan and the design doc.
-2. Build, tests and the phase's automated gate are run and the output captured.
+2. Build, tests and the phase's automated gate are run and the output captured. Tests are run the way
+   a developer runs them, `dotnet test FrameMotionPlus.slnx` on the whole solution, several times in
+   a row: running each test project alone hid two failures in Phase 2 that only appeared when the
+   hardware suites shared the GPU.
 3. An independent sub-agent reviews the phase's diff with no knowledge of the implementer's reasoning.
 4. Review findings are fixed and re-verified.
 5. Report to Adam: what was built, test and gate results, review findings and their resolution,
@@ -148,9 +154,13 @@ hardware or eyes). A phase report states which manual gates are still outstandin
 - **CUDA:** driver-API bindings and wrappers: context, three streams (copy, compute, high-priority),
   device and pinned host memory, events for timing, module/kernel launch, external memory and external
   semaphore import.
-- **Kernel toolchain:** kernels compiled with clang's NVPTX backend to PTX, embedded as resources,
-  generated PTX checked in so a build needs no GPU toolchain. First kernels: test patterns (SDR and PQ),
-  blend, copy/pack. Fallback if clang PTX proves unworkable: the `cuda` pacman package.
+- **Kernel toolchain:** kernels compiled to PTX, embedded as resources, generated PTX checked in so a
+  build needs no GPU toolchain. The VFX SDK under `lib/` bundles `nvcc` 12.8 and the CUDA headers
+  (`lib/VideoFX/external/cuda/`), which a regeneration script can use on a dev machine; clang's NVPTX
+  backend is the alternative that needs no NVIDIA toolchain. First kernels: test patterns (SDR and
+  PQ), blend, copy/pack.
+- **CUDA context:** the device's primary context, so the cudart-based VFX SDK (Phase 3) and FFmpeg's
+  CUDA hwaccel (Phase 4) share it without extra plumbing.
 - **Vulkan:** physical device matched to the CUDA device by UUID; presentation ring of 4 to 6 exported
   `VkBuffer`s imported into CUDA; two timeline semaphores (CUDA signals written, Vulkan signals released);
   presenter pass (ring slot to image, scale, write swapchain); SDL3 window on Wayland at fixed refresh;
@@ -160,8 +170,12 @@ hardware or eyes). A phase report states which manual gates are still outstandin
   inputs (the source frame's upload/convert and the ring slot being free). Phase 1 left
   `IFrameGenerator.Enqueue` exactly as the design doc has it and did not put a ready-signal on
   `GpuFrame`; if stream ordering alone is not enough, this phase changes Core to carry one.
+- **Platform:** `IClock` on `CLOCK_MONOTONIC`, absolute-deadline sleep (`clock_nanosleep`), dedicated
+  real-time threads with affinity; portable fallbacks so Windows builds.
 - `fmp pattern` (CUDA test pattern through the ring to a window) and `fmp bench jitter`
   (NativeAOT hot-loop jitter on a dedicated thread).
+- **Build order:** Platform, Cuda and Vulkan are independent and built in parallel; CudaVulkan and
+  `fmp pattern` join them afterwards.
 - **Tests (`Gpu`, `Display`):** CUDA memory round trip; kernel load and run; CUDA writes a pattern into
   an exported buffer and Vulkan reads it back bit-exact, both formats; semaphore handshake in both
   directions; validation layer reports nothing.
@@ -182,6 +196,22 @@ checkout); nothing from `lib/` is copied into build output or committed.
 - Answer the design doc's open questions: can `NVVFX_OUTPUT_IMAGE` be rebound per run to a ring slot;
   how long is first load and is the engine cached.
 - PQ RGB10A2 clip through VFG with frame dumps for inspection.
+- **Rules from Phase 2 this phase must respect** (measured on driver 620.70.06; see
+  `docs/benchmarks/phase2-interop.md`):
+  - No context-synchronising call during playback. A CUDA free or external-semaphore destroy waits
+    for all queued work in the context, and while it waits, kernel launches and other enqueues on
+    other threads block. That covers `NvCVImage` deallocation, effect destroy, and the background
+    reload-and-swap: preallocate everything, and swap only at a drained point (stop producing, drain
+    the ring, then free).
+  - **Measure whether `NvVFX_Run` or `NvVFX_Load` synchronises the whole context**, and whether a
+    waiting context-wide synchronise blocks other threads' enqueues the way a free does. If the run
+    call does, the generator cannot share a context with a producer that runs ahead of its presents.
+  - A CUDA stream holds about 1,024 queued operations; past that the enqueue call blocks. Count the
+    operations VFG adds per frame against the bridge's `OperationsPerWrite` budget.
+  - One pipeline per CUDA context; writes into the ring must be signalled in order, so a generator
+    on its own stream must order its `done` signals with the stream that writes real frames.
+  - Use `TryAcquireSlot` and skip a generated frame at the source when the bridge refuses; keep the
+    lead within about N.
 - **Automated gate:** 1440p Medium p99 d under 7 ms; VFG writes into the Vulkan-exported ring and the
   result presents. If 1440p fails, the report recommends 1080p or Low mode and later phases retarget.
 - **Manual gate:** Adam looks at the PQ dumps for highlight, gradient and banding artefacts.
@@ -198,6 +228,41 @@ checkout); nothing from `lib/` is copied into build output or committed.
 - Smooth Motion presenter mode (`NVPRESENT_ENABLE_SMOOTH_MOTION=1` before instance creation), A/B against VFG.
 - Quality harness: 120 fps footage, drop alternate frames, regenerate, score PSNR/SSIM against originals.
 - File audio (audio as master clock) arrives with Phase 8; until then file video is timed from PTS.
+- **Carried over from Phase 2:**
+  - The three CUDA streams (copy, compute, high-priority generator) are created here by the pipeline.
+  - `GpuFrame.Ready` now carries a frame's "safe to use" signal, so `SourceFrame.Ready` and
+    `PresentRequest.Ready` duplicate it; collapse them.
+  - A source must wait on the generator's `done` before overwriting a history buffer.
+  - With more than 8 CUDA streams alive, two can share a hardware queue and serialize
+    (`CUDA_DEVICE_MAX_CONNECTIONS`, default 8). It must be set in the launcher's environment;
+    setting it from inside the process does not reach the driver.
+  - A GPU span timer started on an idle stream includes host enqueue time; start spans behind work.
+  - `cuMemFree` and `cuMemFreeHost` block until **all** queued work in the context has finished (a
+    free took 300 ms behind 300 ms of unrelated work). Never free CUDA buffers or imports on the
+    capture, scheduler or present threads; hand them to a housekeeping thread.
+  - The object behind a `GpuSignal` (CUDA event, imported semaphore) must outlive every frame or
+    request that names it; on reconfigure or source switch, drain before disposing.
+  - FFmpeg's CUDA frame pools and a decoder re-initialisation on a resolution change free CUDA
+    memory; under the "no context-synchronising call during playback" rule they must happen at a
+    drained point too.
+  - `fmp pattern`'s pacing loop (sleep-poll for a free image on the present thread) is demo-only and
+    must not be copied; the pipeline paces from the scheduler and present feedback.
+- **Bridge backlog from the Phase 2 review** (approved with these tracked; fix them when this phase
+  builds pipeline start-up, restart and teardown, since that is what exercises them):
+  1. The import reaper can block freeing one abandoned import behind another abandoned import's
+     stuck writes, holding its lock so a new bridge's constructor waits (seen: 5 s, then a 60 s
+     teardown bound). Needs two abandons plus a failed Vulkan-side release. Do not free an entry
+     while another entry on the same context is not yet done.
+  2. A bridge disposed *after* its presenter, with a write never signalled, parks a drain wait that
+     cannot complete, and later CUDA frees in the context block. In that branch release from CUDA
+     and hand the import to the reaper with no probe.
+  3. Abandoned imports are freed at the reaper's next 5 ms look with no bridge live, not at the
+     moment the last bridge is disposed: an application that restarts its bridge immediately keeps
+     every abandoned import until shutdown. Run a free pass when the live count reaches zero.
+  4. Documented caller errors that stay as they are: a process returning from `Main` without
+     disposing the presenter while a release waits on a never-signalled write hangs in the driver's
+     exit path; N or more consecutive never-signalled writes wedge later bridges on that ring until
+     the presenter is disposed; a second pipeline on the same CUDA context is unsupported.
 - **Automated gate:** 1440p60 file to 120 Hz with zero missed slots over 10 minutes; zero gen0
   collections in that run; quality harness produces scores for each generator.
 - **Manual gate:** Smooth Motion vs VFG A/B looks right.
@@ -210,6 +275,9 @@ checkout); nothing from `lib/` is copied into build output or committed.
   `cudaHostAlloc` with `MMAP` + `cudaHostRegister` fallback; real-time dequeue thread, newest-wins;
   upload and convert (adds YUYV); cadence kernel (max tile difference on a downsampled luma grid) feeding
   the Phase 1 tracker; hold handling; negotiated-format logging and MJPEG refusal.
+- **Carried over from Phase 2:** `cuMemHostAlloc` memory is not page aligned (the driver sub-allocates
+  at 512-byte granularity). V4L2 `USERPTR` buffers must be allocated with
+  `CudaPinnedBuffer.Allocate(..., alignment: Environment.SystemPageSize)`.
 - **Automated gate:** cadence detection correct on synthetic 30-in-60, 40-in-120 and dropped-frame
   sequences run through the real kernel; capture pipeline runs against `vivid` when loaded.
 - **Manual gate:** end-to-end latency measured; 60 to 120 at 1440p within 2 ms of the latency model;
@@ -239,6 +307,28 @@ checkout); nothing from `lib/` is copied into build output or committed.
   at most two swapchain images in flight; multiplier fallback when VFG cannot keep up.
 - **Automated gate:** 30 to 120 and 40 to 120 with output interval standard deviation under 0.5 ms from
   present feedback; 59.94 source on 120 Hz with no periodic judder signature over 10 minutes.
+- **Found in Phase 2 on this machine's Wayland surface:** `VK_EXT_present_timing` is supported for
+  feedback, but its present-at-absolute-time and present-at-relative-time capabilities are both
+  false, so target times cannot be requested there. Plan on feedback plus the fallback path
+  (`present_wait2`/`present_id2`, `FIFO_LATEST_READY`, absolute sleep) for windowed Wayland, and
+  re-check the capability on a direct display (Phase 9) and on newer drivers. The surface offers
+  Mailbox, FIFO_LATEST_READY, FIFO and Immediate.
+- **Also found in Phase 2 on this desktop:**
+  - While another GPU-heavy app is busy (a Steam/Proton game at 160 to 210% CPU, or Discord in a
+    call), KWin skips about one refresh in three for our window even with a present queued: a
+    240 Hz window is shown at about 160 Hz. Idle, cadence is exact. Present feedback distinguishes
+    the two (refreshes skipped with a present queued versus with none). The scheduler must cope
+    with the compositor delivering a fraction of the refresh rate, and the HUD should say so.
+  - The 2-in-flight cap holds only with present feedback (`present_wait2`, or the older
+    `present_wait` with later "shown" reports). With none, 5 presents were queued against 3 images
+    and `PresenterCapabilities.MaxFramesInFlight` reports 0.
+  - Pacing-thread wake-ups: p99 about 20 to 32 µs with no measurable runtime share (a plain C loop
+    behaves the same). Under heavy competing load 1 to 4% of wakes are 1 to 9 ms late, costing a
+    slot each. Real-time scheduling is refused for this user (no rtprio limit); whether it removes
+    those misses is unmeasured. Needs `realtime-privileges` and the `realtime` group.
+  - The NVIDIA driver takes about 1.6 ms in `vkQueueSubmit2` on every 1,024th queue submission when
+    nothing is presented to a swapchain (offscreen); not seen in windowed presentation. Re-measure
+    on a direct display.
 - **Scheduler tuning backlog from the Phase 1 review** (accepted as non-blocking there; resolve against
   real hardware here):
   1. An animated menu (irregular 40 to 95 ms gaps) re-seeds the source interval and raises D to
@@ -267,6 +357,10 @@ checkout); nothing from `lib/` is copied into build output or committed.
 - HDR detection from source metadata with manual override; metadata passthrough; HDR10 swapchain with
   `VK_EXT_hdr_metadata`; HDR to SDR tone mapping; SDR placed in HDR at a set paper white; linear-light
   scaling; both VFG instances loaded for mid-session SDR/HDR switching; HUD brightness in HDR.
+- **Found in Phase 2:** the Wayland surface here offers `A2B10G10R10` with `HDR10_ST2084` natively
+  (also HLG and FP16 linear spaces), so `VK_hdr_layer` is not needed on this driver. The Phase 2
+  presenter passes PQ through to an HDR10 swapchain, scales on PQ code values (not linear light),
+  uses a placeholder for 10-bit on an SDR target and sends no HDR metadata; this phase replaces all four.
 - **Automated gate:** HDR test patterns numerically correct on the offscreen target; no added d versus SDR.
 - **Manual gate:** PS5 HDR game looks right on HDR and SDR displays; SDR/HDR switch recovers in one
   frame with no black flash.

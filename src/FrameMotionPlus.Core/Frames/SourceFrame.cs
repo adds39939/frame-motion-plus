@@ -26,7 +26,10 @@ public readonly record struct SourceFrame
     /// <summary>When the frame became usable on the GPU (after upload and convert are enqueued).</summary>
     public long ArrivalTimeNs { get; init; }
 
-    /// <summary>GPU-side signal for upload/convert completion. Consumers wait on it GPU-side.</summary>
+    /// <summary>
+    /// GPU-side signal for upload/convert completion. Consumers wait on it GPU-side. Sources set the same point as
+    /// <see cref="Frame"/>.<see cref="GpuFrame.Ready"/>, which is what a generator sees.
+    /// </summary>
     public GpuSignal Ready { get; init; }
 
     public SourceFrameMarks Marks { get; init; }

@@ -16,3 +16,4 @@
 *.jpg binary
 *.so  binary
 *.dll binary
+*.spv binary

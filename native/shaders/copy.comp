@@ -1,0 +1,32 @@
+#version 450
+
+// Ring slot (pitch-linear 32-bit pixels) to the staged optimal-tiling image. Words are copied as they are through an
+// R32_UINT view of the image, so the copy is exact for every 32-bit ring format. Runs on the shader cores, which move
+// memory several times faster than vkCmdCopyBufferToImage does here.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer RingSlot
+{
+    uint words[];
+} slot;
+
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D staged;
+
+layout(push_constant) uniform PushConstants
+{
+    uint pitchWords;
+    uint width;
+    uint height;
+} pc;
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height)
+    {
+        return;
+    }
+
+    imageStore(staged, ivec2(p), uvec4(slot.words[p.y * pc.pitchWords + p.x], 0u, 0u, 0u));
+}
