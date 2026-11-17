@@ -186,7 +186,9 @@ public class SpscRingTests
     {
         // Stands in for a ring bug that loses items: the producer stops early. The consumer must give up at its
         // deadline, so the stress test fails instead of hanging CI, and every helper thread must stop.
-        var timeout = TimeSpan.FromMilliseconds(300);
+        // The deadline must leave the producer time to enqueue its 4,000 items first: on a 4-core CI runner sharing
+        // its cores with four other test assemblies, 300 ms was enough for only 3,648 of them.
+        var timeout = TimeSpan.FromSeconds(3);
         var result = TransferWithObserver(new SpscRing<int>(64), count: 10_000, produce: 4_000, timeout);
 
         Assert.False(result.Completed);
