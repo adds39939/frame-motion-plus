@@ -53,6 +53,13 @@ telemetry: 0 missed on DP-3; 4 on HDMI-A-1, in one host stall (a handful is acce
 Results, the compositor's measured behaviour, and what is not done:
 [`docs/benchmarks/phase6-pacing.md`](docs/benchmarks/phase6-pacing.md).
 
+Phase 8, first part (capture-card audio) adds `FrameMotionPlus.Audio`: `fmp capture` now plays the card's sound,
+delayed so it is heard when its picture is seen. The card's PipeWire audio source is captured and played to the default
+sink through a delay line whose total delay (from a sample's capture to the time it is heard, both from PipeWire's
+timestamps) follows the video latency the pipeline measures (a real frame's first pixel less its capture timestamp),
+with drift between the two sample clocks corrected by resampling. libpipewire is bound directly (no C shim). Results,
+the measured latencies and what could not be measured: [`docs/benchmarks/phase8-audio.md`](docs/benchmarks/phase8-audio.md).
+
 ## Layout
 
 ```
@@ -66,6 +73,7 @@ src/FrameMotionPlus.Vfx/          NVIDIA VFX SDK bindings and loading, VfgGenera
 src/FrameMotionPlus.Sources.File/ FFmpeg 9 bindings, NVDEC decode into CUDA, the file IFrameSource and its frame history
 src/FrameMotionPlus.Sources.V4l2/ V4L2 bindings, format negotiation, the capture IFrameSource (pinned buffers, cadence)
 src/FrameMotionPlus.Pipeline/     playback: source → scheduler → generator → ring → presenter on dedicated threads, telemetry
+src/FrameMotionPlus.Audio/        the capture card's sound: libpipewire bindings, the delay line (ring, sinc resampler, controller)
 native/kernels/, native/shaders/  CUDA kernel and shader sources with the generated PTX and SPIR-V checked in
 tests/FrameMotionPlus.Core.Tests/ xUnit v3 tests of the core and the CLI (always run)
 tests/FrameMotionPlus.Platform.Tests/ tests of the platform layer and `fmp bench jitter` (Linux-specific ones skip elsewhere)
@@ -76,6 +84,7 @@ tests/FrameMotionPlus.Vfx.Tests/    SDK loading, VfgGenerator, measured SDK beha
 tests/FrameMotionPlus.Sources.File.Tests/ FFmpeg layouts, the convert kernel, decode against software, `fmp decode` (Media)
 tests/FrameMotionPlus.Pipeline.Tests/ the whole path checked frame by frame offscreen, faults, allocations, windowed runs, `fmp play`
 tests/FrameMotionPlus.Sources.V4l2.Tests/ V4L2 layouts, negotiation, the cadence kernel and tracker, vivid, the card, `fmp capture`
+tests/FrameMotionPlus.Audio.Tests/ the delay line simulated, PipeWire layouts, a loopback through null sinks, the audio options
 ```
 
 Hardware tests carry the category `Gpu` (NVIDIA GPU, CUDA driver, Vulkan with the validation layer),
@@ -84,7 +93,8 @@ shared libraries and the `ffmpeg` CLI, which makes the test clips at test time) 
 that is missing, so hosted CI stays green. The capture tests add `Capture` (the kernel's `vivid` test driver, loaded by
 hand with `sudo modprobe vivid`) and `Elgato` (the Elgato 4K X with a picture on its input). The pipeline tests need all of a GPU, FFmpeg 9 and the `ffmpeg` CLI
 (category `Gpu`), and a display or the SDK for some. Vulkan tests run under the validation layer and
-fail on any message.
+fail on any message. The audio tests' PipeWire loopback (two null sinks it creates and removes) and its layout check
+(the PipeWire development headers and gcc) skip where those are missing.
 
 ## The NVIDIA VFX SDK
 
@@ -287,6 +297,34 @@ mode), and reports Rec. 709 for a PQ signal: `fmp capture` therefore takes a 10-
 default; `--hdr off` for a console in SDR, `--range` and `--matrix` to override the rest. MJPEG is never used. Window
 close, Escape, Ctrl+C and SIGTERM stop it cleanly; the device is released on every way out. Set `$FMP_VFX_SDK` for a
 binary outside the checkout, as for `fmp play`.
+
+### Sound
+
+`fmp capture` plays the card's sound by default: the PipeWire source of the sound card on the capture device's USB
+device (`fmp capture --list` shows which), delayed by the video latency the pipeline measures, so the sound is heard when
+its picture is seen. It goes to **the default output you selected** in the desktop's sound settings, and moves with it when
+you select another; or to `--audio-sink`, any output (the headset too), named by its node name or a part of its name or
+description. It plays only there: if that device goes away the sound is muted (and `fmp` says so) until it is back; it is
+never moved to another device by PipeWire's own fallback, and a link anywhere else is muted and cut. (The desktop's
+per-application "move to" is refused for this stream: change the output with the default device or `--audio-sink`.) The delay follows that measurement
+slowly (a change is resampled away at no more than 2 ms per second, a pitch change of at most 3.5 cents) and the drift
+between the card's and the sink's sample clocks is corrected continuously. At the start it prints the source, the sink
+and the latencies PipeWire reports; at the end, the seconds played, the delay target and what was achieved, the A/V
+offset from the timestamps, the drift correction and any underruns. If the sound cannot start (no PipeWire, no source
+for the device, as with `vivid`), the video runs alone and one line says why.
+
+```sh
+fmp capture --mode 4k30-hdr                          # with sound (auto: when the device has an audio source)
+fmp capture --mode 4k30-hdr --audio off              # picture only
+fmp capture --mode 4k30-hdr --audio-offset-ms 20     # the sound 20 ms later than the measured latency says
+fmp capture --mode 4k30-hdr --audio-sink inzone       # the INZONE headset (a part of its name is enough)
+```
+
+The timestamps cannot see the card's own audio-versus-video delay or the TV's processing, so check by eye and ear
+once: in a game or menu with sharp sounds tied to the picture (a button click and its highlight, a gunshot and its
+muzzle flash), if the sound comes early, raise `--audio-offset-ms`; if late, lower it (it may go negative down to what
+the path allows). If you also hear the console another way (the TV on the card's HDMI out, a headset on the
+controller), that sound is not delayed and leads the picture by the video latency: mute it there.
 
 ## Benchmarking VFG
 

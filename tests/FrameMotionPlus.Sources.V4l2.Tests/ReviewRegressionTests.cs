@@ -93,6 +93,11 @@ public class ReviewRegressionTests
     {
         var path = CaptureHardware.RequireVivid();
         var cuda = CaptureHardware.RequireCuda();
+        if (!FrameMotionPlus.Vfx.VfxSdk.TryLoad(out var noSdk))
+        {
+            Assert.Skip(noSdk ?? "the VFX SDK is not available"); // the run uses VFG, as the Pipeline tests that skip without it
+        }
+
         using var controls = new VividControls(path).Set(VividControls.OsdTextMode, VividControls.OsdNone).Set(VividControls.HorizontalMovement, VividControls.FastRight);
         var fault = FrameMotionPlus.Pipeline.PlaybackFaults.Parse("gpu-busy@300:2.5")!;
         var hooks = new FrameMotionPlus.Pipeline.PlaybackHooks { WrapGenerator = (h, s, k) => fault(h, s, k) };

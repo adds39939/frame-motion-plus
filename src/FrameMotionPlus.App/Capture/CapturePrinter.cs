@@ -1,5 +1,6 @@
 using System.Globalization;
 using FrameMotionPlus.App.Play;
+using FrameMotionPlus.Audio;
 using FrameMotionPlus.Core.Scheduling;
 using FrameMotionPlus.Cuda;
 using FrameMotionPlus.Cuda.Kernels;
@@ -45,6 +46,46 @@ internal static class CapturePrinter
             "" => "none of fmp capture's presets",
             var list => list,
         });
+    }
+
+    /// <summary>The audio source that goes with a capture device (--list).</summary>
+    public static void PrintDeviceAudio(TextWriter o, string device, AudioGraphSnapshot? graph, string? noAudio)
+    {
+        if (graph is null)
+        {
+            o.WriteLine($"  audio       unknown: {noAudio}");
+            return;
+        }
+
+        o.WriteLine(AudioDevices.SourceForVideoDevice(graph, device) is { } source
+            ? $"  audio       {source.Description ?? source.Name} ({source.Name}): fmp capture plays it, delayed to the picture"
+            : "  audio       none (no sound card on the same USB device): fmp capture runs without sound unless --audio-source names one");
+    }
+
+    /// <summary>The sinks the sound can go to (--list).</summary>
+    public static void PrintSinks(TextWriter o, AudioGraphSnapshot? graph, string? noAudio)
+    {
+        if (graph is null)
+        {
+            o.WriteLine($"audio sinks: unknown ({noAudio})");
+            return;
+        }
+
+        o.WriteLine($"audio sinks (PipeWire {graph.LibraryVersion}): the sound goes to your selected default output, or to --audio-sink <name or part of one>, and nowhere else:");
+        foreach (var sink in graph.Sinks)
+        {
+            o.WriteLine($"  {sink.Name}{(sink.IsDefault ? "  [your selected default output]" : "")}" +
+                $"{(sink.Name == graph.DefaultSink && !sink.IsDefault ? "  [WirePlumber's fallback while the selected one is unavailable]" : "")}");
+            if (sink.Description is { } description)
+            {
+                o.WriteLine($"              {description}");
+            }
+        }
+
+        if (graph.Sinks.Count == 0)
+        {
+            o.WriteLine("  none");
+        }
     }
 
     public static void PrintSetup(TextWriter o, CaptureOptions options, PlaybackOptions playback, PlaybackSetup s, string why, CudaContext cuda)

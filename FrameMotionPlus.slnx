@@ -19,6 +19,7 @@
     <Project Path="src/FrameMotionPlus.Sources.File/FrameMotionPlus.Sources.File.csproj" />
     <Project Path="src/FrameMotionPlus.Pipeline/FrameMotionPlus.Pipeline.csproj" />
     <Project Path="src/FrameMotionPlus.Sources.V4l2/FrameMotionPlus.Sources.V4l2.csproj" />
+    <Project Path="src/FrameMotionPlus.Audio/FrameMotionPlus.Audio.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/FrameMotionPlus.Core.Tests/FrameMotionPlus.Core.Tests.csproj" />
@@ -30,5 +31,6 @@
     <Project Path="tests/FrameMotionPlus.Sources.File.Tests/FrameMotionPlus.Sources.File.Tests.csproj" />
     <Project Path="tests/FrameMotionPlus.Pipeline.Tests/FrameMotionPlus.Pipeline.Tests.csproj" />
     <Project Path="tests/FrameMotionPlus.Sources.V4l2.Tests/FrameMotionPlus.Sources.V4l2.Tests.csproj" />
+    <Project Path="tests/FrameMotionPlus.Audio.Tests/FrameMotionPlus.Audio.Tests.csproj" />
   </Folder>
 </Solution>

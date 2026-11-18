@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using FrameMotionPlus.App.Capture;
 using FrameMotionPlus.App.Play;
+using FrameMotionPlus.Audio;
 using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Cuda;
 using FrameMotionPlus.Pipeline;
@@ -14,7 +15,9 @@ namespace FrameMotionPlus.App.Cli;
 /// with a live source. <c>--list</c> shows the devices and what they offer. Prints what it negotiated and resolved at the
 /// start and a summary with capture statistics and a verdict at the end. Exit 0 when the run is clean; 1 on a failure; 2 on
 /// a usage error or a mode the device does not offer; 69 with one line when capture, the device, the GPU or a display is
-/// missing. Ctrl+C, SIGTERM, closing the window or Escape stop it cleanly; the device is released on every way out.
+/// missing. Ctrl+C, SIGTERM, closing the window or Escape stop it cleanly; the device is released on every way out. The
+/// card's sound plays too (<see cref="CaptureAudio"/>), delayed to the picture by the measured video latency; when it
+/// cannot, the video runs alone and one line says why.
 /// </summary>
 internal static class CaptureCommand
 {
@@ -86,6 +89,8 @@ internal static class CaptureCommand
             return PatternCommand.ExitUnavailable;
         }
 
+        // The sound first: its streams come up while the video opens (one line and video only if it cannot start).
+        using var audio = CaptureAudio.Start(options, device, error);
         var playback = new PlaybackOptions
         {
             Path = device,
@@ -118,6 +123,7 @@ internal static class CaptureCommand
             VfxSdkDirectory = options.VfxSdk,
             Settings = settings,
             CsvPath = options.CsvPath,
+            Audio = audio.Delay,
         };
 
         var cuda = CudaContext.RetainPrimary(CudaDriver.GetDevice(0), options.CudaSync);
@@ -155,6 +161,7 @@ internal static class CaptureCommand
                 }
 
                 CapturePrinter.PrintSetup(output, options, playback, setup, why, cuda);
+                audio.PrintSetup(output, options);
                 output.Flush();
                 report = session.Run();
                 if (options.FramesCsvPath is { } path && session.PlaybackSource is CapturePlaybackSource capture)
@@ -165,7 +172,9 @@ internal static class CaptureCommand
             }
 
             Volatile.Write(ref live, null);
-            var verdict = PlayPrinter.PrintSummary(output, gate: false, report);
+            _ = audio.Finish(); // the session stopped it with the picture; released here (bounded)
+            var videoLatency = report.Statistics.RealFrameLatency.Count > 0 ? report.Statistics.RealFrameLatency.Mean : 0;
+            var verdict = PlayPrinter.PrintSummary(output, gate: false, report, (o, warnings) => audio.PrintSummary(o, warnings, videoLatency));
             var exit = verdict ? CommandDispatcher.ExitOk : CommandDispatcher.ExitCheckFailed;
             if (report.GpuAbandoned)
             {
@@ -223,11 +232,20 @@ internal static class CaptureCommand
         }
 
         var fallback = CaptureDevices.Default(devices);
+        AudioGraphSnapshot? graph = null;
+        string? noAudio = null;
+        if (!AudioDevices.TrySnapshot(out graph, out noAudio))
+        {
+            graph = null;
+        }
+
         foreach (var d in devices)
         {
             CapturePrinter.PrintDevice(output, d, d.Info.Path == fallback);
+            CapturePrinter.PrintDeviceAudio(output, d.Info.Path, graph, noAudio);
         }
 
+        CapturePrinter.PrintSinks(output, graph, noAudio);
         return CommandDispatcher.ExitOk;
     }
 }

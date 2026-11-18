@@ -29,6 +29,18 @@ internal sealed record CapturePreset(string Name, int Width, int Height, double 
         ?? throw new UsageException($"Option '--mode' expects one of {string.Join(", ", All.Select(p => p.Name))}, got '{name}'.");
 }
 
+/// <summary>Whether <c>fmp capture</c> plays the card's sound (--audio).</summary>
+internal enum AudioChoice
+{
+    /// <summary>On when the capture device has an audio source (the default); otherwise silently off.</summary>
+    Auto = 0,
+
+    /// <summary>On; if it cannot start, the video runs and the reason is printed (and warned about in the summary).</summary>
+    On = 1,
+
+    Off = 2,
+}
+
 /// <summary>Configuration of <c>fmp capture</c>.</summary>
 internal sealed record CaptureOptions
 {
@@ -92,6 +104,18 @@ internal sealed record CaptureOptions
 
     public CudaSchedulingMode CudaSync { get; init; } = CudaSchedulingMode.BlockingSync;
 
+    /// <summary>--audio: the card's sound, delayed to its picture.</summary>
+    public AudioChoice Audio { get; init; } = AudioChoice.Auto;
+
+    /// <summary>--audio-source: the PipeWire source to play (node name); null: the one on the capture device's USB device.</summary>
+    public string? AudioSource { get; init; }
+
+    /// <summary>--audio-sink: the PipeWire sink to play to (node name); null: the default sink, followed when it changes.</summary>
+    public string? AudioSink { get; init; }
+
+    /// <summary>--audio-offset-ms: added to the measured video latency (positive: the sound later).</summary>
+    public double AudioOffsetMs { get; init; }
+
     public static readonly IReadOnlySet<string> Flags = new HashSet<string>(StringComparer.Ordinal)
     {
         "list", "fullscreen", "windowed", "offscreen", "validate", "no-cadence",
@@ -132,6 +156,32 @@ internal sealed record CaptureOptions
         }
 
         var (windowWidth, windowHeight) = Size(r, "window", 1280, 720, 64, 8192);
+        var audioSource = r.String("audio-source");
+        var audioSink = r.String("audio-sink");
+        var audioOffset = r.Double("audio-offset-ms", 0, -200, 500);
+        var audio = r.String("audio")?.ToLowerInvariant() switch
+        {
+            null => audioSource is not null || audioSink is not null ? AudioChoice.On : AudioChoice.Auto,
+            "auto" => AudioChoice.Auto,
+            "on" => AudioChoice.On,
+            "off" => AudioChoice.Off,
+            var v => throw new UsageException($"Option '--audio' expects on, off or auto, got '{v}'."),
+        };
+        if (audio == AudioChoice.Off && (audioSource is not null || audioSink is not null || r.Has("audio-offset-ms")))
+        {
+            throw new UsageException("'--audio off' takes no '--audio-source', '--audio-sink' or '--audio-offset-ms'.");
+        }
+
+        if (audioSource is not null && (audioSource.Length == 0 || audioSource.Any(char.IsWhiteSpace)))
+        {
+            throw new UsageException($"Option '--audio-source' expects a PipeWire node name (fmp capture --list shows them), got '{audioSource}'.");
+        }
+
+        if (audioSink is not null && string.IsNullOrWhiteSpace(audioSink))
+        {
+            throw new UsageException("Option '--audio-sink' expects a sink's node name or a part of its name or description (fmp capture --list shows them).");
+        }
+
         var o = new CaptureOptions
         {
             Device = device,
@@ -175,6 +225,10 @@ internal sealed record CaptureOptions
             PresentLeadMs = r.Double("present-lead-ms", -1, -1, 100),
             LatchMs = r.Double("latch-ms", 1, 0, 50),
             CudaSync = ParseSync(r.String("cuda-sync")),
+            Audio = audio,
+            AudioSource = audioSource,
+            AudioSink = audioSink,
+            AudioOffsetMs = audioOffset,
         };
         r.EnsureAllConsumed();
         if (o.OutputHz is not null && rest.Any(static a => a.StartsWith("--multiplier", StringComparison.Ordinal)))

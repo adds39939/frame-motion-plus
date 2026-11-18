@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>FrameMotionPlus.Audio.Tests</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The zero-allocation tests read GC.GetAllocatedBytesForCurrentThread(), which a background (concurrent) gen2
+         collection triggered by another thread can move on a thread that allocated nothing; blocking collections leave
+         it exact (as in the other test projects). -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- A LibraryImport stub re-compiled at a higher tier binds again and allocates the library name on the calling
+         thread (the V4L2 tests saw it); the real-time callbacks' allocation counters must stay exact. -->
+    <TieredPGO>false</TieredPGO>
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3.mtp-off" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="RepositoryRoot" Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../'))" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Audio\FrameMotionPlus.Audio.csproj" />
+    <!-- fmp capture's audio options are parsed by the App (in-process, through its option parser). -->
+    <ProjectReference Include="..\..\src\FrameMotionPlus.App\FrameMotionPlus.App.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Pipeline\FrameMotionPlus.Pipeline.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The repository and external-tool helpers (gcc for the layout test). -->
+    <Compile Include="..\FrameMotionPlus.Cuda.Tests\Support\Repo.cs" Link="Support\Repo.cs" />
+  </ItemGroup>
+
+</Project>

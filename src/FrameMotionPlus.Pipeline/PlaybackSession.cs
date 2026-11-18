@@ -521,6 +521,16 @@ public sealed class PlaybackSession : IDisposable
         }
         finally
         {
+            // The sound stops with the picture (Stop fades it out and returns at once; its owner disposes it).
+            try
+            {
+                _o.Audio?.Stop();
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                report.TeardownErrors.Add(e);
+            }
+
             // The desktop back at once, before the joins: with GPU work stuck they take up to the stall timeout, and a
             // fullscreen window would cover the output all that while. Minimised, a window keeps taking presents.
             if (_window is not null && _window.IsFullscreen)
@@ -820,6 +830,7 @@ public sealed class PlaybackSession : IDisposable
         var meter = new ThreadMeter();
         var fullscreenDone = !_o.Fullscreen || _fullscreenDone;
         var measuring = false;
+        var audioVersion = 0L;
         while (true)
         {
             meter.Tick();
@@ -840,6 +851,13 @@ public sealed class PlaybackSession : IDisposable
 
             collector.Drain(_pacing!, _writer!, _presentLoop!);
             DrainCsv(collector, csv, report);
+            if (_o.Audio is { } audio && collector.Latency.Version != audioVersion)
+            {
+                // The sound follows the picture's measured latency (a volatile store on the audio side: no wait, no allocation).
+                audioVersion = collector.Latency.Version;
+                audio.SetTargetDelay(collector.Latency.ValueNs);
+            }
+
             if (!measuring && _pacing!.MeasureFromNs != long.MinValue)
             {
                 // The pacing thread started the window (and the other threads' meters) on its own clock.

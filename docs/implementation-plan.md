@@ -75,10 +75,9 @@ src/
   FrameMotionPlus.Vfx/           NvCVImage / NvVFX bindings, VfgGenerator                     (P3)
   FrameMotionPlus.Sources.File/  FFmpeg demux + NVDEC                                         (P4)
   FrameMotionPlus.Sources.V4l2/  capture card                                                 (P5)
-  FrameMotionPlus.PipeWire/      audio delay line, ScreenCast capture                         (P8)
+  FrameMotionPlus.Audio/         capture-card audio: PipeWire streams and the delay line      (P8)
 native/
   kernels/                       CUDA kernel sources and generated PTX                        (P2)
-  shim/                          small C shim for PipeWire's macro-heavy API                  (P8)
 tests/
   FrameMotionPlus.Core.Tests/    always run
   FrameMotionPlus.Gpu.Tests/     hardware-gated (see Testing)
@@ -520,30 +519,64 @@ step reviewed in one go costs more rounds than several small ones:
   12. Disturbance sweep gaps: it does not assert skipped or late counts, allows 2 misses per event,
       treats "generating" as generated ≥ 0.3 × real, and has no near-1:1 non-integer ratio.
 
-### Phase 7: HDR
+### Phase 7: HDR (pass-through, correct)
 
-*Design doc: milestone 4.*
+*Design doc: milestone 4.* **Scope set by the owner on 2026-11-18:** "We don't need SDR-to-HDR. Just
+display what the PS5 is currently outputting, as long as HDR is correct." So this phase makes the
+pass-through right and builds no conversions between SDR and HDR (those are under "Deferred").
 
-- HDR detection from source metadata with manual override; metadata passthrough; HDR10 swapchain with
-  `VK_EXT_hdr_metadata`; HDR to SDR tone mapping; SDR placed in HDR at a set paper white; linear-light
-  scaling; both VFG instances loaded for mid-session SDR/HDR switching; HUD brightness in HDR.
+- **Show what the console outputs:** an HDR10 signal on an HDR10 swapchain, an SDR signal on an SDR
+  swapchain. No tone mapping, no SDR-in-HDR placement, no expansion.
+- **HDR correct end to end:** PQ code values untouched from capture through VFG to the swapchain;
+  BT.2020 primaries and limited/full range handled as the signal says (this card signals nothing,
+  so the defaults and overrides from Phase 5 stand); `VK_EXT_hdr_metadata` sent, from the source
+  where there is any, otherwise sensible defaults; scaling to the output done in linear light rather
+  than on PQ code values; nothing in the path clips, bands or shifts colour.
+- **Following the console:** the PS5 switches between SDR and HDR (menus, games). This card does not
+  signal the change, so find what can be detected (a format or resolution change, picture
+  statistics) and otherwise provide a manual switch that takes effect without restarting; both VFG
+  instances (RGBA8 and RGB10A2) stay loaded so a switch is quick.
 - **Found in Phase 2:** the Wayland surface here offers `A2B10G10R10` with `HDR10_ST2084` natively
   (also HLG and FP16 linear spaces), so `VK_hdr_layer` is not needed on this driver. The Phase 2
-  presenter passes PQ through to an HDR10 swapchain, scales on PQ code values (not linear light),
-  uses a placeholder for 10-bit on an SDR target and sends no HDR metadata; this phase replaces all four.
-- **Automated gate:** HDR test patterns numerically correct on the offscreen target; no added d versus SDR.
-- **Manual gate:** PS5 HDR game looks right on HDR and SDR displays; SDR/HDR switch recovers in one
-  frame with no black flash.
+  presenter passes PQ through to an HDR10 swapchain, scales on PQ code values (not linear light)
+  and sends no HDR metadata; this phase replaces those. Its placeholder for 10-bit on an SDR target
+  stays a placeholder.
+- **Automated gate:** HDR test patterns numerically correct on the offscreen target (code values
+  preserved; linear-light scaling within tolerance; metadata as intended); no added d versus SDR.
+- **Manual gate:** a PS5 HDR game looks right on the owner's HDR display.
 
-### Phase 8: Audio and Remote Play
+### Phase 8: Audio (capture card)
 
-*Design doc: milestone 5.*
+*Design doc: milestone 5.* **Scope set by the owner on 2026-11-18: the capture card only.** File
+playback audio is left for later and Remote Play is left out entirely (both are under "Deferred").
 
-- PipeWire shim; audio delay line tracking measured video latency; file audio as master clock.
-- chiaki-ng window capture through the ScreenCast portal (SDR).
-- libchiaki + NVDEC for HDR Remote Play. **Linking libchiaki makes the app AGPL: needs Adam's decision
-  before any code is written.**
-- **Gates:** measured A/V offset under 10 ms; Remote Play 1080p60 to 120 works (manual, needs a PS5).
+- Capture-card audio: the card's USB audio source played to the chosen sink through a delay line
+  that tracks the measured video latency, with drift correction between the two clocks and a manual
+  trim (`--audio-offset-ms`). Results in `docs/benchmarks/phase8-audio.md`.
+- **Output device (owner, 2026-11-18):** "It should default to the default audio device I have
+  selected", and be "configurable to any device", the headset included. So: with no option the
+  sound goes to the output selected in the desktop's audio settings and follows it when the owner
+  changes that selection; `--audio-sink` names any other device. The sound never goes to a device
+  the owner did not choose: if the device in force goes away the sound is muted until it returns,
+  not moved to a fallback.
+- **Gate:** measured A/V offset under 10 ms. The app can establish the delay it applies from
+  timestamps; the card's own audio-to-video alignment and the TV's audio processing delay need the
+  owner's ears or instruments.
+- **Outcome (2026-11-18, `docs/benchmarks/phase8-audio.md`):**
+  - `fmp capture` plays the card's sound by default (`--audio on|off|auto`, `--audio-source`,
+    `--audio-sink`, `--audio-offset-ms`; `--list` shows sources and sinks). Project
+    `FrameMotionPlus.Audio`: libpipewire bound directly with `LibraryImport`, no C shim (PipeWire
+    1.6 exports the core and registry functions its headers declare inline); the one format pod is
+    built by hand and checked byte for byte against PipeWire's own C builder.
+  - Against the PC's timestamps the sound is on the picture: offset +0.03 ms (0.2 ms rms) over
+    10 minutes at 1440p and 60 s at 4K, windowed; drift correction -36 ppm against a measured clock
+    difference of -35 ppm; no underruns, overruns or resyncs; the audio callbacks allocate nothing.
+    The path's least delay on the HDMI sink is 26.4 ms, below the lowest video latency (about 32 ms).
+  - **The 10 ms gate is open** until the owner checks by eye and ear and sets the trim: the card's
+    own audio-versus-video alignment and the TV's processing cannot be measured from the PC.
+  - Not done: the items in that document's "Known issues / not done" (no reconnect after a PipeWire
+    restart; fixed 256-frame cycle; the audio thread is not real-time without RTKit; older
+    libpipewire leaves audio off).
 
 ### Phase 9: Latency extras and polish
 
@@ -557,10 +590,8 @@ step reviewed in one go costs more rounds than several small ones:
 
 ### Phase 10: Windows portability
 
-*Design doc: milestone 7.* Cannot be verified on this machine beyond the CI build; needs a Windows box.
-
-- Media Foundation capture, NT-handle CUDA/Vulkan bridge, Windows presenter, VFG on Windows.
-- **Gate:** the Phase 4 file-playback test passes on Windows.
+*Design doc: milestone 7.* **Left for now by the owner on 2026-11-18** (listed under "Deferred"). The
+solution still compiles for Windows in CI; nothing runs there.
 
 ## Deviation from the design doc's ordering
 
@@ -589,4 +620,22 @@ Things the design doc includes that are deliberately not being built yet.
 - **Perfecting frame pacing.** Zero missed slots over 10 minutes on every output and in every mode
   (the design doc's gate as written), and whatever `docs/benchmarks/phase6-pacing.md` lists as not
   done. Accepted for now by the owner at "a handful" per run.
+  - The windowed hardware tests (`WindowedTests` in the Pipeline tests) demand zero missed slots in
+    a 300-slot run and so fail when the desktop disturbs the compositor: on 2026-11-18 three of
+    them failed intermittently with bursts of 3 to 4 late slots about 100 ms apart, on the Phase 6
+    commit as well as on the working tree, with the GPU otherwise idle; they had passed in three
+    whole-solution runs earlier the same day. They should allow for, or skip on, misses the display
+    owns, as `A_short_starting_lead_adapts_and_the_misses_stop` now does.
+- **Audio for file playback** (design doc: audio is the master clock for files, video scheduled
+  against it). Left for later on 2026-11-18: the focus is the capture card.
+- **PS Remote Play, entirely** (design doc: chiaki-ng window capture through the ScreenCast portal
+  for SDR, then libchiaki with NVDEC for HDR). Left out on 2026-11-18 at the owner's instruction, so
+  the libchiaki question (linking it would make the app AGPL) does not arise. The PipeWire window
+  capture source that would also have made the app work on any window goes with it.
+- **Conversions between SDR and HDR** (design doc's source/output matrix): HDR to SDR tone mapping
+  for a non-HDR display, SDR placed inside an HDR output at a set paper white, SDR-to-HDR expansion
+  (TrueHDR). Not needed, 2026-11-18: the app shows what the console outputs.
+- **Windows support** (design doc milestone 7: Media Foundation capture, NT-handle CUDA/Vulkan
+  bridge, Windows presenter, VFG on Windows; gate: file playback passes on Windows). Left for now,
+  2026-11-18. It needs a Windows machine to verify.
 

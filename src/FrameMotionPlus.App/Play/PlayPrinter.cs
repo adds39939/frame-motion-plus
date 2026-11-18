@@ -44,8 +44,11 @@ internal static class PlayPrinter
     /// <summary>Prints the summary; returns the verdict (true: pass).</summary>
     public static bool PrintSummary(TextWriter o, PlayOptions options, PlaybackReport r) => PrintSummary(o, options.Gate, r);
 
-    /// <summary>Prints the summary of a file or capture run (with <paramref name="gate"/>, the Phase 4 gate's verdict too).</summary>
-    public static bool PrintSummary(TextWriter o, bool gate, PlaybackReport r)
+    /// <summary>
+    /// Prints the summary of a file or capture run (with <paramref name="gate"/>, the Phase 4 gate's verdict too);
+    /// <paramref name="more"/> adds lines (the capture's sound) before the warnings, and warnings of its own.
+    /// </summary>
+    public static bool PrintSummary(TextWriter o, bool gate, PlaybackReport r, Action<TextWriter, List<string>>? more = null)
     {
         var s = r.Statistics;
         var d = r.Diagnostics;
@@ -246,6 +249,7 @@ internal static class PlayPrinter
 
         var failures = r.Failures();
         var warnings = new List<string>();
+        more?.Invoke(o, warnings);
         if (r.MeasuredGc.Gen0Collections > 0)
         {
             warnings.Add($"{r.MeasuredGc.Gen0Collections} gen0 collection(s) in the measured window");

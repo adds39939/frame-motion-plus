@@ -151,6 +151,14 @@ public sealed record PlaybackOptions
     /// <summary>Scheduler, display and generator settings (a settings file); null: the defaults.</summary>
     public FmpSettings? Settings { get; init; }
 
+    /// <summary>
+    /// The live source's sound, delayed to its picture (Phase 8): the control thread gives it the measured video latency
+    /// (a real frame's first pixel less its capture timestamp, smoothed: <see cref="LatencyFollower"/>) as it changes, and
+    /// stops it (which returns at once) when playback ends. Its owner starts and disposes it. Nothing on a per-frame path
+    /// touches it, and nothing waits for it.
+    /// </summary>
+    public IAudioDelay? Audio { get; init; }
+
     /// <summary>Write the per-slot timeline (Core's telemetry records) to this CSV file.</summary>
     public string? CsvPath { get; init; }
 

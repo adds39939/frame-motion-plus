@@ -20,6 +20,7 @@
     <ProjectReference Include="..\FrameMotionPlus.Vfx\FrameMotionPlus.Vfx.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.Pipeline\FrameMotionPlus.Pipeline.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Audio\FrameMotionPlus.Audio.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -30,6 +31,7 @@
     <InternalsVisibleTo Include="FrameMotionPlus.Sources.File.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Pipeline.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Sources.V4l2.Tests" />
+    <InternalsVisibleTo Include="FrameMotionPlus.Audio.Tests" />
   </ItemGroup>
 
 </Project>

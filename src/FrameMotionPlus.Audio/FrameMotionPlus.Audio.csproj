@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>FrameMotionPlus.Audio</RootNamespace>
+    <AssemblyName>FrameMotionPlus.Audio</AssemblyName>
+    <!-- LibraryImport stubs, the PipeWire structures and the real-time callbacks work on native memory. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The tests drive the delay line's pure parts, read every interop layout and constant, and build test streams. -->
+    <InternalsVisibleTo Include="FrameMotionPlus.Audio.Tests" />
+  </ItemGroup>
+
+</Project>

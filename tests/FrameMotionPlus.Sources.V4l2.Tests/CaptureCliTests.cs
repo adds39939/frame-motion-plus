@@ -14,6 +14,8 @@ namespace FrameMotionPlus.Sources.V4l2.Tests;
 /// <c>fmp capture</c> end to end: the device list, the missing-hardware exits (69, one line) in and out of process, a mode
 /// the device does not offer (2), real runs through the whole pipeline on vivid and on the card (offscreen and windowed),
 /// a stop by SIGINT, and the device released on every way out, also when teardown abandons GPU work that never finishes.
+/// Every run on a real device passes <c>--audio off</c>: tests play sound only to null sinks they create (the audio
+/// tests), never to the machine's sinks.
 /// </summary>
 [SupportedOSPlatform("linux")]
 public sealed class CaptureCliTests
@@ -62,7 +64,7 @@ public sealed class CaptureCliTests
     {
         var path = CaptureHardware.RequireVivid();
         CaptureHardware.RequireCuda();
-        var (exit, _, err) = Run("capture", path, "--size", "999x999", "--offscreen", "--generator", "blend");
+        var (exit, _, err) = Run("capture", path, "--audio", "off", "--size", "999x999", "--offscreen", "--generator", "blend");
         Assert.Equal(CommandDispatcher.ExitUsage, exit);
         Assert.Contains("does not offer 999x999", err, StringComparison.Ordinal);
         Assert.Single(err.Split('\n', StringSplitOptions.RemoveEmptyEntries));
@@ -84,7 +86,7 @@ public sealed class CaptureCliTests
         var environment = new Dictionary<string, string> { [variable] = value };
         // Windowed and bounded, should the missing piece ever not stop it before a window opens (capture is fullscreen and
         // unlimited by default).
-        var (exit, _, err) = await RunOutOfProcess(environment, null, 120, "capture", path, "--size", "320x180", "--generator", "blend", "--windowed", "--duration-s", "2");
+        var (exit, _, err) = await RunOutOfProcess(environment, null, 120, "capture", path, "--audio", "off", "--size", "320x180", "--generator", "blend", "--windowed", "--duration-s", "2");
         Assert.Equal(PatternCommand.ExitUnavailable, exit);
         Assert.Single(err.Split('\n', StringSplitOptions.RemoveEmptyEntries));
         Assert.StartsWith("fmp: capture", err, StringComparison.Ordinal);
@@ -102,7 +104,7 @@ public sealed class CaptureCliTests
         var path = CaptureHardware.RequireVivid();
         CaptureHardware.RequireCuda();
         using var controls = new VividControls(path).Set(VividControls.HorizontalMovement, VividControls.FastRight);
-        var (exit, output, err) = Run("capture", path, "--size", "320x180", "--fps", "60", "--format", "nv12", "--offscreen", "--duration-s", "3", "--warmup-s", "1",
+        var (exit, output, err) = Run("capture", path, "--audio", "off", "--size", "320x180", "--fps", "60", "--format", "nv12", "--offscreen", "--duration-s", "3", "--warmup-s", "1",
             "--generator", "blend");
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
         Assert.Contains("negotiated  320x180 NV12 @ 60 fps", output, StringComparison.Ordinal);
@@ -126,7 +128,7 @@ public sealed class CaptureCliTests
         CaptureHardware.RequireCuda();
         using var controls = new VividControls(path).Set(VividControls.PercentageDroppedBuffers, 100);
         var watch = Stopwatch.StartNew();
-        var (exit, output, err) = Run("capture", path, "--size", "320x180", "--fps", "60", "--offscreen", "--duration-s", "2", "--generator", "blend");
+        var (exit, output, err) = Run("capture", path, "--audio", "off", "--size", "320x180", "--fps", "60", "--offscreen", "--duration-s", "2", "--generator", "blend");
         Assert.Equal(CommandDispatcher.ExitCheckFailed, exit);
         Assert.Contains("No frames arrived from the source in the run's 2 s", output + err, StringComparison.Ordinal);
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(30), $"took {watch.Elapsed.TotalSeconds:0.0} s");
@@ -145,7 +147,7 @@ public sealed class CaptureCliTests
         }
 
         using var controls = new VividControls(path).Set(VividControls.HorizontalMovement, VividControls.FastRight);
-        var (exit, output, err) = Run("capture", path, "--size", "640x360", "--fps", "30", "--format", "nv12", "--window", "480x270", "--duration-s", "3",
+        var (exit, output, err) = Run("capture", path, "--audio", "off", "--size", "640x360", "--fps", "30", "--format", "nv12", "--window", "480x270", "--duration-s", "3",
             "--warmup-s", "1", "--generator", "blend");
         if (err.Contains("needs a", StringComparison.Ordinal) && exit == PatternCommand.ExitUnavailable)
         {
@@ -180,7 +182,7 @@ public sealed class CaptureCliTests
             Thread.Sleep(2500);
             using var kill = Process.Start("kill", ["-INT", p.Id.ToString(CultureInfo.InvariantCulture)]);
             kill.WaitForExit();
-        }, 60, "capture", path, "--size", "320x180", "--fps", "60", "--offscreen", "--warmup-s", "0.5", "--generator", "blend");
+        }, 60, "capture", path, "--audio", "off", "--size", "320x180", "--fps", "60", "--offscreen", "--warmup-s", "0.5", "--generator", "blend");
         Assert.Contains("stopping on SIGINT", err, StringComparison.Ordinal);
         Assert.Contains("stopped: by the user", output, StringComparison.Ordinal);
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
@@ -259,7 +261,7 @@ public sealed class CaptureCliTests
     {
         var path = CaptureHardware.RequireElgatoSignal();
         CaptureHardware.RequireCuda();
-        var (exit, output, err) = Run("capture", path, "--mode", "4k30-hdr", "--offscreen", "--duration-s", "4", "--warmup-s", "1");
+        var (exit, output, err) = Run("capture", path, "--audio", "off", "--mode", "4k30-hdr", "--offscreen", "--duration-s", "4", "--warmup-s", "1");
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
         Assert.Contains("negotiated  3840x2160 P010 @ 30 fps", output, StringComparison.Ordinal);
         Assert.Contains("frames Rgb10A2 Pq/Bt2020", output, StringComparison.Ordinal);
@@ -278,7 +280,7 @@ public sealed class CaptureCliTests
             Assert.Skip("no Wayland session");
         }
 
-        var (exit, output, err) = Run("capture", path, "--mode", "1440p60-hdr", "--window", "640x360", "--duration-s", "3", "--warmup-s", "1");
+        var (exit, output, err) = Run("capture", path, "--audio", "off", "--mode", "1440p60-hdr", "--window", "640x360", "--duration-s", "3", "--warmup-s", "1");
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
         Assert.Contains("negotiated  2560x1440 P010 @ 60 fps", output, StringComparison.Ordinal);
         Assert.Contains("verdict     PASS", output, StringComparison.Ordinal);

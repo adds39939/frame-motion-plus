@@ -84,7 +84,8 @@ internal static class CommandDispatcher
                                     Capture a capture card (V4L2: a PS5 over HDMI) live with frame generation: captured into
                                     CUDA-pinned buffers, repeats of a picture dropped by the cadence detector, interpolated
                                     (VFG, blend or repeat) and presented, paced by the display-time scheduler (Phase 5)
-          fmp capture --list        The V4L2 capture devices and the formats, sizes and rates each offers
+          fmp capture --list        The V4L2 capture devices and the formats, sizes and rates each offers, the audio source
+                                    that goes with each, and the audio sinks
           fmp verify <file.csv> [--rate <hz>] [--vrr] [--warmup-s <s>] [--slots <a>-<b>]
                                     Recompute a play run's verdict from its telemetry CSV alone (early, late, not shown,
                                     untimed, wrong image, order, refreshes without a present) and compare it with the
@@ -321,12 +322,29 @@ internal static class CommandDispatcher
                                     unlimited by default: until Ctrl+C, closing the window or Escape)
           --offscreen               No window: an offscreen target on the real clock at --display-hz
           --display-hz <hz>         With --offscreen: the refresh rate the target stands for     (120)
+          --audio <on|off|auto>     The card's sound, delayed to its picture by the measured video latency (a real frame's
+                                    first pixel less its capture timestamp, smoothed), through PipeWire. auto: when the
+                                    capture device has an audio source (the sound card on the same USB device; vivid has
+                                    none); on: also says why when it cannot; off. The video always runs     (auto)
+          --audio-source <name>     The PipeWire source to play instead (fmp capture --list shows them; implies on)
+          --audio-sink <name>       Where the sound goes: any sink, by its node name or a part of its name or description
+                                    ("inzone"; several matches are refused and listed). Without it: the default output
+                                    you selected in the desktop's sound settings, followed when you select another.
+                                    Either way it plays only there: muted (and said) while that device is gone, never
+                                    moved to another by PipeWire (a link anywhere else is muted and cut); implies on
+          --audio-offset-ms <n>     Trim on top of the measured latency, -200 to 500 ms: positive plays the sound later,
+                                    for what the timestamps cannot see (the TV's processing, the card itself)     (0)
+                                    Diagnostics: FMP_AUDIO_LOG=<s> prints the delay, its target, the ratio and the learned
+                                    clock drift every s seconds on stderr.
                                     Prints what it negotiated (and what the driver changed), the colour it resolved and
                                     why, the buffer mode, then the play summary plus capture statistics: frames dequeued,
                                     skipped as stale (newest wins), dropped by the driver, unique, repeats dropped, dropped
                                     while the pipeline was behind, the detected game rate, holds, black frames, timestamp
                                     jitter, USB delivery (dequeue − timestamp), capture to available, upload, cadence and
-                                    convert GPU time, and the latency added by generation against the latency model.
+                                    convert GPU time, and the latency added by generation against the latency model;
+                                    with sound, its source, sink and their latencies at the start, and at the end the
+                                    seconds played, the delay target and what was achieved, the A/V offset from the
+                                    timestamps, the drift correction (ppm), underruns, overruns and resyncs.
                                     Exits 1 on a failure (the device unplugged, a format change, a stream error), 2 for a
                                     mode the device does not offer, 69 when capture (Linux), the device, the GPU or a
                                     display is missing. The device is released on every way out.

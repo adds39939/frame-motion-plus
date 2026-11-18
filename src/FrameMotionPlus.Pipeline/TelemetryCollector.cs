@@ -64,6 +64,9 @@ internal sealed class TelemetryCollector
 
     public PlaybackStatistics Statistics { get; } = new();
 
+    /// <summary>The smoothed latency of real frames from their capture timestamp to their first pixel, warm-up included (the sound follows it).</summary>
+    public LatencyFollower Latency { get; } = new();
+
     /// <summary>Completed per-slot timeline records (Core's ring); the session drains it into the CSV.</summary>
     public TelemetryRing Records => _ring;
 
@@ -535,6 +538,11 @@ internal sealed class TelemetryCollector
                     Statistics.AddMiss(refresh - _originNs, p.Miss, 1);
                 }
             }
+            if (d.Kind == SlotKind.Real && p.Outcome == PresentOutcome.Shown && p.ShownNs > 0 && !p.Untimed)
+            {
+                Latency.Add(p.ShownNs - d.ContentTimeNs, p.ShownNs);
+            }
+
             if (measured && d.Kind == SlotKind.Real && p.Outcome == PresentOutcome.Shown && p.ShownNs > 0 && !p.Untimed)
             {
                 Statistics.RealFrameLatency.Add(p.ShownNs - d.ContentTimeNs);
