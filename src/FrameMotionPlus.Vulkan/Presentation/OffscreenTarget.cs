@@ -208,6 +208,24 @@ public sealed unsafe class OffscreenTarget : PresentTarget
 
     internal override PresentOutcome Present(int imageIndex, int frameSlot, ulong presentId) => PresentOutcome.Presented;
 
+    /// <summary>
+    /// Tests: makes the target report first-pixel times through this source (present id → time; 0 while its report has not
+    /// come; negative for a report that came without a time), as a swapchain with present timing does, so the presenter's
+    /// handling of late, missing and time-less reports can be checked offscreen.
+    /// </summary>
+    internal Func<ulong, long>? PresentTimeSource { get; set; }
+
+    internal override bool ReportsPresentTimes => PresentTimeSource is not null;
+
+    internal override bool TryTakePresentTime(ulong presentId, out long timeNs)
+    {
+        var t = PresentTimeSource?.Invoke(presentId) ?? 0;
+        timeNs = Math.Max(0, t);
+        return t != 0;
+    }
+
+    internal override bool HasPresentReport(ulong presentId) => (PresentTimeSource?.Invoke(presentId) ?? 0) != 0;
+
     protected override void Dispose(bool disposing)
     {
         if (_disposed)

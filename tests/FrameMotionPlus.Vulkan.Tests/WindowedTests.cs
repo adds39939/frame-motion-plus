@@ -52,6 +52,82 @@ public class WindowedTests
         Assert.InRange(maxQueued, 1UL, 2UL);
     });
 
+    /// <summary>
+    /// Where the surface reports past presentation timing (VK_EXT_present_timing; this desktop: a present-stage-local
+    /// domain, calibrated to CLOCK_MONOTONIC), feedback carries each present's first-pixel time: on CLOCK_MONOTONIC (after
+    /// its submission, before the feedback was read), increasing, and on the refresh grid (consecutive shows a whole number
+    /// of refresh periods apart, within the display's own jitter). Without the extension it stays 0 and the target says why.
+    /// </summary>
+    [Fact]
+    [Trait(Category.Name, Category.Display)]
+    public void Feedback_carries_first_pixel_times_on_the_refresh_grid() => Windowed(PixelFormat.Rgba8, (ctx, window, target, presenter, producer) =>
+    {
+        Gpu.WriteLine($"present timing: {target.Surface.PresentTimingSupported}, stages {target.Surface.PresentStageQueries}; " +
+                      $"{(target.PresentTimingUnavailableReason ?? $"reporting {target.PresentTimingStage}, offset to CLOCK_MONOTONIC {target.PresentTimingOffsetNs} ns, calibration deviation {target.CalibrationDeviationNs} ns")}");
+        if (!presenter.ReportsPresentTimes)
+        {
+            Assert.NotNull(target.PresentTimingUnavailableReason);
+            Assert.Skip($"no first-pixel times on this surface: {target.PresentTimingUnavailableReason}");
+        }
+
+        Assert.Equal(1_000_000_000, Stopwatch.Frequency); // Linux: Stopwatch is CLOCK_MONOTONIC in ns, the feedback's clock
+        Run(window, presenter, producer, TestPattern.MovingBar, 0.3); // the window on its output, its rate known
+        var submitted = new Dictionary<long, long>();
+        var shown = new List<(long Slot, long Actual, long Read)>();
+        producer.FillAllStaging(TestPattern.MovingBar, 0, frameStep: 1);
+        var start = Stopwatch.GetTimestamp();
+        while (Stopwatch.GetElapsedTime(start).TotalSeconds < 1.0)
+        {
+            window.PumpEvents();
+            while (presenter.TryGetFeedback(out var feedback))
+            {
+                shown.Add((feedback.SlotIndex, feedback.ActualTimeNs, Stopwatch.GetTimestamp()));
+            }
+
+            if (!presenter.IsReadyForPresent())
+            {
+                Thread.Sleep(0);
+                continue;
+            }
+
+            var n = producer.WriteStaged();
+            var now = Stopwatch.GetTimestamp();
+            if (presenter.TryPresent(Request(presenter.Ring!, n)))
+            {
+                submitted[(long)n] = now;
+            }
+        }
+
+        var timed = shown.Where(s => s.Actual > 0 && submitted.ContainsKey(s.Slot)).ToList();
+        Gpu.WriteLine($"{shown.Count} presents reported, {timed.Count} with a first-pixel time; presenter: {presenter.Stats.TimedPresents} timed, " +
+                      $"{presenter.Stats.UntimedPresents} untimed; {target.Calibrations} re-calibration(s), longest {target.MaxCalibrationNs / 1e3:0.0} µs, " +
+                      $"total {target.TotalCalibrationNs / 1e3:0.0} µs");
+        // Every present's report comes (lost ones are the presenter's); the compositor may leave the time out of some (KWin at
+        // 240 Hz does, for runs of every fourth present), which the presenter passes on untimed and counts apart.
+        var stats = presenter.Stats;
+        var lost = stats.UntimedPresents - stats.ReportsWithoutTime;
+        Gpu.WriteLine($"reports without a time (the compositor's): {stats.ReportsWithoutTime}; reports that did not come: {lost}");
+        Assert.True(lost <= (stats.TimedPresents + stats.UntimedPresents) / 20, $"{lost} reports did not come");
+        Assert.True(timed.Count >= shown.Count / 2, $"only {timed.Count} of {shown.Count} reports carried a first-pixel time");
+        var period = presenter.Timing.RefreshRate.PeriodNs;
+        var offGrid = 0;
+        for (var i = 0; i < timed.Count; i++)
+        {
+            var (slot, actual, read) = timed[i];
+            Assert.True(actual > submitted[slot], $"present {slot}: shown {actual} before it was submitted at {submitted[slot]}");
+            Assert.True(actual <= read, $"present {slot}: shown {actual} after its feedback was read at {read}");
+            if (i > 0)
+            {
+                var periods = (actual - timed[i - 1].Actual) / period;
+                Assert.True(periods > 0.5, $"present {slot}: {periods:0.###} periods after the one before");
+                offGrid += Math.Abs(periods - Math.Round(periods)) > 0.25 ? 1 : 0;
+            }
+        }
+
+        Gpu.WriteLine($"{offGrid} of {timed.Count - 1} intervals more than a quarter period off a whole number of periods");
+        Assert.True(offGrid <= timed.Count / 20, $"{offGrid} of {timed.Count - 1} intervals were off the refresh grid");
+    });
+
     [Fact]
     [Trait(Category.Name, Category.Display)]
     public void Ten_bit_ring_gets_an_hdr10_swapchain_when_the_surface_offers_one() => Windowed(PixelFormat.Rgb10A2, (ctx, window, target, presenter, producer) =>
@@ -453,7 +529,6 @@ public class WindowedTests
     {
         SlotIndex = (long)n,
         Frame = ring.ConsumerFrame(n),
-        Ready = ring.WrittenSignal(n),
     };
 
     internal static void Windowed(

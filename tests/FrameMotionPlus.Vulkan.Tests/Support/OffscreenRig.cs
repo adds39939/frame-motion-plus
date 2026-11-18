@@ -79,7 +79,6 @@ public sealed class OffscreenRig : IDisposable
     {
         SlotIndex = _outputSlot++,
         Frame = Ring.ConsumerFrame(write),
-        Ready = Ring.WrittenSignal(write),
         TargetTimeNs = 0,
     };
 

@@ -19,6 +19,7 @@
     <ProjectReference Include="..\FrameMotionPlus.CudaVulkan\FrameMotionPlus.CudaVulkan.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.Vfx\FrameMotionPlus.Vfx.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Pipeline\FrameMotionPlus.Pipeline.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -27,6 +28,7 @@
     <InternalsVisibleTo Include="FrameMotionPlus.Gpu.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Vfx.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Sources.File.Tests" />
+    <InternalsVisibleTo Include="FrameMotionPlus.Pipeline.Tests" />
   </ItemGroup>
 
 </Project>

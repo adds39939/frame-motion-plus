@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Vulkan.Windowing;
@@ -31,6 +33,11 @@ public sealed record SurfaceReport
     public bool PresentAtAbsoluteTimeSupported { get; init; }
 
     public bool PresentAtRelativeTimeSupported { get; init; }
+
+    /// <summary>The present stages whose times the surface can report (VK_EXT_present_timing), as Vulkan flag names.</summary>
+    public string PresentStageQueries { get; init; } = "";
+
+    internal uint PresentStageQueryBits { get; init; }
 
     public uint MinImageCount { get; init; }
 
@@ -88,6 +95,15 @@ public sealed record SwapchainTargetOptions
     /// rebuild idles the presenter's queue instead, which the presenter only does once all of its own work has finished.
     /// </summary>
     public bool UsePresentFences { get; init; } = true;
+
+    /// <summary>
+    /// Ask for the time each present's first pixel went out (VK_EXT_present_timing past presentation timing, on
+    /// <c>CLOCK_MONOTONIC</c>), where the device, surface and driver offer it. The presenter reports it in
+    /// <see cref="Core.Abstractions.PresentFeedback.ActualTimeNs"/>; the completion that present-wait reports is the
+    /// time the driver learnt of it, which on this desktop lands up to a few milliseconds after the refresh and moves
+    /// with the compositor's own scheduling.
+    /// </summary>
+    public bool PresentTiming { get; init; } = true;
 }
 
 /// <summary>
@@ -118,6 +134,26 @@ public sealed unsafe class SwapchainTarget : PresentTarget
 
     // One present fence per presenter frame slot; the presenter has at most two.
     private const int FrameSlots = 2;
+
+    // Past presentation timings read per call, stage times per timing, and reports kept for the presenter.
+    private const int TimingBatch = 16;
+    private const int TimingStages = 4;
+    private const int TimingQueue = 64;
+
+    private readonly bool _timingWanted;
+    private readonly VkPresentStageFlagsEXT _timingStage;
+    private VkPastPresentationTimingEXT* _past;
+    private VkPresentStageTimeEXT* _pastStages;
+    private readonly ulong[] _timedIds = new ulong[TimingQueue];
+    private readonly long[] _timedNs = new long[TimingQueue];
+    private int _timedHead;
+    private int _timedCount;
+    private bool _timingActive;
+    private ulong _timingDomainId;
+    private VkTimeDomainKHR _timingDomain;
+    private long _timingOffsetNs;
+    private long _calibratedAt;
+    private const long CalibrateEverySeconds = 1;
 
     public SwapchainTarget(VulkanDevice device, SdlWindow window, SwapchainTargetOptions? options = null)
         : base(device)
@@ -171,6 +207,19 @@ public sealed unsafe class SwapchainTarget : PresentTarget
             _ids = _feedback != PresentFeedbackMode.None ? _feedback
                 : wait2 ? PresentFeedbackMode.PresentWait2 : wait1 ? PresentFeedbackMode.PresentWait : PresentFeedbackMode.None;
             _maintenance1 = caps.SwapchainMaintenance1 && options.UsePresentFences;
+
+            // First-pixel times on CLOCK_MONOTONIC need present ids (present_id2) and a surface that reports a pixel stage.
+            var stages = (VkPresentStageFlagsEXT)Surface.PresentStageQueryBits;
+            _timingStage = (stages & VkPresentStageFlagsEXT.ImageFirstPixelOut) != 0 ? VkPresentStageFlagsEXT.ImageFirstPixelOut
+                : (stages & VkPresentStageFlagsEXT.ImageFirstPixelVisible) != 0 ? VkPresentStageFlagsEXT.ImageFirstPixelVisible
+                : VkPresentStageFlagsEXT.None;
+            _timingWanted = options.PresentTiming && caps.PresentTiming && Surface.PresentTimingSupported
+                && _ids == PresentFeedbackMode.PresentWait2 && _timingStage != VkPresentStageFlagsEXT.None;
+            if (_timingWanted)
+            {
+                _past = (VkPastPresentationTimingEXT*)NativeMemory.AllocZeroed((nuint)(TimingBatch * sizeof(VkPastPresentationTimingEXT)));
+                _pastStages = (VkPresentStageTimeEXT*)NativeMemory.AllocZeroed((nuint)(TimingBatch * TimingStages * sizeof(VkPresentStageTimeEXT)));
+            }
             if (_maintenance1)
             {
                 for (var i = 0; i < FrameSlots; i++)
@@ -190,6 +239,15 @@ public sealed unsafe class SwapchainTarget : PresentTarget
     }
 
     public SurfaceReport Surface { get; } = new();
+
+    /// <summary>
+    /// Why first-pixel times are not reported, or null when they are (VK_EXT_present_timing on <c>CLOCK_MONOTONIC</c> for
+    /// the current swapchain).
+    /// </summary>
+    public string? PresentTimingUnavailableReason { get; private set; }
+
+    /// <summary>The present stage whose time is reported (first pixel out, else first pixel visible).</summary>
+    public string PresentTimingStage => _timingStage.ToString();
 
     public override FrameRate RefreshRate => _window.RefreshRate;
 
@@ -226,6 +284,8 @@ public sealed unsafe class SwapchainTarget : PresentTarget
     private int WantedHeight => _window.IsMinimized ? 0 : _window.PixelHeight;
 
     internal override bool SupportsPresentWait => _feedback != PresentFeedbackMode.None;
+
+    internal override bool ReportsPresentTimes => _timingActive;
 
     internal override bool CanCapQueuedPresents => _feedback != PresentFeedbackMode.None;
 
@@ -369,6 +429,10 @@ public sealed unsafe class SwapchainTarget : PresentTarget
         var flags = _ids == PresentFeedbackMode.PresentWait2
             ? VkSwapchainCreateFlagsKHR.PresentId2 | VkSwapchainCreateFlagsKHR.PresentWait2
             : VkSwapchainCreateFlagsKHR.None;
+        if (_timingWanted)
+        {
+            flags |= VkSwapchainCreateFlagsKHR.PresentTimingEXT;
+        }
         var info = new VkSwapchainCreateInfoKHR
         {
             flags = flags,
@@ -420,6 +484,284 @@ public sealed unsafe class SwapchainTarget : PresentTarget
         Width = (int)w;
         Height = (int)h;
         Version++;
+        SetUpPresentTiming(swapchain);
+    }
+
+    /// <summary>
+    /// Past presentation timings for a new swapchain: a queue for the reports and the <c>CLOCK_MONOTONIC</c> time domain.
+    /// Anything missing turns them off for this swapchain (feedback falls back to present-wait's completion alone).
+    /// </summary>
+    private void SetUpPresentTiming(VkSwapchainKHR swapchain)
+    {
+        _timingActive = false;
+        _timedCount = 0;
+        _timedHead = 0;
+        if (!_timingWanted)
+        {
+            PresentTimingUnavailableReason = PresentTimingUnavailableReason ?? "VK_EXT_present_timing is not offered for this device and surface (or not asked for)";
+            return;
+        }
+
+        var api = Device.Api;
+        var result = api.vkSetSwapchainPresentTimingQueueSizeEXT(swapchain, TimingQueue);
+        if (result != VkResult.Success)
+        {
+            PresentTimingUnavailableReason = $"vkSetSwapchainPresentTimingQueueSizeEXT: {result}";
+            return;
+        }
+
+        var props = new VkSwapchainTimeDomainPropertiesEXT();
+        ulong counter;
+        result = api.vkGetSwapchainTimeDomainPropertiesEXT(swapchain, &props, &counter);
+        if (result is not (VkResult.Success or VkResult.Incomplete) || props.timeDomainCount == 0)
+        {
+            PresentTimingUnavailableReason = $"vkGetSwapchainTimeDomainPropertiesEXT: {result}, {props.timeDomainCount} time domains";
+            return;
+        }
+
+        var count = Math.Min(props.timeDomainCount, 16u);
+        var domains = stackalloc VkTimeDomainKHR[(int)count];
+        var ids = stackalloc ulong[(int)count];
+        props.timeDomainCount = count;
+        props.pTimeDomains = domains;
+        props.pTimeDomainIds = ids;
+        result = api.vkGetSwapchainTimeDomainPropertiesEXT(swapchain, &props, &counter);
+        if (result is not (VkResult.Success or VkResult.Incomplete))
+        {
+            PresentTimingUnavailableReason = $"vkGetSwapchainTimeDomainPropertiesEXT: {result}";
+            return;
+        }
+
+        for (var i = 0; i < props.timeDomainCount; i++)
+        {
+            if (domains[i] == VkTimeDomainKHR.ClockMonotonic)
+            {
+                _timingDomain = domains[i];
+                _timingDomainId = ids[i];
+                _timingOffsetNs = 0;
+                _timingActive = true;
+                PresentTimingUnavailableReason = null;
+                return;
+            }
+        }
+
+        // A domain of the swapchain's own (this driver on Wayland offers only the present stage's): put its times on
+        // CLOCK_MONOTONIC through calibrated timestamps, taken now and again every second.
+        for (var i = 0; i < props.timeDomainCount; i++)
+        {
+            if (domains[i] is VkTimeDomainKHR.PresentStageLocalEXT or VkTimeDomainKHR.SwapchainLocalEXT && Device.Capabilities.CalibratedTimestamps)
+            {
+                _timingDomain = domains[i];
+                _timingDomainId = ids[i];
+                if (Calibrate(swapchain, out var why))
+                {
+                    _timingActive = true;
+                    PresentTimingUnavailableReason = null;
+                    return;
+                }
+
+                PresentTimingUnavailableReason = $"present timing's {domains[i]} domain could not be calibrated to CLOCK_MONOTONIC: {why}";
+                return;
+            }
+        }
+
+        var offered = new StringBuilder();
+        for (var i = 0; i < props.timeDomainCount; i++)
+        {
+            offered.Append(offered.Length > 0 ? ", " : "").Append(domains[i].ToString()).Append(" #").Append(ids[i]);
+        }
+
+        PresentTimingUnavailableReason = $"the swapchain offers no CLOCK_MONOTONIC time domain for present timing (offered: {offered})";
+    }
+
+    /// <summary>The offset from the swapchain's time domain to CLOCK_MONOTONIC (both read at once by the driver).</summary>
+    private bool Calibrate(VkSwapchainKHR swapchain, out string? why)
+    {
+        why = null;
+        if (_timingDomain == VkTimeDomainKHR.ClockMonotonic)
+        {
+            return true;
+        }
+
+        var swapchainInfo = new VkSwapchainCalibratedTimestampInfoEXT { swapchain = swapchain, presentStage = _timingStage, timeDomainId = _timingDomainId };
+        var infos = stackalloc VkCalibratedTimestampInfoKHR[2];
+        infos[0] = new VkCalibratedTimestampInfoKHR { pNext = &swapchainInfo, timeDomain = _timingDomain };
+        infos[1] = new VkCalibratedTimestampInfoKHR { timeDomain = VkTimeDomainKHR.ClockMonotonic };
+        var stamps = stackalloc ulong[2];
+        ulong deviation;
+        // The device enabled the KHR or the EXT extension: same signature.
+        var api = Device.Api;
+        var result = api.vkGetCalibratedTimestampsKHR_ptr.Value != null
+            ? api.vkGetCalibratedTimestampsKHR(2, infos, stamps, &deviation)
+            : api.vkGetCalibratedTimestampsEXT(2, infos, stamps, &deviation);
+        if (result != VkResult.Success)
+        {
+            why = $"vkGetCalibratedTimestampsKHR: {result}";
+            return false;
+        }
+
+        // Present-timing values are nanoseconds in every domain.
+        _timingOffsetNs = (long)stamps[1] - (long)stamps[0];
+        _calibratedAt = Stopwatch.GetTimestamp();
+        CalibrationDeviationNs = (long)deviation;
+        return true;
+    }
+
+    /// <summary>The swapchain time domain's offset to CLOCK_MONOTONIC last calibrated, ns (0 when it is CLOCK_MONOTONIC).</summary>
+    public long PresentTimingOffsetNs => _timingOffsetNs;
+
+    /// <summary>The driver's bound on the last calibration's error, ns.</summary>
+    public long CalibrationDeviationNs { get; private set; }
+
+    /// <summary>Re-calibrations during playback (one a second, on the present thread) and how long they took, ns.</summary>
+    public long Calibrations { get; private set; }
+
+    /// <summary>Complete reports that came without the first-pixel time (the compositor left it out), since creation.</summary>
+    public long ReportsWithoutTime { get; private set; }
+
+    public long MaxCalibrationNs { get; private set; }
+
+    public long TotalCalibrationNs { get; private set; }
+
+    internal override bool TryTakePresentTime(ulong presentId, out long timeNs)
+    {
+        timeNs = 0;
+        if (!_timingActive || _swapchain.IsNull)
+        {
+            return false;
+        }
+
+        if (_timingDomain != VkTimeDomainKHR.ClockMonotonic && Stopwatch.GetTimestamp() - _calibratedAt > Stopwatch.Frequency * CalibrateEverySeconds)
+        {
+            var t0 = Stopwatch.GetTimestamp();
+            _ = Calibrate(_swapchain, out _);
+            var ns = (Stopwatch.GetTimestamp() - t0) * 1_000_000_000 / Stopwatch.Frequency;
+            Calibrations++;
+            MaxCalibrationNs = Math.Max(MaxCalibrationNs, ns);
+            TotalCalibrationNs += ns;
+        }
+
+        // Look in what was read before, then ask the driver for what has come in since.
+        if (TakeQueued(presentId, out timeNs))
+        {
+            return true;
+        }
+
+        ReadPastTimings();
+        return TakeQueued(presentId, out timeNs);
+    }
+
+    internal override bool HasPresentReport(ulong presentId)
+    {
+        if (!_timingActive || _swapchain.IsNull)
+        {
+            return false;
+        }
+
+        if (!Queued(presentId))
+        {
+            ReadPastTimings();
+        }
+
+        return Queued(presentId);
+    }
+
+    private bool Queued(ulong presentId)
+    {
+        for (var k = 0; k < _timedCount; k++)
+        {
+            if (_timedIds[(_timedHead + k) % TimingQueue] == presentId)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TakeQueued(ulong presentId, out long timeNs)
+    {
+        while (_timedCount > 0)
+        {
+            var id = _timedIds[_timedHead];
+            if (id > presentId)
+            {
+                break;
+            }
+
+            var ns = _timedNs[_timedHead];
+            _timedHead = (_timedHead + 1) % TimingQueue;
+            _timedCount--;
+            if (id == presentId)
+            {
+                timeNs = ns;
+                return true;
+            }
+        }
+
+        timeNs = 0;
+        return false;
+    }
+
+    /// <summary>Moves the driver's completed reports (in present order) into the local queue. Allocation-free.</summary>
+    private void ReadPastTimings()
+    {
+        for (var round = 0; round < 4; round++)
+        {
+            for (var i = 0; i < TimingBatch; i++)
+            {
+                _past[i] = new VkPastPresentationTimingEXT
+                {
+                    presentStageCount = TimingStages,
+                    pPresentStages = _pastStages + (i * TimingStages),
+                };
+            }
+
+            var info = new VkPastPresentationTimingInfoEXT { swapchain = _swapchain };
+            var props = new VkPastPresentationTimingPropertiesEXT { presentationTimingCount = TimingBatch, pPresentationTimings = _past };
+            var result = Device.Api.vkGetPastPresentationTimingEXT(&info, &props);
+            if (result is not (VkResult.Success or VkResult.Incomplete))
+            {
+                return;
+            }
+
+            for (var i = 0; i < props.presentationTimingCount; i++)
+            {
+                ref var timing = ref _past[i];
+                if (timing.reportComplete == VkBool32.False)
+                {
+                    continue;
+                }
+
+                // A complete report without the stage's time (KWin at 240 Hz leaves it out for some presents, in runs of every
+                // fourth) is queued with 0: the present's report has come, and no time will.
+                var ns = 0L;
+                for (var s = 0; s < timing.presentStageCount && s < TimingStages; s++)
+                {
+                    if (timing.pPresentStages[s].stage == _timingStage && timing.pPresentStages[s].time != 0)
+                    {
+                        ns = (long)timing.pPresentStages[s].time + _timingOffsetNs;
+                        break;
+                    }
+                }
+
+                ReportsWithoutTime += ns == 0 ? 1 : 0;
+                if (_timedCount == TimingQueue)
+                {
+                    _timedHead = (_timedHead + 1) % TimingQueue;
+                    _timedCount--;
+                }
+
+                _timedIds[(_timedHead + _timedCount) % TimingQueue] = timing.presentId;
+                _timedNs[(_timedHead + _timedCount) % TimingQueue] = ns;
+                _timedCount++;
+            }
+
+            if (result != VkResult.Incomplete)
+            {
+                return;
+            }
+        }
     }
 
     internal override AcquireOutcome TryAcquire(ulong frame, int frameSlot, VkSemaphore acquireSemaphore, out int imageIndex)
@@ -509,6 +851,15 @@ public sealed unsafe class SwapchainTarget : PresentTarget
         {
             fenceInfo.pNext = chain;
             chain = &fenceInfo;
+        }
+
+        // Feedback only (this surface cannot be asked for a present time): report when the first pixel went out.
+        var timingInfo = new VkPresentTimingInfoEXT { timeDomainId = _timingDomainId, presentStageQueries = _timingStage };
+        var timings = new VkPresentTimingsInfoEXT { swapchainCount = 1, pTimingInfos = &timingInfo };
+        if (_timingActive)
+        {
+            timings.pNext = chain;
+            chain = &timings;
         }
 
         var info = new VkPresentInfoKHR
@@ -630,6 +981,12 @@ public sealed unsafe class SwapchainTarget : PresentTarget
             SdlWindow.DestroySurface(_instance, _surface.Handle);
             _surface = default;
         }
+
+        NativeMemory.Free(_past);
+        _past = null;
+        NativeMemory.Free(_pastStages);
+        _pastStages = null;
+        _timingActive = false;
     }
 
     private static VkCompositeAlphaFlagsKHR FirstBit(VkCompositeAlphaFlagsKHR flags) =>
@@ -705,6 +1062,7 @@ public sealed unsafe class SwapchainTarget : PresentTarget
         }
 
         bool id2 = false, wait2 = false, timing = false, absolute = false, relative = false;
+        var stages = VkPresentStageFlagsEXT.None;
         if (_instance.HasExtension("VK_KHR_get_surface_capabilities2"))
         {
             var caps = Device.Capabilities;
@@ -739,6 +1097,7 @@ public sealed unsafe class SwapchainTarget : PresentTarget
             timing = caps.PresentTiming && timingCaps.presentTimingSupported;
             absolute = caps.PresentTiming && timingCaps.presentAtAbsoluteTimeSupported;
             relative = caps.PresentTiming && timingCaps.presentAtRelativeTimeSupported;
+            stages = caps.PresentTiming ? timingCaps.presentStageQueries : VkPresentStageFlagsEXT.None;
         }
 
         var basic = SurfaceCapabilities();
@@ -752,6 +1111,8 @@ public sealed unsafe class SwapchainTarget : PresentTarget
             PresentTimingSupported = timing,
             PresentAtAbsoluteTimeSupported = absolute,
             PresentAtRelativeTimeSupported = relative,
+            PresentStageQueries = stages.ToString(),
+            PresentStageQueryBits = (uint)stages,
             MinImageCount = basic.minImageCount,
             MaxImageCount = basic.maxImageCount,
         };

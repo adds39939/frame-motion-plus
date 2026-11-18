@@ -561,7 +561,7 @@ internal sealed class DecodeRun
             var h = _info.Height;
             var cw = (w + 1) / 2;
             var ch = (h + 1) / 2;
-            _download.Wait(frame.Ready);
+            _download.Wait(frame.Frame.Ready);
             _download.Copy2DAsync(_lumaStaging.Address, (long)w * _bps, planes.Luma, planes.LumaPitch, (long)w * _bps, h);
             _download.Copy2DAsync(_chromaStaging.Address, (long)cw * 2 * _bps, planes.Chroma, planes.ChromaPitch, (long)cw * 2 * _bps, ch);
             _download.CopyToHost<byte>(_lumaStaging.Address, _luma);

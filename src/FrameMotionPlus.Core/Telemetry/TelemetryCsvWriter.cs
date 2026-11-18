@@ -12,7 +12,7 @@ public sealed class TelemetryCsvWriter : IDisposable
     public const string Header =
         "slot,kind,reason,frame_a,frame_b,timestep,target_display_ns,actual_display_ns,ideal_content_ns,content_ns," +
         "pipeline_delay_ns,multiplier,capture_ns,dequeue_ns,upload_done_ns,convert_done_ns,arrival_ns,decision_ns," +
-        "generation_start_ns,generation_end_ns,present_submit_ns,missed";
+        "generation_start_ns,generation_end_ns,present_submit_ns,missed,unjudged";
 
     private const int MaxRecordBytes = 512;
 
@@ -72,6 +72,8 @@ public sealed class TelemetryCsvWriter : IDisposable
         Long(span, ref pos, r.GenerationEndNs);
         Long(span, ref pos, r.PresentSubmitNs);
         span[pos++] = r.Missed ? (byte)'1' : (byte)'0';
+        span[pos++] = (byte)',';
+        span[pos++] = r.Unjudged ? (byte)'1' : (byte)'0';
         span[pos++] = (byte)'\n';
         _used += pos;
         RecordsWritten++;

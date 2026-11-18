@@ -19,6 +19,7 @@ internal static unsafe partial class SdlNative
     public const ulong WindowMinimized = 0x0000000000000040;
     public const ulong WindowHidden = 0x0000000000000008;
     public const ulong WindowOccluded = 0x0000000000000004;
+    public const ulong WindowFullscreen = 0x0000000000000001;
 
     public const uint EventQuit = 0x100;
     public const uint EventWindowShown = 0x202;
@@ -78,6 +79,10 @@ internal static unsafe partial class SdlNative
     [LibraryImport(Library, EntryPoint = "SDL_SetWindowSize")]
     [return: MarshalAs(UnmanagedType.U1)]
     public static partial bool SetWindowSize(nint window, int width, int height);
+
+    [LibraryImport(Library, EntryPoint = "SDL_SetWindowFullscreen")]
+    [return: MarshalAs(UnmanagedType.U1)]
+    public static partial bool SetWindowFullscreen(nint window, [MarshalAs(UnmanagedType.U1)] bool fullscreen);
 
     [LibraryImport(Library, EntryPoint = "SDL_MinimizeWindow")]
     [return: MarshalAs(UnmanagedType.U1)]

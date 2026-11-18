@@ -40,7 +40,7 @@ public class TelemetryTests
         {
             writer.WriteHeader();
             writer.Write(Sample(7));
-            writer.Write(Sample(8));
+            writer.Write(Sample(8) with { Missed = false, Unjudged = true });
             Assert.Equal(2, writer.RecordsWritten);
         }
 
@@ -57,7 +57,13 @@ public class TelemetryTests
         Assert.Equal("-1", field["pipeline_delay_ns"]);
         Assert.Equal("1000000007", field["target_display_ns"]);
         Assert.Equal("1", field["missed"]);
+        Assert.Equal("0", field["unjudged"]);
         Assert.Equal(0.25, double.Parse(field["timestep"], CultureInfo.InvariantCulture));
+
+        // The live verdict "unjudged" (a present without a first-pixel time nothing can place), for fmp verify.
+        var second = lines[2].Split(',');
+        Assert.Equal("0", second[Array.IndexOf(header, "missed")]);
+        Assert.Equal("1", second[Array.IndexOf(header, "unjudged")]);
     }
 
     /// <summary>The kind and reason columns of one CSV row written for <paramref name="record"/>.</summary>

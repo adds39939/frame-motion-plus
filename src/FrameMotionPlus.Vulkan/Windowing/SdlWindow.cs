@@ -208,6 +208,23 @@ public sealed unsafe class SdlWindow : IDisposable
         UpdatePixelSize();
     }
 
+    /// <summary>
+    /// Borderless fullscreen on the display the window is on now (SDL's fullscreen-desktop mode: no mode change), or
+    /// back to a window. Call it once the window has shown a frame, so it is on an output; a new window is on none and
+    /// SDL would pick the primary display. Waits briefly for the compositor to apply it. Window thread.
+    /// </summary>
+    public bool SetFullscreen(bool fullscreen)
+    {
+        ObjectDisposedException.ThrowIf(_window == 0, this);
+        var ok = SdlNative.SetWindowFullscreen(_window, fullscreen);
+        SdlNative.SyncWindow(_window);
+        UpdatePixelSize();
+        return ok;
+    }
+
+    /// <summary>Whether the window is fullscreen now (SDL's window flags).</summary>
+    public bool IsFullscreen => _window != 0 && (SdlNative.GetWindowFlags(_window) & SdlNative.WindowFullscreen) != 0;
+
     public void Minimize()
     {
         ObjectDisposedException.ThrowIf(_window == 0, this);

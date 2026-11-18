@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>FrameMotionPlus.Pipeline.Tests</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The zero-allocation tests read GC.GetAllocatedBytesForCurrentThread(), which a background (concurrent) gen2
+         collection triggered by another thread can move by a few KB on a thread that allocated nothing. Blocking
+         collections leave it exact (GcConfigurationTests guards this, as in the other hardware test projects). -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- Dynamic PGO off in this test host, as in the other hardware test projects: re-compiling a LibraryImport stub at
+         a higher tier binds the P/Invoke again, and binding allocates the library name on the calling thread, which
+         would land in a zero-allocation window by chance. The NativeAOT binary has no tiers. -->
+    <TieredPGO>false</TieredPGO>
+    <!-- Tiered compilation off in this test host: about 2.5 s into a run, tier-up's call-counting completion suspends the
+         runtime for 8 to 9 ms (measured: a present-thread turn of 8.5 ms at 2.47 s in every windowed run, gone with
+         DOTNET_TieredCompilation=0), which a 240 Hz output's present lead (6.25 ms) cannot cover: the windowed runs missed
+         slots there. The NativeAOT binary has no tiers. -->
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3.mtp-off" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Vulkan\FrameMotionPlus.Vulkan.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.CudaVulkan\FrameMotionPlus.CudaVulkan.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Vfx\FrameMotionPlus.Vfx.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Pipeline\FrameMotionPlus.Pipeline.csproj" />
+    <!-- fmp play is tested in-process through the dispatcher, and out of process for the missing-hardware paths. -->
+    <ProjectReference Include="..\..\src\FrameMotionPlus.App\FrameMotionPlus.App.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- One GPU hardware test assembly at a time on a machine: see the remarks in the file. -->
+    <Compile Include="..\Shared\GpuMachineLock.cs" Link="Support\GpuMachineLock.cs" />
+    <Compile Include="..\Shared\ChildProcess.cs" Link="Support\ChildProcess.cs" />
+    <!-- The external-tool helpers (Tools.Which, Tools.Run). -->
+    <Compile Include="..\FrameMotionPlus.Cuda.Tests\Support\Repo.cs" Link="Support\Repo.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Excerpts of recorded telemetry (the verifier's fixtures): the columns it reads, around the events it must flag. -->
+    <None Include="Fixtures\*.csv" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

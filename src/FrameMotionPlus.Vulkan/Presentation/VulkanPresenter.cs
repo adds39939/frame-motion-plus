@@ -78,6 +78,19 @@ public readonly record struct PresenterStats
 
     public long FeedbackOverflows { get; init; }
 
+    /// <summary>Completed presents whose first-pixel time the target reported (VK_EXT_present_timing).</summary>
+    public long TimedPresents { get; init; }
+
+    /// <summary>
+    /// Completed presents reported without a first-pixel time although the target reports them: their report came without
+    /// one (<see cref="ReportsWithoutTime"/>), or did not come (the next present's came first, or the
+    /// <see cref="VulkanPresenter.TimingHoldNs"/> after completion ran out).
+    /// </summary>
+    public long UntimedPresents { get; init; }
+
+    /// <summary>Of <see cref="UntimedPresents"/>: those whose report came, without the time (the compositor left it out).</summary>
+    public long ReportsWithoutTime { get; init; }
+
     /// <summary>GPU time of the last measured ring-to-staged copy, ns (0 when not measured).</summary>
     public long LastCopyGpuNs { get; init; }
 
@@ -93,8 +106,8 @@ public readonly record struct PresenterStats
 /// waits for the GPU; neither does a target rebuild after a resize, which is deferred until in-flight frames finish.
 /// <para>
 /// The presenter creates and owns the ring (in <see cref="Configure"/>; see <see cref="Ring"/>). Present requests name
-/// a write by its <em>written</em> value: <c>Frame = ring.ConsumerFrame(n)</c>, <c>Ready = ring.WrittenSignal(n)</c>
-/// (an empty <c>Ready</c> falls back to <c>Frame.Ready</c>, which ConsumerFrame sets to the same point).
+/// a write by its <em>written</em> value: <c>Frame = ring.ConsumerFrame(n)</c>, whose <c>Ready</c> is
+/// <c>ring.WrittenSignal(n)</c>.
 /// The protocol, including which writes stay presentable after a refused request, is <see cref="RingProtocol"/>.
 /// </para>
 /// <para>
@@ -106,6 +119,9 @@ public readonly record struct PresenterStats
 public sealed unsafe class VulkanPresenter : IPresenter
 {
     private const int PendingCapacity = 8;
+
+    // Completed presents waiting for their timing report (in order), when the target reports first-pixel times.
+    private const int AwaitingCapacity = 64;
 
     // Holds more than RingProtocol.MaxWaitingReleases + 1, the most submissions ever unconfirmed (WithinWaitingBound).
     private const int ReleaseHistory = 1024;
@@ -129,6 +145,16 @@ public sealed unsafe class VulkanPresenter : IPresenter
     private readonly ulong[] _pendingId = new ulong[PendingCapacity];
     private readonly long[] _pendingSlot = new long[PendingCapacity];
     private readonly long[] _pendingTarget = new long[PendingCapacity];
+    private readonly ulong[] _awaitingId = new ulong[AwaitingCapacity];
+    private readonly long[] _awaitingSlot = new long[AwaitingCapacity];
+    private readonly long[] _awaitingTarget = new long[AwaitingCapacity];
+    private readonly long[] _awaitingSince = new long[AwaitingCapacity];
+    private readonly long[] _awaitingActual = new long[AwaitingCapacity];
+    private readonly bool[] _awaitingReported = new bool[AwaitingCapacity];
+    private long _reportsWithoutTime;
+    private int _awaitingHead;
+    private int _awaitingCount;
+    private long _untimedPresents;
     private readonly SpscRing<PresentFeedback> _feedback = new(256);
     private readonly ulong[] _releaseValues = new ulong[ReleaseHistory];
     private readonly double _timestampPeriodNs;
@@ -174,6 +200,7 @@ public sealed unsafe class VulkanPresenter : IPresenter
     private long _maxInFlight;
     private long _recreations;
     private long _feedbackOverflows;
+    private long _timedPresents;
     private long _lastCopyNs;
     private long _lastPassNs;
     private bool _disposed;
@@ -238,6 +265,12 @@ public sealed unsafe class VulkanPresenter : IPresenter
     /// <summary>True once <see cref="Timing"/> describes the output the frames are actually shown on.</summary>
     public bool IsTimingKnown => _target.RefreshRateKnown;
 
+    /// <summary>
+    /// True when feedback carries the time each present's first pixel went out (<see cref="PresentFeedback.ActualTimeNs"/>,
+    /// <c>CLOCK_MONOTONIC</c>, from VK_EXT_present_timing); otherwise it is 0 and only completion is reported.
+    /// </summary>
+    public bool ReportsPresentTimes => _target.ReportsPresentTimes;
+
     /// <summary>The ring frames must be written into, created by <see cref="Configure"/>. Null before.</summary>
     public PresentationRing? Ring => _ring;
 
@@ -288,6 +321,9 @@ public sealed unsafe class VulkanPresenter : IPresenter
         MaxPresentsInFlight = _maxInFlight,
         TargetRecreations = _recreations,
         FeedbackOverflows = _feedbackOverflows,
+        TimedPresents = _timedPresents,
+        UntimedPresents = _untimedPresents,
+        ReportsWithoutTime = _reportsWithoutTime,
         LastCopyGpuNs = _lastCopyNs,
         LastPassGpuNs = _lastPassNs,
     };
@@ -411,7 +447,7 @@ public sealed unsafe class VulkanPresenter : IPresenter
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var ring = _ring ?? throw new InvalidOperationException("Configure the presenter before presenting.");
-        var ready = request.Ready.IsNone ? request.Frame.Ready : request.Ready;
+        var ready = request.Frame.Ready;
         if (!CheckRequest(ring, request, ready))
         {
             _rejected++;
@@ -536,7 +572,7 @@ public sealed unsafe class VulkanPresenter : IPresenter
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var ring = _ring ?? throw new InvalidOperationException("Configure the presenter first.");
-        var ready = request.Ready.IsNone ? request.Frame.Ready : request.Ready;
+        var ready = request.Frame.Ready;
         if (!CheckRequest(ring, request, ready))
         {
             _rejected++;
@@ -591,14 +627,26 @@ public sealed unsafe class VulkanPresenter : IPresenter
             return true;
         }
 
-        if (_disposed || _pendingCount == 0)
+        if (_disposed || (_pendingCount == 0 && _awaitingCount == 0))
         {
             return false;
         }
 
-        PollCompletions(FrameDoneValue());
+        if (_pendingCount > 0)
+        {
+            PollCompletions(FrameDoneValue());
+        }
+
+        ReleaseAwaiting(Stopwatch.GetTimestamp(), force: false);
         return _feedback.TryDequeue(out feedback);
     }
+
+    /// <summary>
+    /// How long feedback for a completed present waits for its first-pixel report (where the target reports them) before it
+    /// goes out without one: the report usually follows completion within a refresh or two; a present's feedback is never
+    /// given the completion's own time in its place (that time is later than the refresh by a variable amount).
+    /// </summary>
+    public const long TimingHoldNs = 50_000_000;
 
     /// <summary>Waits (bounded) for all submitted work: frames and releases. False on timeout. Not for the hot path.</summary>
     public bool WaitIdle(long timeoutNs)
@@ -702,7 +750,7 @@ public sealed unsafe class VulkanPresenter : IPresenter
 
     private static void ThrowBadReady() =>
         throw new ArgumentException(
-            "PresentRequest.Ready (or, when it is empty, Frame.Ready) must be the ring's written timeline at write n ≥ 1 (ring.WrittenSignal(n)).");
+            "PresentRequest.Frame.Ready must be the ring's written timeline at write n ≥ 1 (ring.WrittenSignal(n), as ring.ConsumerFrame(n) sets it).");
 
     private static void ThrowBadFrame() =>
         throw new ArgumentException("PresentRequest.Frame must be the ring slot of write n (ring.ConsumerFrame(n)).");
@@ -1097,21 +1145,98 @@ public sealed unsafe class VulkanPresenter : IPresenter
 
     private void CompleteOldestPending()
     {
-        var feedback = new PresentFeedback
-        {
-            SlotIndex = _pendingSlot[_pendingHead],
-            TargetTimeNs = _pendingTarget[_pendingHead],
-            ActualTimeNs = 0, // first-pixel time needs VK_EXT_present_timing (Phase 6)
-        };
-        _completedPresent = Math.Max(_completedPresent, _pendingId[_pendingHead]);
+        var id = _pendingId[_pendingHead];
+        var slot = _pendingSlot[_pendingHead];
+        var target = _pendingTarget[_pendingHead];
+        _completedPresent = Math.Max(_completedPresent, id);
         _target.OnPresentCompleted();
-        if (!_feedback.TryEnqueue(feedback))
+        _pendingHead = (_pendingHead + 1) % PendingCapacity;
+        _pendingCount--;
+        if (!_target.ReportsPresentTimes)
+        {
+            // The target cannot tell when the first pixel went out: feedback at once, without a time.
+            Emit(slot, target, 0);
+            return;
+        }
+
+        // The first pixel's time (VK_EXT_present_timing) can come after the completion: the feedback waits for it, in
+        // order, behind any feedback already waiting (completion itself, for the in-flight cap, is counted above).
+        if (_awaitingCount == AwaitingCapacity)
+        {
+            ReleaseAwaiting(long.MaxValue, force: true, limit: 1);
+        }
+
+        var i = (_awaitingHead + _awaitingCount) % AwaitingCapacity;
+        _awaitingId[i] = id;
+        _awaitingSlot[i] = slot;
+        _awaitingTarget[i] = target;
+        _awaitingSince[i] = Stopwatch.GetTimestamp();
+        _awaitingActual[i] = 0;
+        _awaitingReported[i] = false;
+        _awaitingCount++;
+        ReleaseAwaiting(_awaitingSince[i], force: false);
+    }
+
+    /// <summary>
+    /// Feedback for completed presents, in present order, each once its report has come (with a first-pixel time, or without
+    /// one: counted untimed). Reports come in present order (they are read without VK_PAST_PRESENTATION_TIMING_ALLOW_OUT_OF_
+    /// ORDER_RESULTS_BIT_EXT), so one whose report has not come when the next present's has is lost: it goes out untimed at
+    /// once rather than holding the feedback behind it. Otherwise it waits up to <see cref="TimingHoldNs"/> after completion,
+    /// or not at all with <paramref name="force"/>.
+    /// </summary>
+    private void ReleaseAwaiting(long nowTicks, bool force, int limit = int.MaxValue)
+    {
+        var holdTicks = TimingHoldNs * Stopwatch.Frequency / 1_000_000_000;
+        while (_awaitingCount > 0 && limit-- > 0)
+        {
+            var h = _awaitingHead;
+            if (!HasReport(h) && !force && nowTicks - _awaitingSince[h] < holdTicks)
+            {
+                // Lost once the next present's report has come (looked at without taking anything); the same read may have
+                // brought this one's too, so it is looked up once more.
+                if (_awaitingCount < 2 || !_target.HasPresentReport(_awaitingId[(h + 1) % AwaitingCapacity]))
+                {
+                    return;
+                }
+
+                _ = HasReport(h);
+            }
+
+            var actual = _awaitingReported[h] ? _awaitingActual[h] : 0;
+            if (actual > 0)
+            {
+                _timedPresents++;
+            }
+            else
+            {
+                _untimedPresents++;
+                _reportsWithoutTime += _awaitingReported[h] ? 1 : 0;
+            }
+
+            Emit(_awaitingSlot[h], _awaitingTarget[h], actual);
+            _awaitingHead = (_awaitingHead + 1) % AwaitingCapacity;
+            _awaitingCount--;
+        }
+    }
+
+    /// <summary>Whether awaiting entry <paramref name="i"/>'s report has come (with a time or without; looked up once).</summary>
+    private bool HasReport(int i)
+    {
+        if (!_awaitingReported[i] && _target.TryTakePresentTime(_awaitingId[i], out var t))
+        {
+            _awaitingReported[i] = true;
+            _awaitingActual[i] = t;
+        }
+
+        return _awaitingReported[i];
+    }
+
+    private void Emit(long slot, long target, long actual)
+    {
+        if (!_feedback.TryEnqueue(new PresentFeedback { SlotIndex = slot, TargetTimeNs = target, ActualTimeNs = actual }))
         {
             _feedbackOverflows++;
         }
-
-        _pendingHead = (_pendingHead + 1) % PendingCapacity;
-        _pendingCount--;
     }
 
     private void CompleteAllPending()
@@ -1120,6 +1245,8 @@ public sealed unsafe class VulkanPresenter : IPresenter
         {
             CompleteOldestPending();
         }
+
+        ReleaseAwaiting(long.MaxValue, force: true);
     }
 
     private ulong FrameDoneValue()

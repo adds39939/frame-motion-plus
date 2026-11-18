@@ -50,7 +50,6 @@ public class AllocationTests
         {
             SlotIndex = (long)n,
             Frame = ring.ConsumerFrame(n),
-            Ready = ring.WrittenSignal(n),
             TargetTimeNs = (long)n,
         };
 
@@ -141,7 +140,7 @@ public class AllocationTests
                         window.PumpEvents();
                         pumps++;
                         var n = producer.WriteStaged();
-                        var request = new PresentRequest { SlotIndex = (long)n, Frame = ring.ConsumerFrame(n), Ready = ring.WrittenSignal(n) };
+                        var request = new PresentRequest { SlotIndex = (long)n, Frame = ring.ConsumerFrame(n) };
 
                         // Not gated on IsReadyForPresent: most of these are refused, which exercises that path too.
                         if (presenter.TryPresent(request))

@@ -46,6 +46,7 @@
   <ItemGroup>
     <!-- One GPU hardware test assembly at a time on a machine: see the remarks in the file. -->
     <Compile Include="..\Shared\GpuMachineLock.cs" Link="Support\GpuMachineLock.cs" />
+    <Compile Include="..\Shared\ChildProcess.cs" Link="Support\ChildProcess.cs" />
   </ItemGroup>
 
 </Project>

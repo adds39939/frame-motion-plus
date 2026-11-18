@@ -25,6 +25,34 @@ public class FrameTypesTests
         Assert.False(RuntimeHelpers.IsReferenceOrContainsReferences<BridgeSlot>());
     }
 
+    /// <summary>
+    /// A frame's "safe to use" point travels on the frame alone (<see cref="GpuFrame.Ready"/>): neither a source frame nor a
+    /// present request carries a second copy that could disagree with it, and a source is given back each frame with the
+    /// GPU point of its last reader (Phase 4 carry-overs).
+    /// </summary>
+    [Fact]
+    public void Ready_points_travel_on_the_frame_and_releases_carry_the_last_reader()
+    {
+        Assert.Null(typeof(SourceFrame).GetProperty("Ready"));
+        Assert.Null(typeof(PresentRequest).GetProperty("Ready"));
+        Assert.NotNull(typeof(GpuFrame).GetProperty(nameof(GpuFrame.Ready)));
+
+        var release = typeof(IFrameSource).GetMethod(nameof(IFrameSource.Release));
+        Assert.NotNull(release);
+        var parameters = release.GetParameters();
+        Assert.Equal(2, parameters.Length);
+        Assert.Equal(typeof(long), parameters[0].ParameterType);
+        Assert.Equal(typeof(GpuSignal).MakeByRefType(), parameters[1].ParameterType);
+        Assert.True(parameters[1].IsIn);
+
+        var signal = GpuSignal.Timeline(MemoryDomain.CudaDevice, 7, 42);
+        var frame = new SourceFrame { FrameId = 3, Frame = new GpuFrame { Ready = signal, ContentTimeNs = 9 } };
+        Assert.Equal(signal, frame.Frame.Ready);
+        Assert.Equal(9, frame.ContentTimeNs);
+        var request = new PresentRequest { SlotIndex = 1, Frame = frame.Frame };
+        Assert.Equal(signal, request.Frame.Ready);
+    }
+
     [Fact]
     public void Ten_bit_is_representable_and_families_group_formats()
     {

@@ -22,6 +22,7 @@ internal static unsafe partial class LibC
     private const string Library = "libc";
 
     public const int ClockMonotonic = 1;
+    public const int ClockThreadCpuTime = 3;
     public const int TimerAbsTime = 1;
 
     public const int Eperm = 1;
@@ -135,4 +136,8 @@ internal static unsafe partial class LibC
         Einval => "EINVAL",
         _ => "errno " + errno.ToString(System.Globalization.CultureInfo.InvariantCulture),
     };
+
+    /// <summary>_exit(2): ends the process at once, without exit handlers (atexit, the runtime's shutdown).</summary>
+    [LibraryImport(Library, EntryPoint = "_exit")]
+    public static partial void ExitImmediately(int status);
 }

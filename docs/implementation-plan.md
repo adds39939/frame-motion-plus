@@ -230,6 +230,8 @@ step reviewed in one go costs more rounds than several small ones:
 - **4b, pipeline:** source, scheduler, generator and present threads joined by SPSC rings; `fmp play`
   with repeat, blend and VFG; telemetry CSV; the 10-minute gate run.
 - **4c, around it:** HUD and the quality harness.
+  **Deferred on 2026-11-18** so that capture (Phase 5) starts first: `fmp play`'s summary and
+  telemetry CSV already report what the HUD would show. Listed under "Deferred".
 
 - FFmpeg demux + NVDEC (`hwaccel cuda`) sharing the app's CUDA context; convert kernel
   (NV12/P010 to RGBA8/RGB10A2, chroma upsample, matrix and range); frame history; PTS timing.
@@ -348,8 +350,14 @@ step reviewed in one go costs more rounds than several small ones:
      changed" on failure although a multi-probe search may have moved the demuxer.
   3. Untested: a file that grows while it plays; MPEG-PS (handled like TS); the Windows path, which
      reports file playback as unavailable.
-- **Automated gate:** 1440p60 file to 120 Hz with zero missed slots over 10 minutes; zero gen0
-  collections in that run; quality harness produces scores for each generator.
+- **Automated gate (relaxed by the owner on 2026-11-18):** a 1440p60 file at 2x for 10 minutes with
+  **zero missed slots caused by the pipeline** and zero gen0 collections; quality harness produces
+  scores for each generator. Slots the desktop compositor shows late or skips are counted and
+  reported separately and do not fail the gate: the runs are made in a compositor window on a
+  desktop that is in use ("missing the odd frame is to be expected"). The design doc's strict form,
+  zero missed slots of any cause, moves to Phase 9, where direct display bypasses the compositor.
+  This only works if the miss accounting is right: a miss is the pipeline's unless the timestamps
+  show the present was handed over in time for its refresh and the display showed it late.
 - **Manual gate:** VFG file playback looks right to Adam (smooth motion, no visible pacing hitches).
 
 ### Phase 5: Capture card (V4L2)
@@ -431,6 +439,31 @@ step reviewed in one go costs more rounds than several small ones:
   - The NVIDIA driver takes about 1.6 ms in `vkQueueSubmit2` on every 1,024th queue submission when
     nothing is presented to a swapchain (offscreen); not seen in windowed presentation. Re-measure
     on a direct display.
+- **Pacing backlog from step 4b** (`docs/benchmarks/phase4b-pipeline.md`, "Known issues carried to
+  Phase 6"). The owner chose on 2026-11-18 to document these and move on: playback looks right on
+  screen, and exact frame timing against the compositor is this phase's subject.
+  1. **No gate-length run of the final 4b code has been verified from raw timestamps as free of
+     pipeline-caused misses.** Earlier "missed 0" summaries understated: the offline verifier
+     (`fmp verify <csv>`, run by `fmp play --gate`) finds 368 misses in a run the live counters
+     passed. Run the gate on each output and reconcile the live counters with the verifier first.
+  2. The hand-over window rests on an estimate of the compositor's latch, which moves: about 5 ms
+     before the refresh on the 119.88 Hz output, 1.4 to 6.4 ms within one session at 240 Hz. Presents
+     handed over too early were shown a refresh early; too late, a refresh late.
+  3. The 240 Hz output is unverified: its own timing was irregular in the last session (intervals of
+     3.5 to 8.5 ms on a 4.17 ms period) and KWin at times sent presentation reports without a
+     first-pixel time for every fourth present.
+  4. The adaptive present lead only rises and decays back to 1.5 refreshes (12.5 ms at 119.88 Hz);
+     it never probes down toward the measured latch, so the delay to light carries the full lead.
+  5. Showing a new image every second refresh (stride 2 on 240 Hz) costs one extra refresh of delay
+     from the scheduler's stride quantisation.
+  6. A 60.000 fps file on a 119.88 Hz output is not phase-locked: 96% of shown frames are generated
+     and VFG runs at twice the rate. A file has no live constraint, so resampling its playback clock
+     by 0.1% would lock it and halve the work. Decide.
+  7. Millisecond container timestamps (Matroska, TS) are tolerated by a 3% multiplier slack in the
+     scheduler rather than de-quantised in the source.
+  8. A window moving between the 240 Hz and 120 Hz outputs costs about 10 misses and cannot be
+     tested end to end (a Wayland client cannot move itself).
+  9. `FMP_PLAY_FAULT` (fault injection) is compiled into the release binary and listed in `--help`.
 - **Scheduler tuning backlog from the Phase 1 review** (accepted as non-blocking there; resolve against
   real hardware here):
   1. An animated menu (irregular 40 to 95 ms gaps) re-seeds the source interval and raises D to
@@ -484,6 +517,8 @@ step reviewed in one go costs more rounds than several small ones:
 - Direct display mode (`VK_KHR_display` + `VK_EXT_acquire_drm_display`), hitch-free quality switching,
   settings UI, two-hour soak (no drift, stable memory, zero steady-state collections).
 - **Manual gate:** direct display measurably beats Wayland fullscreen end to end.
+- **Automated gate carried here from Phase 4:** a 1440p60 file at 2x for 10 minutes on a direct
+  display with zero missed slots of any cause (the design doc's milestone 1 gate as written).
 
 ### Phase 10: Windows portability
 
@@ -511,3 +546,9 @@ Things the design doc includes that are deliberately not being built yet.
   layer policy in `FrameMotionPlus.Vulkan` already has an NVIDIA-present-layer setting. Open
   questions from the design doc remain open: whether it respects present timing, and how it behaves
   with HDR.
+- **Step 4c: the HUD and the quality harness** (design doc: HUD with frame-time graph, d, D, dropped
+  and repeated frames, detected frame rate; quality harness scoring generated frames against dropped
+  originals with PSNR/SSIM). Deferred on 2026-11-18 to start the capture card first. `fmp play`
+  prints these figures at the end of a run and writes per-frame telemetry to CSV; `fmp bench
+  vfg-quality` already scores VFG against known intermediates on synthetic and graded content.
+

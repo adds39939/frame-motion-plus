@@ -56,6 +56,12 @@ public readonly record struct FrameTimelineRecord
 
     /// <summary>The slot's image was not ready by its target time.</summary>
     public bool Missed { get; init; }
+
+    /// <summary>
+    /// Presented, but nothing can say whether it was shown at its target (no first-pixel time, and no timed show took its
+    /// refresh): neither a miss nor a show (playback on a display that reports first-pixel times only).
+    /// </summary>
+    public bool Unjudged { get; init; }
 }
 
 /// <summary>Receives timeline records. Implementations used on the hot path must not allocate.</summary>

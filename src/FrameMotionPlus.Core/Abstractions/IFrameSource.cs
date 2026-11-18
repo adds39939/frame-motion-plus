@@ -45,6 +45,14 @@ public interface IFrameSource : IDisposable
     /// <summary>Non-blocking. Returns the next unique frame in content-time order, if one is ready.</summary>
     bool TryRead(out SourceFrame frame);
 
-    /// <summary>Tells the source that no pending GPU work references <paramref name="frameId"/> any more.</summary>
-    void Release(long frameId);
+    /// <summary>
+    /// Gives a frame back: no work enqueued after this call reads <paramref name="frameId"/>, and the work enqueued before
+    /// has finished reading it once <paramref name="lastReader"/> is reached, GPU-side (a generator's <c>done</c>, the
+    /// presentation-ring write that copied it, an event recorded after the reads; <see cref="GpuSignal.None"/> when no
+    /// work read it). The source writes the frame's buffer again only after that point, without the CPU waiting for it.
+    /// The object behind <paramref name="lastReader"/> must stay alive until the source is stopped or disposed (the wait
+    /// is enqueued when the buffer is next written), and the point must be reached, or the source's writes stop there.
+    /// Consumer thread; allocation-free.
+    /// </summary>
+    void Release(long frameId, in GpuSignal lastReader);
 }

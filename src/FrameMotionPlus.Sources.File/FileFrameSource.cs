@@ -81,7 +81,11 @@ public sealed unsafe class FileFrameSource : IFrameSource
     private readonly SpscRing<QueuedFrame> _queue;
     private readonly SpscRing<DecodeTiming> _timings;
     private readonly PendingTiming[] _pending = new PendingTiming[PendingTimings];
-    private readonly ManualResetEventSlim _wake = new(false);
+    // An AutoResetEvent, not a ManualResetEventSlim: under NativeAOT the slim event's Monitor-based slow path allocates
+    // lazily created state the first time a thread contends for it, which can be at any point of a long run (seen in the
+    // 10-minute gate: 120 B, once, on the decode thread). The wait subsystem's event allocates nothing after a thread's first
+    // wait. A Set while nobody waits leaves it signalled, so a wake-up between the check and the wait is never lost.
+    private readonly AutoResetEvent _wake = new(false);
     private readonly FileFrameInfo[] _frameInfo = null!;
     private readonly int _queueCapacity;
     private AVFrame* _frame;
@@ -105,6 +109,7 @@ public sealed unsafe class FileFrameSource : IFrameSource
     private int _pendingCount;
     private bool _timingLost;
     private bool _firstPathThisFrame;
+    private bool _startedOnce;
     private bool _disposed;
     private bool _freed;
     private volatile bool _leaked;
@@ -316,6 +321,23 @@ public sealed unsafe class FileFrameSource : IFrameSource
     /// <summary>Test hook, consumer thread: runs inside <see cref="TryRead"/> for each frame it returns.</summary>
     internal Action? ReadHook { get; set; }
 
+    /// <summary>
+    /// Sets the <c>CLOCK_MONOTONIC</c> time at which the file's first frame counts as having appeared, replacing
+    /// <see cref="FileSourceOptions.ContentTimeOriginNs"/>: a pipeline builds the source first (opening a file, creating
+    /// its decoder and decoding the first frame take tens of milliseconds) and chooses the origin when it starts playback.
+    /// Only before the first <see cref="Start"/>, which is when content times start being assigned; throws afterwards.
+    /// </summary>
+    public void SetContentTimeOrigin(long originNs)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_thread is not null || Volatile.Read(ref _framesDecoded) > 0 || _startedOnce)
+        {
+            throw new InvalidOperationException("The content-time origin can only be set before the source is first started.");
+        }
+
+        _clock.SetOrigin(originNs);
+    }
+
     /// <summary>Starts the decode thread. Allocation happens here, not afterwards.</summary>
     public void Start()
     {
@@ -326,6 +348,7 @@ public sealed unsafe class FileFrameSource : IFrameSource
         }
 
         Volatile.Write(ref _stop, 0);
+        _startedOnce = true;
         _thread = DedicatedThread.Start("fmp-decode", _options.DecodeThread, Run);
     }
 
@@ -357,8 +380,7 @@ public sealed unsafe class FileFrameSource : IFrameSource
 
     /// <summary>
     /// The next frame in presentation order, if one is ready. Never blocks, never allocates. The frame is held until
-    /// <see cref="Release(long, in GpuSignal)"/>; its <see cref="GpuFrame.Ready"/> (and <see cref="SourceFrame.Ready"/>)
-    /// is the end of its conversion.
+    /// <see cref="Release(long, in GpuSignal)"/>; its <see cref="GpuFrame.Ready"/> is the end of its conversion.
     /// </summary>
     public bool TryRead(out SourceFrame frame)
     {
@@ -385,14 +407,14 @@ public sealed unsafe class FileFrameSource : IFrameSource
         return false;
     }
 
-    /// <summary>The frame is no longer read by any GPU work, pending or future (<see cref="IFrameSource.Release"/>).</summary>
+    /// <summary>The frame is no longer read by any GPU work, pending or future (<see cref="GpuSignal.None"/> as the last reader).</summary>
     public void Release(long frameId) => Release(frameId, GpuSignal.None);
 
     /// <summary>
     /// No work enqueued after this call reads <paramref name="frameId"/>, and the work enqueued before has finished
     /// reading it once <paramref name="lastReader"/> is reached (the generator's <c>done</c>, a ring write, an event
-    /// recorded after the reads): its buffer is written again only after that point, GPU-side. Consumer thread;
-    /// allocation-free.
+    /// recorded after the reads): its buffer is written again only after that point, GPU-side
+    /// (<see cref="IFrameSource.Release"/>). Consumer thread; allocation-free.
     /// </summary>
     public void Release(long frameId, in GpuSignal lastReader)
     {
@@ -533,10 +555,9 @@ public sealed unsafe class FileFrameSource : IFrameSource
         {
             _context.MakeCurrent();
 
-            // First uses on this thread, before anything is measured: a blocking wait (its first Monitor.Wait allocates
-            // the thread's wait state once).
-            _wake.Reset();
-            _ = _wake.Wait(1);
+            // First uses on this thread, before anything is measured: a blocking wait (the thread's first wait allocates
+            // its wait state once).
+            _ = _wake.WaitOne(1);
             var allocationBase = -1L;
             while (Volatile.Read(ref _stop) == 0)
             {
@@ -616,14 +637,10 @@ public sealed unsafe class FileFrameSource : IFrameSource
 
     /// <summary>
     /// Sleeps until the consumer reads or releases a frame, a seek is asked for or <see cref="Stop"/> is called. Every
-    /// caller re-checks its condition afterwards, and those all change before the event is set, so a wake-up that lands
-    /// between the wait and the reset is never lost. Allocation-free.
+    /// caller re-checks its condition afterwards, and those all change before the event is set; a set while the thread is
+    /// not waiting leaves the event signalled, so no wake-up is lost. Allocation-free.
     /// </summary>
-    private void Idle()
-    {
-        _wake.Wait();
-        _wake.Reset();
-    }
+    private void Idle() => _ = _wake.WaitOne();
 
     private long FrameTicks() => _frame->BestEffortTimestamp == Av.NoPtsValue ? _frame->Pts : _frame->BestEffortTimestamp;
 
@@ -707,7 +724,7 @@ public sealed unsafe class FileFrameSource : IFrameSource
         _lastColor = color;
         PerFrameHook?.Invoke();
         var queued = new QueuedFrame(
-            new SourceFrame { FrameId = id, Frame = frame, ArrivalTimeNs = Monotonic.NowNs, Ready = frame.Ready, Marks = marks },
+            new SourceFrame { FrameId = id, Frame = frame, ArrivalTimeNs = Monotonic.NowNs, Marks = marks },
             _epoch);
         if (!_queue.TryEnqueue(queued))
         {

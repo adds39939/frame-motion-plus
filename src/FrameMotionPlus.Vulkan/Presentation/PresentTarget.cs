@@ -152,6 +152,26 @@ public abstract class PresentTarget : IDisposable
     /// <summary>Non-blocking: has present <paramref name="presentId"/> completed (shown)? Only when <see cref="SupportsPresentWait"/>.</summary>
     internal virtual bool PollPresentComplete(ulong presentId) => true;
 
+    /// <summary>True when the target reports when each present's first pixel went out (<see cref="TryTakePresentTime"/>).</summary>
+    internal virtual bool ReportsPresentTimes => false;
+
+    /// <summary>
+    /// Non-blocking: whether present <paramref name="presentId"/>'s report has come and, in <paramref name="timeNs"/>, when its
+    /// first pixel went out on <c>CLOCK_MONOTONIC</c> (0 when the report came without that time: some compositors leave it
+    /// out for some presents). Reports for older presents are discarded. Allocation-free.
+    /// </summary>
+    internal virtual bool TryTakePresentTime(ulong presentId, out long timeNs)
+    {
+        timeNs = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Non-blocking: whether present <paramref name="presentId"/>'s report has come (with a time or without), without taking
+    /// it or discarding any report (older ones included). Allocation-free.
+    /// </summary>
+    internal virtual bool HasPresentReport(ulong presentId) => false;
+
     /// <summary>Waits (bounded) until every present has released its semaphores, before images or semaphores go.</summary>
     internal virtual void WaitForPresents(long timeoutNs)
     {

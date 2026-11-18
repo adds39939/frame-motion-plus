@@ -39,7 +39,7 @@ internal sealed class ContentClock
     private readonly long _timeBaseNum;
     private readonly long _timeBaseDen;
     private readonly long _nominalIntervalNs;
-    private readonly long _origin;
+    private long _origin;
     private long _startTicks;
     private bool _haveStart;
     private long _offsetNs;
@@ -82,6 +82,20 @@ internal sealed class ContentClock
 
     /// <summary>Whether the last frame's timestamp was an isolated collision moved 1 ns on.</summary>
     public bool LastWasRepaired => _repairedLast;
+
+    /// <summary>
+    /// Replaces the origin given to the constructor. Only before the first <see cref="Next"/>: content times already handed
+    /// out would otherwise not be on one timeline with the later ones.
+    /// </summary>
+    public void SetOrigin(long originNs)
+    {
+        if (_lastContentNs != long.MinValue)
+        {
+            throw new InvalidOperationException("The content-time origin can only be set before the first frame is timed.");
+        }
+
+        _origin = originNs;
+    }
 
     /// <summary>Stream ticks of <paramref name="mediaNs"/> after the start (for seeking).</summary>
     public long TicksAt(long mediaNs) =>

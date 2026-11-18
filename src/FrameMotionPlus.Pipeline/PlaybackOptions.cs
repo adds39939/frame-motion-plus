@@ -1,0 +1,182 @@
+using FrameMotionPlus.Core.Abstractions;
+using FrameMotionPlus.Core.Settings;
+using FrameMotionPlus.Core.Time;
+using FrameMotionPlus.Platform.Threading;
+
+namespace FrameMotionPlus.Pipeline;
+
+/// <summary>Which frame generator writes the generated slots.</summary>
+public enum GeneratorKind
+{
+    /// <summary>NVIDIA Maxine VFG (needs the VFX SDK), on the generator thread: its Enqueue blocks.</summary>
+    Vfg = 0,
+
+    /// <summary>Linear blend (CUDA), the debug baseline.</summary>
+    Blend = 1,
+
+    /// <summary>The nearest real frame copied (CUDA), the A/B baseline.</summary>
+    Repeat = 2,
+
+    /// <summary>No generator: real frames only (the scheduler's multiplier is 1).</summary>
+    None = 3,
+}
+
+/// <summary>Where frames are shown.</summary>
+public enum DisplayKind
+{
+    /// <summary>An SDL3 window on Wayland: FIFO swapchain, pacing locked to present feedback.</summary>
+    Window = 0,
+
+    /// <summary>An offscreen target (no display server); presents complete with their GPU work.</summary>
+    Offscreen = 1,
+}
+
+/// <summary>The clock the pacing runs on.</summary>
+public enum PlaybackClock
+{
+    /// <summary><c>CLOCK_MONOTONIC</c>: real time, real waits.</summary>
+    Real = 0,
+
+    /// <summary>
+    /// A virtual clock the pacing thread advances to each decision time (offscreen only): every slot is decided exactly
+    /// on time, the threads wait for each other instead of skipping, measured generation times are not fed back, and
+    /// frames count as available a fixed lead before their content time. Given the same file and options the scheduler
+    /// makes the same decisions every run, so every presented frame can be checked against what it must show.
+    /// </summary>
+    Virtual = 1,
+}
+
+/// <summary>Configuration of a <see cref="PlaybackSession"/> (what <c>fmp play</c> resolves its options into).</summary>
+public sealed record PlaybackOptions
+{
+    /// <summary>The video file.</summary>
+    public required string Path { get; init; }
+
+    public GeneratorKind Generator { get; init; } = GeneratorKind.Vfg;
+
+    public FrameGenQuality Quality { get; init; } = FrameGenQuality.Medium;
+
+    /// <summary>
+    /// The cap on output frames per source frame (the scheduler's maximum multiplier). The scheduler picks the largest
+    /// ratio up to this the display allows: a 60 fps file at 2 on a 120 Hz panel shows a new frame every refresh, on a
+    /// 240 Hz panel every other refresh; at 4 on the 240 Hz panel every refresh. 1 shows real frames only.
+    /// </summary>
+    public int Multiplier { get; init; } = 2;
+
+    /// <summary>Asked for as an output rate instead: the multiplier cap is this over the file's frame rate (rounded).</summary>
+    public double? OutputHz { get; init; }
+
+    /// <summary>Start the file again at its end (each lap is a discontinuity: nothing is interpolated across it).</summary>
+    public bool Loop { get; init; }
+
+    /// <summary>Stop after this much playback (after the start-up); 0: until the end of the file or a stop.</summary>
+    public long DurationNs { get; init; }
+
+    /// <summary>Stop after this many output slots (after the start-up); 0: no limit.</summary>
+    public long MaxSlots { get; init; }
+
+    public DisplayKind Display { get; init; } = DisplayKind.Window;
+
+    public PlaybackClock Clock { get; init; } = PlaybackClock.Real;
+
+    /// <summary>The refresh rate an offscreen target stands for (nothing paces it otherwise).</summary>
+    public FrameRate OffscreenRate { get; init; } = FrameRate.FromHz(120);
+
+    /// <summary>Offscreen target size; 0: the source's size (a 1:1 present, so frames can be checked bit for bit).</summary>
+    public int OffscreenWidth { get; init; }
+
+    public int OffscreenHeight { get; init; }
+
+    /// <summary>Window size in window coordinates.</summary>
+    public int WindowWidth { get; init; } = 1280;
+
+    public int WindowHeight { get; init; } = 720;
+
+    /// <summary>Borderless fullscreen on the output the window is on, once it has shown a frame.</summary>
+    public bool Fullscreen { get; init; }
+
+    /// <summary>Vulkan validation layer with synchronization checks.</summary>
+    public bool Validate { get; init; }
+
+    /// <summary>Excluded from the statistics and the allocation and GC counts at the start of playback.</summary>
+    public long WarmupNs { get; init; } = 2 * Nanoseconds.PerSecond;
+
+    /// <summary>
+    /// The present lead to start from (and the lowest it adapts down to): how long before its refresh a slot's content must
+    /// be ready, on top of the generation time and the scheduler's margin, so its present is handed over before the
+    /// compositor latches it. -1: 1.5 refresh periods for a window; 0 offscreen.
+    /// </summary>
+    public long PresentLeadNs { get; init; } = -1;
+
+    /// <summary>
+    /// The least a present is assumed to need before its refresh (offscreen: how early a slot is submitted; windowed: a floor
+    /// under the measured, adaptive present lead used for fillers and for an empty queue's prediction).
+    /// </summary>
+    public long LatchLeadNs { get; init; } = Nanoseconds.PerMillisecond;
+
+    /// <summary>VFX SDK directory (else <c>$FMP_VFX_SDK</c>, the settings file, a checkout's lib/VideoFX, /usr/local/VideoFX).</summary>
+    public string? VfxSdkDirectory { get; init; }
+
+    /// <summary>Scheduler, display and generator settings (a settings file); null: the defaults.</summary>
+    public FmpSettings? Settings { get; init; }
+
+    /// <summary>Write the per-slot timeline (Core's telemetry records) to this CSV file.</summary>
+    public string? CsvPath { get; init; }
+
+    /// <summary>Per-slot timeline records kept for the CSV and the summary between collector passes.</summary>
+    public int TelemetryCapacity { get; init; } = 8192;
+
+    /// <summary>Frames decoded and converted ahead of the pacing thread.</summary>
+    public int DecodeAhead { get; init; } = 4;
+
+    /// <summary>Frames the pacing thread may hold at once: the scheduler's start-up frames plus the pair in use.</summary>
+    public int HistoryDepth { get; init; } = 10;
+
+    /// <summary>How the pacing, generator and present threads are scheduled (default: SCHED_OTHER, 1 ns timer slack).</summary>
+    public ThreadSchedulingRequest Threads { get; init; } = ThreadSchedulingRequest.Default;
+
+    /// <summary>
+    /// Windowed: the present lead adapts to the output (it goes up at once when a present's content misses the compositor's
+    /// latch, and comes back down slowly). False keeps it at <see cref="PresentLeadNs"/> (diagnostics, tests).
+    /// </summary>
+    public bool AdaptiveLead { get; init; } = true;
+
+    /// <summary>Bounded waits of the teardown and of the virtual clock's lockstep (a hang becomes a failure).</summary>
+    public long StallTimeoutNs { get; init; } = 10 * Nanoseconds.PerSecond;
+
+    internal void Check()
+    {
+        ArgumentException.ThrowIfNullOrEmpty(Path);
+        ArgumentOutOfRangeException.ThrowIfLessThan(Multiplier, 1, nameof(Multiplier));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(Multiplier, 8, nameof(Multiplier));
+        ArgumentOutOfRangeException.ThrowIfNegative(DurationNs, nameof(DurationNs));
+        ArgumentOutOfRangeException.ThrowIfNegative(MaxSlots, nameof(MaxSlots));
+        ArgumentOutOfRangeException.ThrowIfNegative(WarmupNs, nameof(WarmupNs));
+        ArgumentOutOfRangeException.ThrowIfNegative(LatchLeadNs, nameof(LatchLeadNs));
+        ArgumentOutOfRangeException.ThrowIfLessThan(PresentLeadNs, -1, nameof(PresentLeadNs));
+        if (Clock == PlaybackClock.Virtual && Display != DisplayKind.Offscreen)
+        {
+            throw new ArgumentException("The virtual clock needs the offscreen display: a window's refreshes run on real time.", nameof(Clock));
+        }
+
+        if (!OffscreenRate.IsValid)
+        {
+            throw new ArgumentOutOfRangeException(nameof(OffscreenRate), "The offscreen rate must be set.");
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegative(OffscreenWidth, nameof(OffscreenWidth));
+        ArgumentOutOfRangeException.ThrowIfNegative(OffscreenHeight, nameof(OffscreenHeight));
+        ArgumentOutOfRangeException.ThrowIfLessThan(WindowWidth, 64, nameof(WindowWidth));
+        ArgumentOutOfRangeException.ThrowIfLessThan(WindowHeight, 64, nameof(WindowHeight));
+        ArgumentOutOfRangeException.ThrowIfLessThan(TelemetryCapacity, 256, nameof(TelemetryCapacity));
+        if ((TelemetryCapacity & (TelemetryCapacity - 1)) != 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(TelemetryCapacity), TelemetryCapacity, "Must be a power of two.");
+        }
+
+        ArgumentOutOfRangeException.ThrowIfLessThan(DecodeAhead, 1, nameof(DecodeAhead));
+        ArgumentOutOfRangeException.ThrowIfLessThan(HistoryDepth, 4, nameof(HistoryDepth));
+        ArgumentNullException.ThrowIfNull(Threads, nameof(Threads));
+        ArgumentOutOfRangeException.ThrowIfLessThan(StallTimeoutNs, Nanoseconds.PerSecond, nameof(StallTimeoutNs));
+    }
+}

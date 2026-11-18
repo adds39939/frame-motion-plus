@@ -78,6 +78,45 @@ public class SerialSourceTests
     }
 
     /// <summary>
+    /// Every read and release wakes a decode thread held back by a full queue or history: no wake-up is lost between its
+    /// check and its wait (its wait has no timeout, so a lost one would leave the queue empty for good). One frame at a time
+    /// through a looping clip, each read the moment the queue has one, for 600 frames: the next frame always comes, within
+    /// a bounded time, and the decode thread allocates nothing.
+    /// </summary>
+    [Fact]
+    public void Every_read_and_release_wakes_a_held_back_decode_thread()
+    {
+        var env = Media.Require();
+        using var source = new FileFrameSource(env.Context, env.Clip("h264-3s"), new FileSourceOptions { Kernels = env.Kernels, Loop = true });
+        source.Start();
+        Frames.WaitUntil(() => source.QueueDepth == 4, "the queue did not fill");
+        var worst = 0L;
+        var held = -1L;
+        for (var i = 0; i < 600; i++)
+        {
+            var start = Stopwatch.GetTimestamp();
+            Assert.True(Frames.Next(source, out var frame, timeoutS: 5), $"frame {i}: none came within 5 s (a lost wake-up)");
+            worst = Math.Max(worst, Stopwatch.GetTimestamp() - start);
+            if (held >= 0)
+            {
+                source.Release(held);
+            }
+
+            held = frame.FrameId;
+            if (i % 3 == 0)
+            {
+                Thread.Sleep(1); // now and then the decode thread catches up and waits again
+            }
+        }
+
+        source.Release(held);
+        var worstMs = worst * 1000.0 / Stopwatch.Frequency;
+        Log.WriteLine(string.Create(CultureInfo.InvariantCulture, $"600 frames one at a time: longest wait for the next {worstMs:0.0} ms; decode thread {source.Statistics.DecodeThreadAllocatedBytes} B"));
+        Assert.True(worstMs < 1000, $"a frame took {worstMs:0} ms");
+        Assert.Equal(0, source.Statistics.DecodeThreadAllocatedBytes);
+    }
+
+    /// <summary>
     /// A release point that does not complete for a long time (here a 3 s GPU delay; for ever in a broken consumer) holds
     /// the decode thread inside NVDEC's per-frame synchronisation. <see cref="FileFrameSource.Stop"/> gives up after its
     /// bound with a <see cref="TimeoutException"/> that says why, <see cref="FileFrameSource.Dispose"/> frees nothing and
@@ -97,7 +136,7 @@ public class SerialSourceTests
         {
             source.Start();
             Assert.True(Frames.Next(source, out var frame));
-            reader.Wait(frame.Ready);
+            reader.Wait(frame.Frame.Ready);
             env.Kernels.EnqueueDelay(reader, 3_000_000_000);
             readDone.Record(reader);
             source.Release(frame.FrameId, readDone.Signal);
@@ -148,7 +187,7 @@ public class SerialSourceTests
         using var reader = CudaStream.Create(env.Context);
         using (var gone = CudaEvent.Create(env.Context))
         {
-            reader.Wait(frame.Ready);
+            reader.Wait(frame.Frame.Ready);
             gone.Record(reader);
             source.Release(frame.FrameId, gone.Signal);
         }

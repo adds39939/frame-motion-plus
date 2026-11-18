@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>FrameMotionPlus.Pipeline</RootNamespace>
+    <AssemblyName>FrameMotionPlus.Pipeline</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Vulkan\FrameMotionPlus.Vulkan.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.CudaVulkan\FrameMotionPlus.CudaVulkan.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Vfx\FrameMotionPlus.Vfx.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The tests drive the threads' pure parts (display grid, miss attribution) and read internal counters. -->
+    <InternalsVisibleTo Include="FrameMotionPlus.Pipeline.Tests" />
+  </ItemGroup>
+
+</Project>

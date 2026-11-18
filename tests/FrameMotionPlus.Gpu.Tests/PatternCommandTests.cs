@@ -312,14 +312,14 @@ public sealed partial class PatternCommandTests
             Assert.Skip("POSIX signals");
         }
 
-        Hardware.RequireGpu();
-        var dotnet = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
-        var info = new ProcessStartInfo(dotnet) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
-        foreach (var a in new[] { typeof(CommandDispatcher).Assembly.Location, "pattern", "--offscreen", "--size", "640x360", "--duration-s", "60" })
+        if (signal == 2 && TestSupport.ChildProcess.SigintUnavailable is { } why)
         {
-            info.ArgumentList.Add(a);
+            Assert.Skip(why);
         }
 
+        Hardware.RequireGpu();
+        var dotnet = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
+        var info = TestSupport.ChildProcess.WithDefaultSigint(dotnet, [typeof(CommandDispatcher).Assembly.Location, "pattern", "--offscreen", "--size", "640x360", "--duration-s", "60"]);
         using var process = Process.Start(info)!;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(60));

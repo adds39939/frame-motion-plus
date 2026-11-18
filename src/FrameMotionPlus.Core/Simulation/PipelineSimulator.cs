@@ -352,8 +352,7 @@ public sealed class PipelineSimulator
                 _presenter.TryPresent(new PresentRequest
                 {
                     SlotIndex = decision.SlotIndex,
-                    Frame = output,
-                    Ready = GpuSignal.Timeline(1, (ulong)decision.SlotIndex),
+                    Frame = output with { Ready = GpuSignal.Timeline(1, (ulong)decision.SlotIndex) },
                     TargetTimeNs = v,
                 });
                 while (_presenter.TryGetFeedback(out _))

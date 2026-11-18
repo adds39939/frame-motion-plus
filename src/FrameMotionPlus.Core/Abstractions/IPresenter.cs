@@ -76,10 +76,11 @@ public readonly record struct PresentRequest
 {
     public long SlotIndex { get; init; }
 
+    /// <summary>
+    /// The ring slot to show. Its <see cref="GpuFrame.Ready"/> is the GPU-side point the present pass waits on before
+    /// reading it (the slot's <em>written</em> value in the presenter's domain, e.g. <see cref="BridgeSlot.ConsumerView"/>).
+    /// </summary>
     public GpuFrame Frame { get; init; }
-
-    /// <summary>GPU-side signal the present pass waits on before reading <see cref="Frame"/>.</summary>
-    public GpuSignal Ready { get; init; }
 
     /// <summary>Absolute target display time V (first pixel), ns.</summary>
     public long TargetTimeNs { get; init; }

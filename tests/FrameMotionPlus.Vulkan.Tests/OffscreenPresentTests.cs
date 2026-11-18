@@ -135,6 +135,66 @@ public class OffscreenPresentTests
         Assert.Equal(255, TestPatterns.Unpack(output[(16 * 64) + 40], PixelFormat.Rgba8).R);
     });
 
+    /// <summary>
+    /// Where the target reports first-pixel times, a completed present's feedback waits for its report instead of going out
+    /// without one (the pipeline then took the report's own time as the shown time: a sample up to a period off the refresh
+    /// grid, which moved the grid and read as a late show); feedback stays in present order; one whose report never comes
+    /// goes out without a time, counted as untimed, as soon as a later present's report proves it lost (reports come in
+    /// present order), not after the whole <see cref="VulkanPresenter.TimingHoldNs"/> holding every feedback behind it.
+    /// A report that comes without a time (KWin at 240 Hz leaves it out for some presents) releases its present untimed
+    /// when it comes, counted apart. Synthetic reports (offscreen): each arrives three presents after its own, present 7's
+    /// never, present 12's without a time.
+    /// </summary>
+    [Fact]
+    [Trait(Category.Name, Category.Gpu)]
+    public void Feedback_waits_for_late_first_pixel_reports_and_counts_the_one_that_never_comes() => Gpu.Run(ctx =>
+    {
+        using var rig = OffscreenRig.Create(ctx, 64, 32, PixelFormat.Rgba8);
+        var presented = 0L;
+        static long TimeOf(ulong id) => 1_000_000_000L + ((long)id * 1_000);
+        rig.Target.PresentTimeSource = id => id == 7 ? 0 : Volatile.Read(ref presented) < (long)id + 3 ? 0 : id == 12 ? -1 : TimeOf(id);
+        var got = new List<PresentFeedback>();
+        var lostAt = 0;
+        for (var frame = 1; frame <= 20; frame++)
+        {
+            _ = rig.WriteAndPresent(TestPattern.Ramp, frame);
+            Volatile.Write(ref presented, frame);
+            rig.WaitReady();
+            while (rig.Presenter.TryGetFeedback(out var f))
+            {
+                got.Add(f);
+                lostAt = f.SlotIndex == 6 ? frame : lostAt;
+            }
+        }
+
+        Volatile.Write(ref presented, 1000);
+        var start = Stopwatch.GetTimestamp();
+        while (got.Count < 20 && Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(3))
+        {
+            while (rig.Presenter.TryGetFeedback(out var f))
+            {
+                got.Add(f);
+            }
+
+            Thread.Sleep(1);
+        }
+
+        Assert.Equal(20, got.Count);
+        for (var i = 0; i < got.Count; i++)
+        {
+            Assert.Equal(i, got[i].SlotIndex);
+            var id = (ulong)got[i].SlotIndex + 1;
+            Assert.Equal(id is 7 or 12 ? 0 : TimeOf(id), got[i].ActualTimeNs);
+        }
+
+        Assert.Equal(18, rig.Presenter.Stats.TimedPresents);
+        Assert.Equal(2, rig.Presenter.Stats.UntimedPresents);
+        Assert.Equal(1, rig.Presenter.Stats.ReportsWithoutTime);
+
+        // Present 8's report is there once 11 presents were made: present 7's feedback went out then, not 50 ms later.
+        Assert.InRange(lostAt, 11, 13);
+    });
+
     [Fact]
     [Trait(Category.Name, Category.Gpu)]
     public void Many_frames_reuse_every_slot_and_honour_release() => Gpu.Run(ctx =>
@@ -195,9 +255,10 @@ public class OffscreenPresentTests
 
         var n2 = rig.WriteAndPresent(TestPattern.Ramp, 2);
 
-        // Ready may be left empty: the frame's own Ready (set by ConsumerFrame) is used.
+        // The present pass waits on the request frame's own Ready, which ConsumerFrame sets to the written point.
         rig.WaitReady();
-        Assert.True(rig.Presenter.TryPresent(rig.Request(n2) with { Ready = GpuSignal.None }));
+        Assert.Equal(rig.Ring.WrittenSignal(n2), rig.Request(n2).Frame.Ready);
+        Assert.True(rig.Presenter.TryPresent(rig.Request(n2)));
         Assert.Equal(2, rig.Presenter.Stats.Repeats);
         rig.WaitReady();
         Assert.False(rig.Presenter.TryPresent(rig.Request(n1)), "an older write may already be overwritten");
@@ -205,10 +266,12 @@ public class OffscreenPresentTests
         Assert.Equal(n2, rig.Presenter.LastPresentedWrite);
 
         // Requests that do not name the ring's slot and timeline are programming errors.
-        var wrongSlot = rig.Request(n2 + 1) with { Frame = rig.Ring.ConsumerFrame(n2) };
+        var wrongSlot = rig.Request(n2 + 1) with { Frame = rig.Ring.ConsumerFrame(n2) with { Ready = rig.Ring.WrittenSignal(n2 + 1) } };
         Assert.Throws<ArgumentException>(() => rig.Presenter.TryPresent(wrongSlot));
-        var wrongSignal = rig.Request(n2 + 1) with { Ready = GpuSignal.Timeline(MemoryDomain.Vulkan, 1234, n2 + 1) };
+        var wrongSignal = rig.Request(n2 + 1) with { Frame = rig.Ring.ConsumerFrame(n2 + 1) with { Ready = GpuSignal.Timeline(MemoryDomain.Vulkan, 1234, n2 + 1) } };
         Assert.Throws<ArgumentException>(() => rig.Presenter.TryPresent(wrongSignal));
+        var noSignal = rig.Request(n2 + 1) with { Frame = rig.Ring.ConsumerFrame(n2 + 1) with { Ready = GpuSignal.None } };
+        Assert.Throws<ArgumentException>(() => rig.Presenter.TryPresent(noSignal));
     });
 
     [Fact]

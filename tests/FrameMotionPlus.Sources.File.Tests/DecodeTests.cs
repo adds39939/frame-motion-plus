@@ -110,6 +110,52 @@ public class DecodeTests
     }
 
     /// <summary>
+    /// The content-time origin can be chosen after the source is built (a pipeline picks it when it starts playback):
+    /// content times are then the media times plus that origin, the same as giving it in the options; once the source has
+    /// started, changing it is refused (times already handed out would not be on one timeline with later ones).
+    /// </summary>
+    [Fact]
+    public void The_content_time_origin_can_be_set_until_the_source_starts()
+    {
+        var env = Media.Require();
+        var path = env.Clip("h264");
+        const long Origin = 123_456_789_000L;
+        static long[] Times(FileFrameSource source)
+        {
+            var times = new List<long>();
+            while (times.Count < 10 && Frames.Next(source, out var frame))
+            {
+                times.Add(frame.ContentTimeNs);
+                source.Release(frame.FrameId);
+            }
+
+            return [.. times];
+        }
+
+        long[] byOption, bySetter;
+        using (var source = new FileFrameSource(env.Context, path, new FileSourceOptions { Kernels = env.Kernels, ContentTimeOriginNs = Origin }))
+        {
+            source.Start();
+            byOption = Times(source);
+        }
+
+        using (var source = new FileFrameSource(env.Context, path, new FileSourceOptions { Kernels = env.Kernels, ContentTimeOriginNs = 5 }))
+        {
+            source.SetContentTimeOrigin(Origin);
+            source.SetContentTimeOrigin(Origin); // as often as wanted before the start
+            source.Start();
+            bySetter = Times(source);
+            Assert.Throws<InvalidOperationException>(() => source.SetContentTimeOrigin(0));
+            source.Stop();
+            Assert.Throws<InvalidOperationException>(() => source.SetContentTimeOrigin(0)); // also once stopped again
+        }
+
+        Assert.Equal(10, byOption.Length);
+        Assert.Equal(byOption, bySetter);
+        Assert.Equal(Origin, bySetter[0]);
+    }
+
+    /// <summary>
     /// A broken file whose timestamps collide in pairs still gets distinct, strictly increasing content times: each
     /// collision is isolated (the frame after it advances again), so it is moved 1 ns after the previous frame, counted
     /// and flagged on the frame; it is not a discontinuity, and no two frames in a row are repaired.
@@ -468,11 +514,12 @@ public class DecodeTests
         Assert.True(Frames.Next(source, out var frame));
         var original = Frames.Rgb(env, frame);
         using var copy = CudaDeviceBuffer.AllocateImage(env.Context, frame.Frame.Width, frame.Frame.Height, frame.Frame.Format);
-        reader.Wait(frame.Ready);
+        reader.Wait(frame.Frame.Ready);
         env.Kernels.EnqueueDelay(reader, 300_000_000);
         reader.CopyFrameAsync(frame.Frame, copy.AsFrame());
         readDone.Record(reader);
-        source.Release(frame.FrameId, releaseWithReader ? readDone.Signal : GpuSignal.None);
+        // Through Core's interface, which carries the last reader's GPU point (the pipeline releases this way).
+        ((Core.Abstractions.IFrameSource)source).Release(frame.FrameId, releaseWithReader ? readDone.Signal : GpuSignal.None);
         for (var i = 0; i < 6; i++)
         {
             Assert.True(Frames.Next(source, out var next));

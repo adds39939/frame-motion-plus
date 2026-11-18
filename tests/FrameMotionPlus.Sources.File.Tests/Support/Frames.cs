@@ -47,7 +47,7 @@ internal static class Frames
         using var stream = CudaStream.Create(env.Context);
         using var luma = CudaDeviceBuffer.Allocate(env.Context, (long)w * h * bps);
         using var chroma = CudaDeviceBuffer.Allocate(env.Context, (long)cw * 2 * ch * bps);
-        stream.Wait(frame.Ready);
+        stream.Wait(frame.Frame.Ready);
         stream.Copy2DAsync(luma.Address, (long)w * bps, planes.Luma, planes.LumaPitch, (long)w * bps, h);
         stream.Copy2DAsync(chroma.Address, (long)cw * 2 * bps, planes.Chroma, planes.ChromaPitch, (long)cw * 2 * bps, ch);
         var l = new byte[luma.SizeBytes];
@@ -77,7 +77,7 @@ internal static class Frames
     public static uint[] Rgb(CudaEnvironment env, in SourceFrame frame)
     {
         using var stream = CudaStream.Create(env.Context);
-        stream.Wait(frame.Ready);
+        stream.Wait(frame.Frame.Ready);
         var pixels = new uint[frame.Frame.Width * frame.Frame.Height];
         stream.CopyFrameToHost(frame.Frame, pixels);
         return pixels;

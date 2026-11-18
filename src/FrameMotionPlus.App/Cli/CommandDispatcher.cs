@@ -35,6 +35,8 @@ internal static class CommandDispatcher
                 "bench" => BenchCommand.Run(rest, output, error),
                 "pattern" => PatternCommand.Run(rest, output, error),
                 "decode" => DecodeCommand.Run(rest, output, error),
+                "play" => PlayCommand.Run(rest, output, error),
+                "verify" => VerifyCommand.Run(rest, output, error),
                 _ => throw new UsageException($"Unknown command '{args[0]}'."),
             };
         }
@@ -72,6 +74,12 @@ internal static class CommandDispatcher
           fmp pattern [options]     CUDA test pattern through the presentation ring to a window or offscreen (Phase 2)
           fmp decode <file> [options]
                                     Decode a video file with NVDEC into CUDA, convert it to RGB and check it (Phase 4)
+          fmp play <file> [options] Play a video file with frame generation in real time: decoded, interpolated (VFG,
+                                    blend or repeat) and presented, paced by the display-time scheduler (Phase 4)
+          fmp verify <file.csv> [--rate <hz>] [--warmup-s <s>] [--slots <a>-<b>]
+                                    Recompute a play run's verdict from its telemetry CSV alone (early, late, not shown,
+                                    untimed, wrong image, order, refreshes without a present) and compare it with the
+                                    live accounting in the CSV; exit 1 on any miss, unjudged slot or disagreement
           fmp --version
           fmp --help
 
@@ -207,6 +215,57 @@ internal static class CommandDispatcher
                                     non-increasing content times, FFmpeg frame-pool growth, a consumer-path allocation or a
                                     file that cannot be played; 69 without a GPU, the FFmpeg 9 libraries or (for --verify)
                                     the ffmpeg CLI.
+
+        play options:
+          --generator <name>        auto (VFG when the NVIDIA VFX SDK is found, else blend, saying why), vfg, blend,
+                                    repeat, or none (real frames only)                        (auto)
+          --quality <mode>          VFG quality: low, medium or high                          (medium)
+          --multiplier <n>          Cap on output frames per source frame, 1 to 8: a 60 fps file at 2 shows a new
+                                    image every refresh of a 120 Hz display and every other refresh of a 240 Hz one;
+                                    at 4 every refresh of the 240 Hz one                      (2)
+          --output-hz <hz>          The cap as an output rate instead: the cap is this over the file's frame rate
+          --loop                    Start the file again at its end (each lap is a discontinuity: never interpolated)
+          --duration-s <s>          Play this long (after the start-up), else to the end of the file
+          --frames <n>              Play this many output slots instead
+          --window <WxH>            Window size                                               (1280x720)
+          --fullscreen              Borderless fullscreen on the output the window is on (off by default)
+          --offscreen               No window: an offscreen target the file's size on a virtual clock (deterministic:
+                                    every slot decided exactly on time, the threads waiting for each other); for tests
+          --realtime                With --offscreen: the real clock instead (slots paced at --rate)
+          --rate <hz>               With --offscreen: the refresh rate the target stands for  (120)
+          --size <WxH>              With --offscreen: the target's size                       (the file's)
+          --validate                Vulkan validation layer with synchronization checks; any message fails the run
+          --csv <path>              Write the per-slot timeline (content time, decode available, decision, generation
+                                    start and end on the GPU, write signalled, present submitted, shown) as CSV
+          --settings <file>         Scheduler, display and generator settings (and generator.vfxSdkDirectory)
+          --vfx-sdk <dir>           The VFX SDK directory (else $FMP_VFX_SDK, --settings, lib/VideoFX of a checkout,
+                                    /usr/local/VideoFX)
+          --warmup-s <s>            Excluded from the statistics, allocation and GC counts    (2)
+          --present-lead-ms <ms>    The present lead to start from (how long before its refresh a slot's content must be
+                                    ready; windowed: 1.5 refreshes; offscreen: 0). It adapts: up a millisecond at once
+                                    when a frame decided too late misses the compositor's latch, slowly back down
+          --latch-ms <ms>           The least a present is assumed to need before its refresh (offscreen: how early a
+                                    slot is submitted; windowed: a floor under the adaptive lead)     (1)
+          --cuda-sync <mode>        How threads wait in CUDA synchronisations: blocking (sleep; VFG's blocking call
+                                    then costs about 0.06 instead of 0.35 ms of CPU per slot), spin, yield, auto (blocking)
+          --gate                    The Phase 4 gate: exactly VFG Medium at 2x, looped, 10 minutes (--duration-s may
+                                    shorten it), windowed; PASS with zero missed slots caused by the pipeline and zero gen0
+                                    collections in the measured window. A miss is the pipeline's unless the timestamps show
+                                    the present was handed over in time for its refresh (at least the measured deadline
+                                    before it) and the display showed it late; those, and misses while the output's rate
+                                    changed (the window moved), are counted apart
+                                    Prints what it resolved (file, generator and why, display, rates) and a summary: slots,
+                                    presents, missed slots and whose, output intervals from present feedback (first-pixel
+                                    times where the display reports them), generation time d, the delay to light (present
+                                    lead + D + the stride's rounding), per-thread CPU and allocations, GC counts, a verdict.
+                                    Exits 1 on a failure, a validation message, a hot-thread allocation, a run that measured
+                                    nothing or a failed gate; 69 without a GPU, FFmpeg 9, a display (windowed) or, for
+                                    --generator vfg, the VFX SDK. Ctrl+C, SIGTERM, closing the window or Escape stop it
+                                    cleanly with its summary, at any point of the start-up too. If GPU work never finishes,
+                                    it stops, reports what teardown left and ends the process.
+                                    Diagnostics: FMP_PLAY_WATCHDOG=1 prints where each pipeline thread is once a second;
+                                    FMP_PLAY_FAULT=gpu-wait@N (a GPU wait that never completes at the N-th generated frame)
+                                    or gpu-busy@N:S (S seconds of GPU work there) checks that the run still ends.
 
         Exit codes: 0 success, 1 check or validation failed, 2 usage error, 70 internal error; 69 when a GPU or display is required but not there.
 

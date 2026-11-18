@@ -21,6 +21,11 @@ public sealed class FrameScheduler
 {
     private const double RatioTolerance = 1e-6;
 
+    // Before the phase locks, the source-to-refresh ratio comes from the median interval, which timestamps rounded to a
+    // coarse time base bias: Matroska's whole milliseconds make a 60 fps file's median 17 ms, 2.04 refreshes of 120 Hz.
+    // The multiplier cap is applied with this slack, so 2.04 at a cap of 2 is still a stride of 1, not 2 (no generation).
+    private const double MultiplierSlack = 0.03;
+
     // Grid instants are floored to whole nanoseconds, so slot offsets that are exact multiples of the refresh
     // period can come out a nanosecond short; quantisation and its hold use this one tolerance everywhere.
     private const long QuantisationToleranceNs = 1_000;
@@ -53,6 +58,7 @@ public sealed class FrameScheduler
 
     private long _lastContentNs = long.MinValue;
     private bool _started;
+    private bool _shownFirst;
     private bool _pacingInitialized;
 
     private int _stride = 1;
@@ -390,6 +396,13 @@ public sealed class FrameScheduler
         _cursor = seqN;
         ref readonly var n = ref _timeline[seqN];
         var hasNext = seqN < _timeline.LastSequence && _timeline[seqN + 1].ArrivalTimeNs <= now;
+        if (!_shownFirst)
+        {
+            // The first image of a playback is the real frame due at τ, never one generated between it and the next (τ
+            // can land anywhere in the first interval: the content clock and the refreshes are not locked yet).
+            _shownFirst = true;
+            return EmitReal(v, tau, now, d, n.FrameId, n.ContentTimeNs, SlotReason.None, skipped);
+        }
 
         if (!hasNext)
         {
@@ -841,7 +854,7 @@ public sealed class FrameScheduler
         else
         {
             var ratio = nominal / p;
-            var fMin = Math.Max(1, CeilToInt(ratio / _maxMultiplier));
+            var fMin = Math.Max(1, CeilToInt((ratio / _maxMultiplier) - MultiplierSlack));
             fStrict = Math.Max(fMin, CeilToInt(leadGen / p));
             fRelax = Math.Max(fMin, CeilToInt(leadGen / (p * (1.0 - _fallbackHeadroom))));
             coverSlots = 0;

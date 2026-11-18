@@ -442,8 +442,7 @@ public sealed class CudaVulkanBridge : IGpuBridge
         return new PresentRequest
         {
             SlotIndex = slotIndex,
-            Frame = slot.ConsumerView,
-            Ready = slot.ConsumerWait,
+            Frame = slot.ConsumerView, // its Ready is ConsumerWait, the written point the present pass waits on
             TargetTimeNs = targetTimeNs,
         };
     }

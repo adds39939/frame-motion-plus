@@ -28,7 +28,13 @@ Results and the answers that shape the Phase 4 pipeline: [`docs/benchmarks/phase
 Phase 4a (decode) adds `FrameMotionPlus.Sources.File`: FFmpeg demux and NVDEC decode through FFmpeg's CUDA hwaccel
 in the application's CUDA context, the NV12/P010-to-RGB convert kernel, the frame history, and `fmp decode`, which
 checks a file against a software decode. Results: [`docs/benchmarks/phase4a-decode.md`](docs/benchmarks/phase4a-decode.md).
-The playback pipeline (`fmp play`) is Phase 4b.
+
+Phase 4b (pipeline) adds `FrameMotionPlus.Pipeline`, which joins everything: the file source, the scheduler, the
+generator (VFG, blend or repeat) on a thread of its own, the presentation ring and the presenter, on dedicated
+threads, and `fmp play`, which plays a file with frame generation in real time (first light, the design doc's
+milestone 1). Results, the threading and time model, and the frame-timing issues carried to Phase 6 (the 10-minute
+gate has not been verified on the current code):
+[`docs/benchmarks/phase4b-pipeline.md`](docs/benchmarks/phase4b-pipeline.md). The HUD and the quality harness are 4c.
 
 ## Layout
 
@@ -41,6 +47,7 @@ src/FrameMotionPlus.Vulkan/       device selection, exportable presentation ring
 src/FrameMotionPlus.CudaVulkan/   the IGpuBridge: the presenter's ring and timelines imported into CUDA (Linux, opaque FDs)
 src/FrameMotionPlus.Vfx/          NVIDIA VFX SDK bindings and loading, VfgGenerator (Video Frame Generation, CUDA domain)
 src/FrameMotionPlus.Sources.File/ FFmpeg 9 bindings, NVDEC decode into CUDA, the file IFrameSource and its frame history
+src/FrameMotionPlus.Pipeline/     playback: source → scheduler → generator → ring → presenter on dedicated threads, telemetry
 native/kernels/, native/shaders/  CUDA kernel and shader sources with the generated PTX and SPIR-V checked in
 tests/FrameMotionPlus.Core.Tests/ xUnit v3 tests of the core and the CLI (always run)
 tests/FrameMotionPlus.Platform.Tests/ tests of the platform layer and `fmp bench jitter` (Linux-specific ones skip elsewhere)
@@ -49,12 +56,14 @@ tests/FrameMotionPlus.Vulkan.Tests/ ring, presenter, offscreen and windowed pres
 tests/FrameMotionPlus.Gpu.Tests/    CUDA/Vulkan interop end to end and `fmp pattern` (Gpu, Display)
 tests/FrameMotionPlus.Vfx.Tests/    SDK loading, VfgGenerator, measured SDK behaviour, the VFG commands (Vfx)
 tests/FrameMotionPlus.Sources.File.Tests/ FFmpeg layouts, the convert kernel, decode against software, `fmp decode` (Media)
+tests/FrameMotionPlus.Pipeline.Tests/ the whole path checked frame by frame offscreen, faults, allocations, windowed runs, `fmp play`
 ```
 
 Hardware tests carry the category `Gpu` (NVIDIA GPU, CUDA driver, Vulkan with the validation layer),
 `Display` (a Wayland session and SDL3 as well), `Vfx` (the NVIDIA VFX SDK as well) or `Media` (FFmpeg 9's
 shared libraries and the `ffmpeg` CLI, which makes the test clips at test time) and skip, never fail, when
-that is missing, so hosted CI stays green. Vulkan tests run under the validation layer and
+that is missing, so hosted CI stays green. The pipeline tests need all of a GPU, FFmpeg 9 and the `ffmpeg` CLI
+(category `Gpu`), and a display or the SDK for some. Vulkan tests run under the validation layer and
 fail on any message.
 
 ## The NVIDIA VFX SDK
@@ -191,6 +200,38 @@ fmp decode clip.mkv --verify                # every frame bit-exact against the 
 fmp decode clip.mkv --loop --frames 3000 --csv decode.csv
 fmp decode clip.h264 --loop --verify        # an elementary stream loops too (from its first byte)
 ```
+
+## Playing a file
+
+`fmp play <file>` plays a video file with frame generation: decoded ahead (FFmpeg/NVDEC), each output slot
+decided by the display-time scheduler (a real frame, a generated one at timestep t, or the last image again),
+generated frames made by VFG (the default when the VFX SDK is found; otherwise blend, saying why) straight into the
+presentation ring, and shown one per refresh in a window (FIFO, at most two presents in flight, paced from present
+feedback: first-pixel times where the display reports them). The present lead (how long before its refresh a slot's
+content must be ready) starts at 1.5 refreshes and adapts to the compositor's latch. At the end it prints a summary:
+slots, presents, every missed slot with its time and whose it was (the pipeline's unless the timestamps show the present
+was handed over in time and the display showed it late; misses while the output's rate changes are counted apart),
+output intervals from present feedback, the generation time d, the delay to light (lead + D + the stride's rounding),
+per-thread CPU and allocations, GC counts and a verdict.
+
+```sh
+# a test clip: 60 s of ffmpeg's moving test picture at 1440p60
+ffmpeg -f lavfi -i "testsrc2=size=2560x1440:rate=60,trim=duration=60" -c:v libx264 -preset veryfast \
+  -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709 clip-1440p60.mp4
+fmp play clip-1440p60.mp4 --loop                       # VFG Medium, 2x (60 → 120 output), window 1280x720
+fmp play clip-1440p60.mp4 --loop --multiplier 4        # 4x where the display allows (every refresh at 240 Hz)
+fmp play clip-1440p60.mp4 --generator blend --csv play.csv   # blend, per-slot timeline as CSV
+fmp play clip-1440p60.mp4 --fullscreen                 # borderless fullscreen on the window's output
+fmp play clip-1440p60.mp4 --gate                       # the Phase 4 gate: 10 minutes VFG Medium 2x, no miss of the pipeline's
+fmp play clip.mkv --offscreen --generator blend --duration-s 5   # no window: offscreen on a virtual clock
+fmp verify play.csv                                    # recompute a run's verdict from its telemetry CSV alone
+```
+
+A 60 fps file at `--multiplier 2` shows a new image every refresh of a 120 Hz display and every other refresh of a
+240 Hz one (each image then shows for two refreshes); `--multiplier 4` gives every refresh at 240 Hz. Window close,
+Escape, Ctrl+C and SIGTERM stop it cleanly with its summary, during the start-up too; if GPU work never finishes, it
+stops, says what its teardown had to leave and ends the process. A published binary outside a checkout does not find
+the VFX SDK in `lib/VideoFX`: set `$FMP_VFX_SDK` (or `--vfx-sdk`). See `fmp --help` for every option.
 
 ## Benchmarking VFG
 
