@@ -1,3 +1,4 @@
+using System.Globalization;
 using FrameMotionPlus.Pipeline.Tests.Support;
 
 namespace FrameMotionPlus.Pipeline.Tests;
@@ -80,33 +81,102 @@ public class WindowedTests
     /// <summary>
     /// The same short lead to start from, adaptive: the first frames whose content misses the latch raise the lead a step
     /// each, at once, and the misses stop; none of the pipeline's in the second half of the run (with the lead fixed they go
-    /// on for as long as it runs).
+    /// on for as long as it runs). On a desktop where the compositor itself skips refreshes (seen: KWin missing one refresh
+    /// every second on DP-3 with a browser open, presents handed over 7.8 ms ahead shown a refresh late too), a skipped
+    /// refresh close to another can still count as the pipeline's by the conservative rule. So a pipeline-attributed miss in
+    /// the second half is excused only when its own timestamps clear it: handed over at least 1 ms before presents that
+    /// made their refresh (the latch's upper bound from this run's on-time shows), or within four refreshes of a miss the
+    /// display is proven to own. If every one is excused, the run skips as "environment"; any other fails it. The lead logic
+    /// itself is tested against a simulated compositor
+    /// (<c>SimulatedDisplayTests.A_short_starting_lead_rises_past_the_latch_and_the_misses_stop</c>).
     /// </summary>
     [Fact]
     public void A_short_starting_lead_adapts_and_the_misses_stop()
     {
         var cuda = Hardware.RequireDisplay();
-        var report = Run(cuda, GeneratorKind.Blend, 1_500_000, adaptive: true, 5_000_000_000, 300_000_000);
-        var s = report.Statistics;
-        var half = s.LastMeasuredNs > s.FirstMeasuredNs ? (s.LastMeasuredNs - s.FirstMeasuredNs) / 2 : 0;
-        var late = 0;
-        foreach (var m in s.MissEvents)
+        var csv = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"fmp-short-lead-{Environment.ProcessId}-{Environment.TickCount64}.csv");
+        try
         {
-            if (m.Kind is MissKind.LatePresent or MissKind.Dropped && m.AtNs > half + 300_000_000)
+            var report = Run(cuda, GeneratorKind.Blend, 1_500_000, adaptive: true, 5_000_000_000, 300_000_000, csvPath: csv);
+            var s = report.Statistics;
+            var half = s.LastMeasuredNs > s.FirstMeasuredNs ? (s.LastMeasuredNs - s.FirstMeasuredNs) / 2 : 0;
+            var judgedFrom = half + 300_000_000;
+            var period = report.DisplayRate.IsValid ? (long)report.DisplayRate.PeriodNs : 0;
+
+            // The live misses and the CSV's missed slots are the same set, in the same order: pair them, and read each
+            // miss's hand-over lead (refresh − the later of submission and content written) from its slot.
+            var rows = ShortLeadRow.Read(csv);
+            var missedRows = rows.Where(r => r.Missed).OrderBy(r => r.TargetNs).ToList();
+            var events = s.MissEvents.ToArray().OrderBy(m => m.AtNs).ToList();
+            var paired = missedRows.Count == events.Count;
+            var latchUpper = rows.Where(r => !r.Missed && r.ActualNs > 0 && r.SubmitNs > 0).Select(r => r.HandoverLeadNs).Order().ToList() is { Count: > 0 } ok
+                ? ok[ok.Count / 20]
+                : long.MaxValue;
+            var display = events.Where(m => m.Kind is MissKind.DisplayLate or MissKind.Discarded or MissKind.CatchUp).Select(m => m.AtNs).ToList();
+            var pipeline = 0;
+            var excused = 0;
+            for (var i = 0; i < events.Count; i++)
             {
-                late++;
+                var m = events[i];
+                if (m.AtNs <= judgedFrom || m.Kind is not (MissKind.LatePresent or MissKind.Dropped or MissKind.NotShown or MissKind.SkippedVblank or MissKind.Early))
+                {
+                    continue;
+                }
+
+                pipeline++;
+                var aheadOfLatch = paired && missedRows[i].HandoverLeadNs >= latchUpper + 1_000_000;
+                var nearDisplay = period > 0 && display.Any(t => Math.Abs(t - m.AtNs) <= 4 * period);
+                excused += aheadOfLatch || nearDisplay ? 1 : 0;
             }
-        }
 
-        Log.WriteLine($"{Playback.Describe(report)}; lead raised {report.LeadRaises}x to {report.FinalLeadNs / 1e6:0.000} ms; pipeline misses in the second half {late}");
-        RequireFixedGrid(report);
-        if (report.LeadRaises == 0 && s.TotalMisses == 0)
+            Log.WriteLine($"{Playback.Describe(report)}; lead raised {report.LeadRaises}x to {report.FinalLeadNs / 1e6:0.000} ms; latch at most {latchUpper / 1e6:0.000} ms " +
+                          $"(on-time hand-overs, p5); second half: pipeline misses {pipeline}, of them cleared by their timestamps {excused}; misses paired with slots {paired}");
+            RequireFixedGrid(report);
+            if (report.LeadRaises == 0 && s.TotalMisses == 0)
+            {
+                Assert.Skip("this compositor took presents handed over 1.5 ms before their refresh: nothing to adapt to");
+            }
+
+            Assert.True(report.LeadRaises >= 1, "the lead never adapted");
+            if (pipeline > 0 && excused == pipeline)
+            {
+                Assert.Skip($"the compositor skipped refreshes in the second half: all {pipeline} misses counted as the pipeline's were handed over well before the latch or next to a miss of the display's: environment");
+            }
+
+            Assert.True(pipeline == 0, $"{pipeline} misses of the pipeline's in the second half, {pipeline - excused} not cleared by their timestamps");
+        }
+        finally
         {
-            Assert.Skip("this compositor took presents handed over 1.5 ms before their refresh: nothing to adapt to");
+            File.Delete(csv);
         }
+    }
 
-        Assert.True(report.LeadRaises >= 1, "the lead never adapted");
-        Assert.Equal(0, late);
+    /// <summary>One slot of the telemetry CSV, as much as the short-lead test needs.</summary>
+    private sealed record ShortLeadRow(long TargetNs, long ActualNs, long SubmitNs, long ReadyNs, bool Missed)
+    {
+        public long HandoverLeadNs => TargetNs - Math.Max(SubmitNs, ReadyNs);
+
+        public static List<ShortLeadRow> Read(string path)
+        {
+            var lines = File.ReadAllLines(path);
+            var head = lines[0].Split(',');
+            int Col(string name) => Array.IndexOf(head, name);
+            int slot = Col("slot"), target = Col("target_display_ns"), actual = Col("actual_display_ns"), submit = Col("present_submit_ns"), ready = Col("generation_end_ns"), missed = Col("missed");
+            var rows = new List<ShortLeadRow>();
+            foreach (var line in lines.Skip(1))
+            {
+                var f = line.Split(',');
+                if (long.Parse(f[slot], CultureInfo.InvariantCulture) < 0)
+                {
+                    continue;
+                }
+
+                rows.Add(new ShortLeadRow(long.Parse(f[target], CultureInfo.InvariantCulture), long.Parse(f[actual], CultureInfo.InvariantCulture),
+                    long.Parse(f[submit], CultureInfo.InvariantCulture), long.Parse(f[ready], CultureInfo.InvariantCulture), f[missed] == "1"));
+            }
+
+            return rows;
+        }
     }
 
     private static PlaybackReport Windowed(Cuda.CudaContext cuda, GeneratorKind generator)
@@ -171,7 +241,7 @@ public class WindowedTests
         }
     }
 
-    private static PlaybackReport Run(Cuda.CudaContext cuda, GeneratorKind generator, long leadNs, bool adaptive, long durationNs, long warmupNs, string clip = "c60-long")
+    private static PlaybackReport Run(Cuda.CudaContext cuda, GeneratorKind generator, long leadNs, bool adaptive, long durationNs, long warmupNs, string clip = "c60-long", string? csvPath = null)
     {
         var options = new PlaybackOptions
         {
@@ -189,9 +259,9 @@ public class WindowedTests
             AdaptiveLead = adaptive,
 
             // FMP_TEST_CSV_DIR=<dir> keeps each run's telemetry (for fmp verify) when a run needs a closer look.
-            CsvPath = Environment.GetEnvironmentVariable("FMP_TEST_CSV_DIR") is { Length: > 0 } dir
+            CsvPath = csvPath ?? (Environment.GetEnvironmentVariable("FMP_TEST_CSV_DIR") is { Length: > 0 } dir
                 ? System.IO.Path.Combine(dir, $"{TestContext.Current.Test?.TestDisplayName.Replace(' ', '_').Replace('"', '_') ?? clip}-{Environment.TickCount64}.csv")
-                : null,
+                : null),
         };
         try
         {

@@ -443,9 +443,12 @@ public sealed class FrameScheduler
         if (_stride > 1)
         {
             // Fallback: quantise content time to a grid of Stride vblanks measured from frame N, so generations
-            // are at least Stride slots apart. The hold and NeedsNextFrame use the same threshold.
+            // are at least Stride slots apart. The hold and NeedsNextFrame use the same threshold. A slot within the snap
+            // before a bucket's start belongs to that bucket, as a slot within the snap before frame N+1 shows N+1: with
+            // the 1 µs grid tolerance alone, a phase-locked source whose alignment left τ a few microseconds before each
+            // real frame (60 fps on 240.016 Hz) showed every real frame and generated frame a whole refresh late.
             var bucket = _stride * _periodNs;
-            contentOffset = (long)Math.Round(Math.Floor((offset + QuantisationToleranceNs) / bucket) * bucket);
+            contentOffset = (long)Math.Round(Math.Floor((offset + StrideToleranceNs(interval)) / bucket) * bucket);
         }
 
         if (contentOffset <= snap)
@@ -720,8 +723,13 @@ public sealed class FrameScheduler
             return gap >= _intervalNs - SnapNs(_intervalNs);
         }
 
-        return _stride <= 1 || gap + QuantisationToleranceNs >= _stride * _periodNs;
+        return _stride <= 1 || gap + StrideToleranceNs(_intervalNs) >= _stride * _periodNs;
     }
+
+    /// <summary>How far before a stride bucket's start a slot still counts as in it: phase-locked, the snap to real frames
+    /// (the alignment keeps τ within its hysteresis of a real frame, either side); not locked, the grid's nanosecond
+    /// tolerance (τ drifts through every offset anyway, and a wider bucket would only make the hold longer).</summary>
+    private long StrideToleranceNs(long intervalNs) => _phase.IsCoherent ? Math.Max(QuantisationToleranceNs, SnapNs(intervalNs)) : QuantisationToleranceNs;
 
     /// <summary>Distance from a real frame within which it is shown instead of a generated frame.</summary>
     private long SnapNs(long intervalNs) => Math.Max((long)(_epsilon * intervalNs), _coherentSnapNs);
@@ -905,7 +913,7 @@ public sealed class FrameScheduler
         }
 
         return _stride > 1
-            ? Math.Max(0, _holdIntervalNs - (_stride * p) + QuantisationToleranceNs)
+            ? Math.Max(0, _holdIntervalNs - (_stride * p) + StrideToleranceNs(_holdIntervalNs))
             : (1.0 - _epsilon) * _holdIntervalNs;
     }
 

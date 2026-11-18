@@ -421,6 +421,25 @@ step reviewed in one go costs more rounds than several small ones:
   at most two swapchain images in flight; multiplier fallback when VFG cannot keep up.
 - **Automated gate:** 30 to 120 and 40 to 120 with output interval standard deviation under 0.5 ms from
   present feedback; 59.94 source on 120 Hz with no periodic judder signature over 10 minutes.
+- **Outcome of this phase (2026-11-18, `docs/benchmarks/phase6-pacing.md`):**
+  - Variable refresh works for fullscreen windows on both outputs and is chosen automatically
+    (`--clock auto`); `fmp capture` opens fullscreen by default. On the 119.88 Hz output a 60 fps
+    source doubled exceeds the ceiling, so that case stays on fixed refresh.
+  - A real frame is shown after its capture timestamp: 4K HDR 30 to 60, 63 ms before, 54 ms
+    windowed (fixed refresh), 47 ms fullscreen (variable refresh); 1440p with 30 fps content, 51 ms
+    before, 39 ms windowed, 32 ms fullscreen. In 4K what remains is card-to-PC delivery (27 ms) and
+    the hold and generation (19 ms).
+  - 10-minute gate runs, judged by the live counters and `fmp verify` in agreement: 240 Hz output
+    0 missed of 143,533; 120 Hz output 4 missed of 71,688 in one host stall. 3x and 4x run with no
+    misses.
+  - Not done: the Phase 1 scheduler tuning backlog below; zero-miss pacing; and the items in that
+    document's "Known issues / not done".
+- **Owner's tolerance and manual check (2026-11-18):** after playing a game through `fmp capture`
+  ("incredible"; an earlier variable-refresh run was "fantastic - smooth 60fps and the latency was
+  great"): "it's to be expected we're going to miss a handful of frames - 4 in 72,000 is acceptable
+  for now, we can focus on perfecting it in a later phase ... let's not get lost in perfection yet".
+  So a handful of missed slots in a 10-minute run does not hold this phase; exact pacing is to be
+  perfected later (see "Deferred").
 - **Found in Phase 2 on this machine's Wayland surface:** `VK_EXT_present_timing` is supported for
   feedback, but its present-at-absolute-time and present-at-relative-time capabilities are both
   false, so target times cannot be requested there. Plan on feedback plus the fallback path
@@ -567,4 +586,7 @@ Things the design doc includes that are deliberately not being built yet.
   originals with PSNR/SSIM). Deferred on 2026-11-18 to start the capture card first. `fmp play`
   prints these figures at the end of a run and writes per-frame telemetry to CSV; `fmp bench
   vfg-quality` already scores VFG against known intermediates on synthetic and graded content.
+- **Perfecting frame pacing.** Zero missed slots over 10 minutes on every output and in every mode
+  (the design doc's gate as written), and whatever `docs/benchmarks/phase6-pacing.md` lists as not
+  done. Accepted for now by the owner at "a handful" per run.
 

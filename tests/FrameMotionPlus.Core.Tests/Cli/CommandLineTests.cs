@@ -98,6 +98,21 @@ public sealed class CommandLineTests : IDisposable
         Assert.Contains("needs a value", error, StringComparison.Ordinal);
     }
 
+    /// <summary>Phase 6's options: the slot clock of play and capture, and the present probe's test and present mode.</summary>
+    [Theory]
+    [InlineData("Option '--clock' expects auto, fixed or vrr, got 'free'.", "play", "clip.mp4", "--clock", "free", "--duration-s", "1")]
+    [InlineData("Option '--clock' expects auto, fixed or vrr, got 'free'.", "capture", "--clock", "free", "--windowed", "--duration-s", "1")]
+    [InlineData("Unknown --test 'jitter' (latch, vrr, cadence).", "bench", "present", "--test", "jitter")]
+    [InlineData("Unknown --mode 'relaxed' (fifo, fifo-latest-ready, mailbox, immediate).", "bench", "present", "--mode", "relaxed")]
+    [InlineData("Unknown option '--rate' for 'fmp bench present'.", "bench", "present", "--rate", "60")]
+    public void An_unknown_clock_or_probe_choice_is_a_usage_error(string message, params string[] args)
+    {
+        var (exit, _, error) = Run(args);
+
+        Assert.Equal(CommandDispatcher.ExitUsage, exit);
+        Assert.Contains(message, error, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void A_missing_settings_file_is_a_usage_error()
     {

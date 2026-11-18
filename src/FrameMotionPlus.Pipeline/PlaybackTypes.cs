@@ -60,6 +60,12 @@ public sealed class PlaybackHooks
 
     /// <summary>Copy every presented frame to host memory (offscreen), so <see cref="OnPresented"/> can read it back.</summary>
     public bool OffscreenReadback { get; init; }
+
+    /// <summary>
+    /// Tests: an offscreen session on the real clock presents as a window does, to this model of a compositor's FIFO (its
+    /// latch, missed refreshes, discards), which reports the first-pixel times.
+    /// </summary>
+    internal SimulatedCompositor? SimulatedDisplay { get; init; }
 }
 
 /// <summary>What a session's source delivers (a file or a capture), in the terms every source shares.</summary>
@@ -239,6 +245,31 @@ public sealed class PlaybackReport
     public long PresentRefusals { get; set; }
 
     public long LateShows { get; set; }
+
+    /// <summary>How a file's clock was stretched to lock to the display (1: not).</summary>
+    public double Resample { get; set; } = 1.0;
+
+    /// <summary>The clock mode the run used: fixed refresh, or variable refresh.</summary>
+    public RefreshMode RefreshModeUsed { get; set; } = RefreshMode.Fixed;
+
+    /// <summary>The variable-refresh probe before playback (fullscreen, or --clock vrr); null when not run.</summary>
+    public VrrProbeResult? VrrProbe { get; set; }
+
+    /// <summary>Auto chose fixed refresh although the display follows the presents: the output rate the source would have
+    /// needed at the multiplier (fps; 0 when that was not why).</summary>
+    public double VrrTooFast { get; set; }
+
+    /// <summary>The compositor's latch measured before playback (windowed, adaptive lead), and the lead it gave; null when not run.</summary>
+    public LatchSweepResult? LatchSweep { get; set; }
+
+    /// <summary>Every change of the present lead in the run: when (ns, CLOCK_MONOTONIC), to what, why.</summary>
+    public List<(long AtNs, long LeadNs, LeadChange Why)> LeadChanges { get; } = [];
+
+    /// <summary>Late shows after which the compositor gave the refresh back itself (it discarded a queued present).</summary>
+    public long CompositorCatchUps { get; set; }
+
+    /// <summary>Late shows after which the present thread gave refreshes back (the compositor did not).</summary>
+    public long OwnCatchUps { get; set; }
 
     public long MaxPresentsInFlight { get; set; }
 

@@ -142,7 +142,9 @@ public sealed class VerificationResult
 /// </summary>
 public static class TelemetryVerifier
 {
-    public static VerificationResult Verify(IReadOnlyList<VerifierRow> rows, long periodNs, long fromNs = long.MinValue, long toNs = long.MaxValue)
+    /// <param name="vrr">Variable refresh: slots are not on a refresh grid, so a refresh without a slot or without a new
+    /// present is no finding; every other definition holds, with half the shortest refresh period as the tolerance.</param>
+    public static VerificationResult Verify(IReadOnlyList<VerifierRow> rows, long periodNs, long fromNs = long.MinValue, long toNs = long.MaxValue, bool vrr = false)
     {
         var result = new VerificationResult();
         var half = periodNs / 2;
@@ -180,6 +182,7 @@ public static class TelemetryVerifier
         }
 
         var verdict = new Dictionary<long, VerifierFinding>();
+        var outside = new List<long>(); // targets of missed slots outside the judged window (they explain refreshes inside it)
         var lastScheduledImage = -1L;
         foreach (var s in slots)
         {
@@ -191,6 +194,11 @@ public static class TelemetryVerifier
 
             if (s.TargetNs < fromNs || s.TargetNs > toNs)
             {
+                if (s.TargetNs <= toNs && s.ActualNs > 0 && Math.Abs(s.ActualNs - s.TargetNs) > half)
+                {
+                    outside.Add(s.TargetNs);
+                }
+
                 continue;
             }
 
@@ -236,7 +244,7 @@ public static class TelemetryVerifier
         }
 
         // Every refresh has a slot: a hole of k refreshes between consecutive slots is flagged on the later one.
-        for (var i = 1; i < slots.Count; i++)
+        for (var i = 1; i < slots.Count && !vrr; i++)
         {
             if (slots[i].TargetNs - slots[i - 1].TargetNs >= periodNs + half && slots[i].TargetNs >= fromNs && slots[i].TargetNs <= toNs)
             {
@@ -262,11 +270,11 @@ public static class TelemetryVerifier
         }
 
         // Targets of the missed slots, for explaining the refreshes without a new present.
-        var missedTargets = verdict.Where(kv => IsMiss(kv.Value)).Select(kv => slotTarget[kv.Key]).Order().ToArray();
+        var missedTargets = verdict.Where(kv => IsMiss(kv.Value)).Select(kv => slotTarget[kv.Key]).Concat(outside).Order().ToArray();
 
         // Refreshes without a new present: between consecutive timed shows, those the presents without a time submitted in
         // between (shown in between, if at all: one present per refresh, in order) cannot account for.
-        for (var i = 1; i < shows.Count; i++)
+        for (var i = 1; i < shows.Count && !vrr; i++)
         {
             var a = shows[i - 1].ActualNs;
             var b = shows[i].ActualNs;

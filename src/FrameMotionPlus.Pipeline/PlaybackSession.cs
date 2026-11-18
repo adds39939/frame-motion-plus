@@ -234,13 +234,25 @@ public sealed class PlaybackSession : IDisposable
         }
         else
         {
-            _target = new OffscreenTarget(_device, new OffscreenTargetOptions
+            var offscreen = new OffscreenTarget(_device, new OffscreenTargetOptions
             {
                 Width = _o.OffscreenWidth > 0 ? _o.OffscreenWidth : width,
                 Height = _o.OffscreenHeight > 0 ? _o.OffscreenHeight : height,
                 Readback = _hooks.OffscreenReadback,
-                RefreshRate = _o.OffscreenRate,
+                RefreshRate = _hooks.SimulatedDisplay?.Rate ?? _o.OffscreenRate,
             });
+            _target = offscreen;
+            if (_hooks.SimulatedDisplay is { } simulated)
+            {
+                if (_o.Clock != PlaybackClock.Real)
+                {
+                    throw new ArgumentException("A simulated display runs on the real clock.");
+                }
+
+                offscreen.PresentTimeSource = simulated.TimeOf;
+                offscreen.PresentSubmitted = simulated.OnSubmit;
+                offscreen.CompletesOnReport = true;
+            }
         }
 
         _presenter = new VulkanPresenter(_device, _target, new VulkanPresenterOptions { MeasureGpuTime = true });
@@ -317,9 +329,9 @@ public sealed class PlaybackSession : IDisposable
         _writer = new RingWriter(_cuda, _generatorStream, _generator, format, RingWriterQueue, records) { BeforeJob = _hooks.BeforeWrite };
         _presentLoop = new PresentLoop(
             _presenter,
-            _o.Display,
+            WindowTiming ? DisplayKind.Window : _o.Display,
             _o.Clock,
-            _o.Display == DisplayKind.Window ? _presenter.Timing.RefreshRate : _o.OffscreenRate,
+            WindowTiming ? _presenter.Timing.RefreshRate : _o.OffscreenRate,
             _o.LatchLeadNs,
             _o.StallTimeoutNs,
             PresentQueue,
@@ -463,6 +475,7 @@ public sealed class PlaybackSession : IDisposable
 
             PreRoll(report);
             var (scheduler, startNs) = CreateScheduler(report);
+            collector.Vrr = _vrr;
 
             // The verifier's rows, sized before playback (one per slot and filler; 30 minutes when the run has no limit).
             var seconds = _o.DurationNs > 0 ? _o.DurationNs / 1e9 : 1800;
@@ -488,7 +501,8 @@ public sealed class PlaybackSession : IDisposable
                 _o.WarmupNs,
                 _presentLeadNs,
                 _startupFrames,
-                StartLead(report.DisplayRate))
+                StartLead(report.DisplayRate),
+                report.Resample = ResampleFor(report.DisplayRate))
             {
                 OnTurn = _hooks.PacingTurn,
                 OtherMeters = [_writer.Meter, _presentLoop.Meter],
@@ -507,6 +521,20 @@ public sealed class PlaybackSession : IDisposable
         }
         finally
         {
+            // The desktop back at once, before the joins: with GPU work stuck they take up to the stall timeout, and a
+            // fullscreen window would cover the output all that while. Minimised, a window keeps taking presents.
+            if (_window is not null && _window.IsFullscreen)
+            {
+                try
+                {
+                    _window.Minimize();
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    report.TeardownErrors.Add(e);
+                }
+            }
+
             StopThreads(report, pacingThread, writerThread, presentThread);
             if (_pacing is not null && _writer is not null && _presentLoop is not null)
             {
@@ -539,13 +567,17 @@ public sealed class PlaybackSession : IDisposable
     /// known), let the present thread learn the refresh grid from feedback, run every per-frame path once on every thread
     /// (no first-use work in the measured window) and start the GPU clock. Bounded.
     /// </summary>
+    /// <summary>Presented as a window is (refresh grid, present lead, verifier): a window, or a simulated display in a test.</summary>
+    private bool WindowTiming => _o.Display == DisplayKind.Window || _hooks.SimulatedDisplay is not null;
+
     private void PreRoll(PlaybackReport report)
     {
-        var window = _o.Display == DisplayKind.Window;
+        var window = WindowTiming;
         var giveUp = Monotonic.NowNs + (3 * Nanoseconds.PerSecond);
         var frames = 0L;
         var presentLoop = _presentLoop!;
         var bridge = _bridge!;
+        var fullscreenAt = long.MinValue;
         while (true)
         {
             PumpWindow();
@@ -554,7 +586,18 @@ public sealed class PlaybackSession : IDisposable
                 break;
             }
 
-            var done = window ? presentLoop.GridReady && frames >= 24 : frames >= 6;
+            // Fullscreen before playback (once the window is on an output and its grid known), so the clock mode can be
+            // chosen from what the display then does; the pre-roll goes on for a while there.
+            if (_o.Fullscreen && _window is not null && fullscreenAt == long.MinValue && presentLoop.GridReady && _presenter!.IsTimingKnown)
+            {
+                _ = _window.SetFullscreen(true);
+                fullscreenAt = Monotonic.NowNs;
+                _fullscreenDone = true;
+                giveUp = Math.Max(giveUp, fullscreenAt + (2 * Nanoseconds.PerSecond));
+            }
+
+            var settled = !_o.Fullscreen || _window is null || (fullscreenAt != long.MinValue && Monotonic.NowNs - fullscreenAt > 800 * Nanoseconds.PerMillisecond);
+            var done = window ? presentLoop.GridReady && frames >= 24 && settled : frames >= 6;
             if (done || Monotonic.NowNs > giveUp)
             {
                 break;
@@ -604,8 +647,116 @@ public sealed class PlaybackSession : IDisposable
             }
         }
 
+        // The clock mode: variable refresh where asked for, or (auto) where the display follows the presents, which KWin's
+        // "automatic" VRR does for a fullscreen window only.
+        var probeVrr = window && _o.Clock == PlaybackClock.Real && _hooks.SimulatedDisplay is null && _stopReason == (int)StopReason.None
+            && (_o.Refresh == RefreshMode.Vrr || (_o.Refresh == RefreshMode.Auto && _fullscreenDone));
+        if (_hooks.SimulatedDisplay is { Vrr: true } simulated && _o.Refresh == RefreshMode.Vrr)
+        {
+            presentLoop.EnterVrr(simulated.VrrDelayNs);
+            var entered = Monotonic.NowNs + (100 * Nanoseconds.PerMillisecond);
+            while ((!presentLoop.IsVrr || presentLoop.Grid.LeadNs != presentLoop.LeadNs) && Monotonic.NowNs < entered)
+            {
+                Thread.Sleep(1);
+            }
+
+            _vrr = true;
+        }
+        else if (probeVrr)
+        {
+            presentLoop.RequestVrrProbe(VrrProbeNs);
+            var probeBy = Monotonic.NowNs + VrrProbeNs + Nanoseconds.PerSecond;
+            while (!presentLoop.VrrProbeDone && Monotonic.NowNs < probeBy && _stopReason == (int)StopReason.None)
+            {
+                PumpWindow();
+                Thread.Sleep(2);
+            }
+
+            report.VrrProbe = presentLoop.VrrProbe;
+
+            // Auto: not when the output's highest rate is below what the source needs at the multiplier (60 fps at 2x is
+            // 120.00 fps; HDMI-A-1 here stops at 119.88 Hz): the slots would queue behind the refreshes and every few
+            // seconds one would have to go. Fixed refresh plays it smoothly there.
+            var rate = _presenter!.Timing.RefreshRate;
+            var multiplier = _generator is null ? 1
+                : _o.OutputHz is { } hz && _source is { NominalRate.IsValid: true } s0 ? Math.Clamp((int)Math.Round(hz / s0.NominalRate.Hz), 1, 8)
+                : Math.Max(1, _o.Multiplier);
+            var needed = _source is { NominalRate.IsValid: true } src ? src.NominalRate.Hz * multiplier : 0;
+            var fits = VrrFits(needed, rate);
+            report.VrrTooFast = presentLoop.VrrProbe is { Active: true } && !fits ? needed : 0;
+            if (_o.Refresh == RefreshMode.Vrr || (presentLoop.VrrProbe is { Active: true } && fits))
+            {
+                var delay = presentLoop.VrrProbe is { DelayP50Ns: > 0 } probe ? probe.DelayP50Ns : 750 * Nanoseconds.PerMicrosecond;
+                presentLoop.EnterVrr(delay);
+                var entered = Monotonic.NowNs + (100 * Nanoseconds.PerMillisecond);
+                while ((!presentLoop.IsVrr || presentLoop.Grid.LeadNs != presentLoop.LeadNs) && Monotonic.NowNs < entered)
+                {
+                    Thread.Sleep(1);
+                }
+
+                _vrr = true;
+            }
+        }
+
+        report.RefreshModeUsed = _vrr ? RefreshMode.Vrr : RefreshMode.Fixed;
+        if (!_vrr && window && _o.Clock == PlaybackClock.Real && _o.PresentLeadNs < 0 && _o.AdaptiveLead && presentLoop.GridReady && _stopReason == (int)StopReason.None)
+        {
+            // Where this compositor takes a present on this output, from probes of the last pre-roll image: the present
+            // lead starts from that instead of 1.5 refreshes (bounded; a second at most).
+            presentLoop.RequestLatchSweep(LatchSweepNs);
+            var sweepBy = Monotonic.NowNs + LatchSweepNs + Nanoseconds.PerSecond;
+            while (!presentLoop.LatchSweepDone && Monotonic.NowNs < sweepBy && _stopReason == (int)StopReason.None)
+            {
+                PumpWindow();
+                Thread.Sleep(2);
+            }
+
+            // The grid goes out with the new lead on the present thread's next turn.
+            var sent = Monotonic.NowNs + (50 * Nanoseconds.PerMillisecond);
+            while (presentLoop.LatchSweep is { Bracketed: true } sweep && presentLoop.Grid.LeadNs != presentLoop.LeadNs && Monotonic.NowNs < sent)
+            {
+                Thread.Sleep(1);
+            }
+
+            report.LatchSweep = presentLoop.LatchSweep;
+        }
+
+        if (window && _o.Clock == PlaybackClock.Real)
+        {
+            // The pre-roll's grid updates were read by nobody (the pacing thread starts next) and may have filled the queue,
+            // so the clock mode's or the measured lead's update may not have gone out: drop them all and have the current
+            // one sent again, so the scheduler and the pacing thread start from it.
+            while (presentLoop.DisplayUpdates.TryDequeue(out _))
+            {
+            }
+
+            var before = presentLoop.GridSends;
+            presentLoop.ResendGrid();
+            var resent = Monotonic.NowNs + (100 * Nanoseconds.PerMillisecond);
+            while (presentLoop.GridSends == before && Monotonic.NowNs < resent)
+            {
+                Thread.Sleep(1);
+            }
+        }
+
         report.DisplayRateKnown = !window || (_presenter!.IsTimingKnown && presentLoop.GridReady);
     }
+
+    /// <summary>
+    /// Whether an output whose highest rate is <paramref name="output"/> can show <paramref name="neededHz"/> new images a
+    /// second under variable refresh (0.05% slack, under the 0.1% between 120 and 119.88 Hz, for a rate reported rounded):
+    /// 60 fps at 2x on 119.88 Hz cannot, 59.94 fps can, and on 240.016 Hz 60 fps at up to 4x can.
+    /// </summary>
+    internal static bool VrrFits(double neededHz, FrameRate output) => !output.IsValid || neededHz <= output.Hz * 1.0005;
+
+    /// <summary>The most the latch sweep before playback may take.</summary>
+    private const long LatchSweepNs = 1_500 * Nanoseconds.PerMillisecond;
+
+    /// <summary>The most the variable-refresh probe before playback may take (about 24 presents).</summary>
+    private const long VrrProbeNs = 600 * Nanoseconds.PerMillisecond;
+
+    private bool _fullscreenDone;
+    private bool _vrr;
 
     /// <summary>Window events outside the control loop (the pre-roll): a close or Escape stops the run there too.</summary>
     private void PumpWindow()
@@ -619,7 +770,7 @@ public sealed class PlaybackSession : IDisposable
     private (FrameScheduler Scheduler, long StartNs) CreateScheduler(PlaybackReport report)
     {
         var settings = _o.Settings ?? new FmpSettings();
-        var window = _o.Display == DisplayKind.Window;
+        var window = WindowTiming;
         var now = Monotonic.NowNs;
         FrameRate rate;
         long anchor;
@@ -644,7 +795,7 @@ public sealed class PlaybackSession : IDisposable
         var multiplier = _generator is null ? 1 : Math.Min(asked, Math.Max(1, _generator.Generator.Capabilities.MaxMultiplier));
         var options = baseOptions with
         {
-            ClockMode = ClockMode.FixedRefresh,
+            ClockMode = _vrr ? ClockMode.Vrr : ClockMode.FixedRefresh,
             DisplayRate = rate,
             MaxMultiplier = multiplier,
             InitialGenerationTimeNs = _initialGenerationNs,
@@ -667,7 +818,7 @@ public sealed class PlaybackSession : IDisposable
     private void Control(PlaybackReport report, TelemetryCollector collector, TelemetryCsvWriter? csv, DedicatedThread pacing, DedicatedThread writer, DedicatedThread present)
     {
         var meter = new ThreadMeter();
-        var fullscreenDone = !_o.Fullscreen;
+        var fullscreenDone = !_o.Fullscreen || _fullscreenDone;
         var measuring = false;
         while (true)
         {
@@ -803,7 +954,7 @@ public sealed class PlaybackSession : IDisposable
     private void Verify(PlaybackReport report, TelemetryCollector collector)
     {
         var liveUnexplained = collector.ExplainGaps(collector.MeasureFromNs, collector.Statistics.LastMeasuredNs);
-        if (_o.Display != DisplayKind.Window || _o.Clock != PlaybackClock.Real || _presenter is not { ReportsPresentTimes: true } || collector.PeriodNs <= 0
+        if (!WindowTiming || _o.Clock != PlaybackClock.Real || _presenter is not { ReportsPresentTimes: true } || collector.PeriodNs <= 0
             || collector.MeasureFromNs == long.MaxValue)
         {
             report.VerificationSkipped = "the verifier judges windowed runs with first-pixel times";
@@ -811,7 +962,7 @@ public sealed class PlaybackSession : IDisposable
         }
 
         var stats = collector.Statistics;
-        var result = TelemetryVerifier.Verify(collector.VerifierRows, collector.PeriodNs, collector.MeasureFromNs, stats.LastMeasuredNs);
+        var result = TelemetryVerifier.Verify(collector.VerifierRows, collector.PeriodNs, collector.MeasureFromNs, stats.LastMeasuredNs, _vrr);
         if (result.UnexplainedRefreshes != liveUnexplained)
         {
             result.Disagreements += Math.Abs(result.UnexplainedRefreshes - liveUnexplained);
@@ -864,6 +1015,9 @@ public sealed class PlaybackSession : IDisposable
             report.DroppedRefused = pl.DroppedRefused;
             report.PresentRefusals = pl.Refusals;
             report.LateShows = pl.LateShows;
+            report.CompositorCatchUps = pl.CompositorCatchUps;
+            pl.CopyLeadChanges(report.LeadChanges);
+            report.OwnCatchUps = pl.OwnCatchUps;
             report.MaxPresentsInFlight = Math.Max(pl.MaxInFlight, s.MaxPresentsInFlight);
             report.DisplayRateChanges = pl.RateChanges;
             report.Presenter = Cost(pl.Meter);
@@ -881,7 +1035,7 @@ public sealed class PlaybackSession : IDisposable
             // The presenter's own count (submitted and not completed): the present thread's lags by the feedback it has
             // not drained yet, so it can read one more than are actually queued.
             report.MaxPresentsInFlight = presenter.Stats.MaxPresentsInFlight;
-            if (_o.Display == DisplayKind.Window && presenter.IsTimingKnown)
+            if (WindowTiming && presenter.IsTimingKnown)
             {
                 report.DisplayRate = presenter.Timing.RefreshRate;
             }
@@ -911,6 +1065,32 @@ public sealed class PlaybackSession : IDisposable
     /// context: a drained point), the CUDA objects, the presenter, its target, the window and the Vulkan device and
     /// instance (whose destruction is when the validation layer reports leaks). Never throws; errors are reported.
     /// </summary>
+    /// <summary>
+    /// A file whose frame interval is within 0.5% of a whole number of the display's refreshes, played on fixed refresh, is
+    /// stretched to exactly that many (60.000 fps on 119.88 Hz: 0.1% slower), so it phase-locks: real frames on refreshes
+    /// and the generator run only where a new image is wanted. 1 otherwise (a live source, variable refresh, an exact
+    /// ratio, or one too far off: those play at their own rate as the design describes).
+    /// </summary>
+    private double ResampleFor(FrameRate display)
+    {
+        if (!_o.ResampleToDisplay || _source is null || _source.IsLive || _vrr || !display.IsValid || !_source.NominalRate.IsValid)
+        {
+            return 1.0;
+        }
+
+        return ResampleFactor(_source.NominalRate, display);
+    }
+
+    /// <summary>The stretch that locks a file of <paramref name="source"/> to <paramref name="display"/>'s refreshes when it is
+    /// within 0.5% of a whole number of them per frame; 1 otherwise (exact, or too far off).</summary>
+    internal static double ResampleFactor(FrameRate source, FrameRate display)
+    {
+        var ratio = source.PeriodNs / display.PeriodNs;
+        var n = Math.Round(ratio);
+        var off = Math.Abs(ratio - n) / Math.Max(1, n);
+        return n >= 1 && off > 1e-6 && off < 0.005 ? n * display.PeriodNs / source.PeriodNs : 1.0;
+    }
+
     /// <summary>How far ahead of now the first frame is put (two refreshes: past the scheduler's first decision).</summary>
     private static long StartLead(FrameRate rate) => rate.IsValid ? (long)Math.Round(2 * rate.PeriodNs) : 20 * Nanoseconds.PerMillisecond;
 

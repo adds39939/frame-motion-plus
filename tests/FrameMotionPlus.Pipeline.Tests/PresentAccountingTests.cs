@@ -64,6 +64,40 @@ public class MissAccountingTests
         Assert.Equal(MissKind.DisplayLate, a.OnLateShow(now + (8 * Ms), 8_000 * Us, 1));
     }
 
+    /// <summary>
+    /// A compositor's missed refresh (a present handed over in time shown late) followed by presents handed over no earlier
+    /// that make their refresh: the late show is contradicted, and the next compositor miss at that lead is the display's again.
+    /// Before, the first one stayed evidence for ten seconds and made the next one the pipeline's (the simulated display's
+    /// missed refreshes a second apart).
+    /// </summary>
+    [Fact]
+    public void A_late_show_that_later_presents_at_the_same_lead_contradict_no_longer_raises_the_deadline()
+    {
+        var now = 100 * Nanoseconds.PerSecond;
+        var a = WithHistory(now, 7_000 * Us, 8_000 * Us);
+        Assert.Equal(MissKind.DisplayLate, a.OnLateShow(now, 7_600 * Us, 1));
+        a.OnOnTime();
+        for (var i = 1; i <= 20; i++)
+        {
+            // Handed over 7.3 ms before (7.55 at the most, with the default uncertainty): no later than the late one.
+            a.RecordOnTime(now + (i * 8 * Ms), 7_300 * Us);
+        }
+
+        Assert.Equal(7_250 * Us, a.RequiredLeadNs(now + (200 * Ms)));
+        Assert.Equal(MissKind.DisplayLate, a.OnLateShow(now + (200 * Ms), 7_600 * Us, 1));
+
+        // Presents that made it at leads possibly longer than the late one's (7.5 ms, up to 7.75) do not contradict it.
+        var b = WithHistory(now, 7_000 * Us, 8_000 * Us);
+        Assert.Equal(MissKind.DisplayLate, b.OnLateShow(now, 7_600 * Us, 1));
+        b.OnOnTime();
+        for (var i = 1; i <= 20; i++)
+        {
+            b.RecordOnTime(now + (i * 8 * Ms), 7_500 * Us);
+        }
+
+        Assert.Equal(MissKind.LatePresent, b.OnLateShow(now + (200 * Ms), 7_600 * Us, 1));
+    }
+
     [Fact]
     public void Evidence_older_than_the_window_does_not_count()
     {
@@ -195,6 +229,37 @@ public class LeadControllerTests
 }
 
 /// <summary>Catching up after a late show without losing a new real frame where something else can be given up (pure).</summary>
+/// <summary>The lead's raise from a late present's hand-over (pure).</summary>
+public class LeadRaiseTests
+{
+    private const long S = 1_000_000_000;
+
+    /// <summary>
+    /// A present handed over earlier than the lead asked that still missed takes the lead to its hand-over lead plus two
+    /// steps: from 1.5 ms, one handed over 2.7 ms ahead puts it at 4.7 ms, not 2.5 (one step at a time it settled 0.06 ms
+    /// past a 4.44 ms latch and kept missing); one handed over at the lead, or without a hand-over, one step as before.
+    /// </summary>
+    [Fact]
+    public void A_raise_clears_the_missed_hand_over_by_two_steps()
+    {
+        var c = new LeadController(1_500_000, 8_000_000, adaptive: true);
+        Assert.True(c.OnLateContent(1 * S, 2_700_000));
+        Assert.Equal(4_700_000, c.LeadNs);
+
+        var b = new LeadController(3_500_000, 8_000_000, adaptive: true);
+        Assert.True(b.OnLateContent(1 * S, 3_400_000));
+        Assert.Equal(4_500_000, b.LeadNs);
+
+        var d = new LeadController(3_500_000, 8_000_000, adaptive: true);
+        Assert.True(d.OnLateContent(1 * S));
+        Assert.Equal(4_500_000, d.LeadNs);
+
+        var e = new LeadController(3_500_000, 8_000_000, adaptive: true);
+        Assert.True(e.OnLateContent(1 * S, 7_000_000));
+        Assert.Equal(8_000_000, e.LeadNs);
+    }
+}
+
 public class CatchUpPolicyTests
 {
     [Fact]
@@ -241,5 +306,37 @@ public class StartOffsetTests
     {
         Assert.Equal(1_000 + 16 - 400, PacingLoop.StartOffset(live: false, nowNs: 1_000, startLeadNs: 16, firstContentNs: 400));
         Assert.Equal(0, PacingLoop.StartOffset(live: true, nowNs: 1_000, startLeadNs: 16, firstContentNs: 400));
+    }
+}
+
+/// <summary>The compositor's latch bounded from timed shows (pure).</summary>
+public class LatchEstimatorTests
+{
+    private const long P = 8_341_675;
+    private const long FirstPixel = 160_000;
+
+    /// <summary>
+    /// Presents handed over 12.5 ms before their refresh make it; then one at the same lead (a little less: hand-overs
+    /// scatter) is shown a refresh late because the compositor skipped that refresh. That is no evidence of the latch:
+    /// taken as one, it put the latch's lower bound at 12.4 ms, the next presents at that lead looked unreachable and one
+    /// was dropped while the compositor gave the refresh back itself. A present handed over clearly later than any that
+    /// made it, and missed, still is evidence.
+    /// </summary>
+    [Fact]
+    public void A_miss_at_a_lead_that_made_its_refresh_is_no_evidence_of_the_latch()
+    {
+        var latch = new LatchEstimator();
+        long now = 1_000_000_000;
+        for (var i = 0; i < 100; i++, now += P)
+        {
+            latch.Add(now, now + FirstPixel, now - 12_500_000 + ((i % 5) * 50_000), P, couldHaveMadeEarlier: false);
+        }
+
+        Assert.Equal(12_460_000, latch.HighNs);
+        latch.AddMissed(now, now, now - 12_400_000);
+        Assert.Equal(0, latch.LowNs);
+
+        latch.AddMissed(now + P, now + P, now + P - 2_000_000);
+        Assert.Equal(2_000_000, latch.LowNs);
     }
 }

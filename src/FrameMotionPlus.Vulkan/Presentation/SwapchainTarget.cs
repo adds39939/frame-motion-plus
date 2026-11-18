@@ -85,9 +85,28 @@ public enum PresentFeedbackMode
     None = 3,
 }
 
+/// <summary>The swapchain's present mode (the surface must offer it).</summary>
+public enum SwapchainPresentMode
+{
+    /// <summary>VK_PRESENT_MODE_FIFO_KHR: one queued present per refresh, in order (always offered; the default).</summary>
+    Fifo = 0,
+
+    /// <summary>VK_PRESENT_MODE_FIFO_LATEST_READY: at each refresh, the newest present whose work is done; older ones are discarded.</summary>
+    FifoLatestReady = 1,
+
+    /// <summary>VK_PRESENT_MODE_MAILBOX_KHR: a newer present replaces a queued one; no tearing.</summary>
+    Mailbox = 2,
+
+    /// <summary>VK_PRESENT_MODE_IMMEDIATE_KHR: shown at once, tearing allowed.</summary>
+    Immediate = 3,
+}
+
 /// <summary>Which optional mechanisms a <see cref="SwapchainTarget"/> uses (forcing a fallback is for tests and diagnosis).</summary>
 public sealed record SwapchainTargetOptions
 {
+    /// <summary>The present mode. Anything but FIFO must be offered by the surface (and FIFO_LATEST_READY enabled on the device), else the target refuses.</summary>
+    public SwapchainPresentMode PresentMode { get; init; } = SwapchainPresentMode.Fifo;
+
     public PresentFeedbackMode Feedback { get; init; } = PresentFeedbackMode.Automatic;
 
     /// <summary>
@@ -120,6 +139,7 @@ public sealed unsafe class SwapchainTarget : PresentTarget
     private readonly PresentFeedbackMode _feedback;
     private readonly PresentFeedbackMode _ids;
     private readonly bool _maintenance1;
+    private readonly VkPresentModeKHR _presentMode = VkPresentModeKHR.Fifo;
     private readonly List<(VkFormat Format, VkColorSpaceKHR ColorSpace)> _formats = [];
     private VkSurfaceKHR _surface;
     private VkSwapchainKHR _swapchain;
@@ -182,6 +202,17 @@ public sealed unsafe class SwapchainTarget : PresentTarget
             }
 
             Surface = QuerySurface();
+            _presentMode = options.PresentMode switch
+            {
+                SwapchainPresentMode.FifoLatestReady => VkPresentModeKHR.FifoLatestReady,
+                SwapchainPresentMode.Mailbox => VkPresentModeKHR.Mailbox,
+                SwapchainPresentMode.Immediate => VkPresentModeKHR.Immediate,
+                _ => VkPresentModeKHR.Fifo,
+            };
+            if (!Surface.PresentModes.Contains(_presentMode.ToString()) || (_presentMode == VkPresentModeKHR.FifoLatestReady && !device.Capabilities.FifoLatestReady))
+            {
+                throw new NotSupportedException($"The surface does not offer the {options.PresentMode} present mode (offered: {string.Join(", ", Surface.PresentModes)}).");
+            }
 
             var caps = device.Capabilities;
             var wait2 = caps.PresentWait2 && caps.PresentId2 && Surface.PresentWait2Supported && Surface.PresentId2Supported;
@@ -270,6 +301,9 @@ public sealed unsafe class SwapchainTarget : PresentTarget
     public bool UsesPresentFences => _maintenance1;
 
     public override bool SupportsHdr10 => Surface.Hdr10St2084;
+
+    /// <summary>The swapchain's present mode, as the Vulkan enum name.</summary>
+    public string PresentModeName => _presentMode.ToString();
 
     /// <summary>The swapchain's colour space, as the Vulkan enum name.</summary>
     public string SwapchainColorSpaceName => _colorSpace.ToString();
@@ -448,7 +482,7 @@ public sealed unsafe class SwapchainTarget : PresentTarget
             compositeAlpha = (caps.supportedCompositeAlpha & VkCompositeAlphaFlagsKHR.Opaque) != 0
                 ? VkCompositeAlphaFlagsKHR.Opaque
                 : FirstBit(caps.supportedCompositeAlpha),
-            presentMode = VkPresentModeKHR.Fifo,
+            presentMode = _presentMode,
             clipped = true,
             oldSwapchain = old,
         };

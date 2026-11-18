@@ -270,7 +270,8 @@ public sealed class CliTests : IDisposable
         }
 
         var environment = new Dictionary<string, string> { [variable] = value == "empty" ? _directory : value };
-        string[] args = variable == "FMP_VFX_SDK" ? ["play", clip, "--offscreen", "--generator", "vfg"] : ["play", clip];
+        // Bounded, should the missing piece ever not stop it before a window opens.
+        string[] args = variable == "FMP_VFX_SDK" ? ["play", clip, "--offscreen", "--generator", "vfg", "--duration-s", "2"] : ["play", clip, "--duration-s", "2"];
         var (exit, _, err) = await RunOutOfProcess(environment, args);
         Assert.Equal(PatternCommand.ExitUnavailable, exit);
         Assert.Single(err.Split('\n', StringSplitOptions.RemoveEmptyEntries));
@@ -371,6 +372,53 @@ public sealed class CliTests : IDisposable
         Assert.Contains("stopped: by the user", output, StringComparison.Ordinal);
         Assert.Contains("STOPPED by the user before anything was measured", output, StringComparison.Ordinal);
         Assert.Equal(CommandDispatcher.ExitOk, exit); // a stop the user asked for is not a failure
+    }
+
+    /// <summary>
+    /// <c>fmp bench present</c> (windowed, short) ends on SIGINT after the current probe, printing what it measured and a
+    /// "stopped" line. It used to ignore signals, Escape and closing the window and run its full duration, so a fullscreen
+    /// probe covered its output for as long as asked.
+    /// </summary>
+    [Fact]
+    [Trait(Category.Name, Category.Display)]
+    public async Task A_signal_stops_the_present_probe_with_what_it_measured()
+    {
+        if (TestSupport.ChildProcess.SigintUnavailable is { } why)
+        {
+            Assert.Skip(why);
+        }
+
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
+        {
+            Assert.Skip("needs a Wayland session");
+        }
+
+        var watch = Stopwatch.StartNew();
+        var (exit, output, err) = await RunOutOfProcess(new Dictionary<string, string>(), p =>
+        {
+            Thread.Sleep(4000); // past the start-up (the handlers are set before the window opens) and into the probes
+            using var kill = Process.Start("kill", ["-INT", p.Id.ToString(CultureInfo.InvariantCulture)]);
+            kill.WaitForExit();
+        }, 60, "bench", "present", "--test", "cadence", "--duration-s", "30", "--window", "320x180");
+        Log.WriteLine($"ended after {watch.Elapsed.TotalSeconds:0.0} s");
+        if (output.Contains("needs a Wayland session", StringComparison.Ordinal) || output.Contains("no first-pixel times", StringComparison.Ordinal))
+        {
+            Assert.Skip(output.Trim());
+        }
+
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(15), $"took {watch.Elapsed.TotalSeconds:0.0} s: the signal was ignored");
+        Assert.Contains("stopped     by SIGINT", output, StringComparison.Ordinal);
+        Assert.True(exit == CommandDispatcher.ExitOk, output + err);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("600")]
+    public void The_present_probe_runs_at_most_two_minutes(string seconds)
+    {
+        var (exit, _, err) = Run("bench", "present", "--duration-s", seconds);
+        Assert.Equal(CommandDispatcher.ExitUsage, exit);
+        Assert.Contains("at most 120 s", err, StringComparison.Ordinal);
     }
 
     private static (int Exit, string Out, string Err) Run(params string[] args)

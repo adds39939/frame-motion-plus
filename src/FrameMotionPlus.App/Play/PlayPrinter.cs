@@ -56,6 +56,34 @@ internal static class PlayPrinter
             $"effective {d.Multiplier} (stride {d.Stride}: a new image every {d.Stride} refresh{(d.Stride == 1 ? "" : "es")}); " +
             $"source interval T {Ms(d.SourceIntervalNs)} ms; present lead {Ms(r.PresentLeadNs)} ms at the end{LeadHistory(r)}; scheduler margin {Ms(r.MarginNs)} ms; " +
             $"{(d.PhaseCoherent ? "phase-locked to the refreshes" : "not phase-locked")}"));
+        o.WriteLine(r.RefreshModeUsed == RefreshMode.Vrr
+            ? string.Create(Ic,
+                $"  clock       VARIABLE REFRESH: slots follow the source (V = ts + D + kT/M), each handed over at its time; the output's shortest refresh period " +
+                $"{Ms(period)} ms; expected delay from hand-over to first pixel (the lead) {Ms(r.PresentLeadNs)} ms{VrrProbe(r)}")
+            : string.Create(Ic, $"  clock       fixed refresh: slots are the output's refreshes{VrrProbe(r)}" +
+                $"{(r.VrrTooFast > 0 ? $"; not variable refresh: the source at its multiplier needs {r.VrrTooFast:0.###} fps, more than this output's {r.DisplayRate.Hz:0.###} Hz (--clock vrr forces it)" : "")}"));
+        if (r.Resample != 1.0)
+        {
+            o.WriteLine(string.Create(Ic,
+                $"  resample    the file plays {Math.Abs(r.Resample - 1) * 100:0.000}% {(r.Resample > 1 ? "slower" : "faster")} (content times x{r.Resample:0.000000}) to lock to the {r.DisplayRate.Hz:0.###} Hz output"));
+        }
+
+        if (r.LatchSweep is { } sweep)
+        {
+            o.WriteLine(sweep.Bracketed
+                ? string.Create(Ic,
+                    $"  latch       measured before playback ({sweep.Probes} probes of the last pre-roll image: {sweep.Made} made their refresh, {sweep.Late} a refresh late, " +
+                    $"{sweep.Early} early): the latest hand-over that missed its refresh came {Ms(sweep.LateMaxNs)} ms before it (the shortest that made one: " +
+                    $"{Ms(sweep.MadeMinNs)} ms); the present lead started at {Ms(sweep.LeadNs)} ms (that plus {Ms(sweep.MarginNs)})")
+                : string.Create(Ic, $"  latch       not bracketed by {sweep.Probes} probes before playback ({sweep.Made} made, {sweep.Late} late, {sweep.Early} early): the lead started at {Ms(sweep.LeadNs)} ms"));
+        }
+
+        if (r.LeadChanges.Count > 1)
+        {
+            var shown = r.LeadChanges.Take(12).Select(c => string.Create(Ic, $"{c.Why} {Ms(c.LeadNs)}"));
+            o.WriteLine($"  lead        changes: {string.Join(" → ", shown)}{(r.LeadChanges.Count > 12 ? $" ... ({r.LeadChanges.Count})" : "")}");
+        }
+
         o.WriteLine($"  threads     pacing: {r.PacingThread}; generator: {r.WriterThread}; present: {r.PresentThread}");
         o.WriteLine(string.Create(Ic,
             $"  duration    {r.PlaybackNs / 1e9:0.00} s played, {s.MeasuredSeconds:0.00} s measured after {r.WarmupNs / 1e9:0.#} s of warm-up; stopped: {StopName(r.StopReason)}"));
@@ -81,13 +109,18 @@ internal static class PlayPrinter
                 $"min {Ms(iv.Min)} ms over {iv.Count}{(period > 0 ? $" (refresh period {Ms(period)} ms)" : "")}; " +
                 $"{s.OffGridIntervals} of {s.TimedIntervals} timed intervals more than a quarter refresh off the grid{offGrid}"));
         var total = s.TotalMisses;
+        var against = r.Verification is { } vv
+            ? string.Create(Ic, $" (the verifier, from the telemetry alone: {vv.Misses}; {(vv.Disagreements == 0 ? "agrees" : $"DISAGREES on {vv.Disagreements}")})")
+            : " (the verifier did not run)";
         o.WriteLine(string.Create(Ic,
-            $"  missed      {total} slot(s); the pipeline's {s.PipelineMisses}: late present {s.MissCount(MissKind.LatePresent)}, early {s.MissCount(MissKind.Early)}, " +
+            $"  missed      {total} slot(s){against}; the pipeline's {s.PipelineMisses}: late present {s.MissCount(MissKind.LatePresent)}, early {s.MissCount(MissKind.Early)}, " +
             $"dropped {s.MissCount(MissKind.Dropped)}, untimed and its refresh taken {s.MissCount(MissKind.NotShown)}, refresh without a new present {s.MissCount(MissKind.MissedRefresh)}, " +
             $"refused {s.MissCount(MissKind.Refused)}, skipped vblank {s.MissCount(MissKind.SkippedVblank)}, back-pressure {s.MissCount(MissKind.BackPressure)}, " +
             $"presenter backlog {s.MissCount(MissKind.PresenterBacklog)}; the display's {s.EnvironmentMisses}: shown late although handed over in time " +
-            $"{s.MissCount(MissKind.DisplayLate)}, given up catching up after those {s.MissCount(MissKind.CatchUp)}; during a refresh-rate change {s.RateChangeMisses}; " +
-            $"unjudged {s.UnjudgedSlots}; refreshes without a new present {s.RefreshesWithoutPresent}"));
+            $"{s.MissCount(MissKind.DisplayLate)}, given back after those {s.MissCount(MissKind.CatchUp)}, handed over in time and discarded by the compositor " +
+            $"{s.MissCount(MissKind.Discarded)}; during a refresh-rate change {s.RateChangeMisses}; unjudged {s.UnjudgedSlots}; refreshes without a new present " +
+            $"{s.RefreshesWithoutPresent}; late shows {r.LateShows}: the refresh given back by the compositor {r.CompositorCatchUps}x, by the present thread {r.OwnCatchUps}x" +
+            $"{(r.RefreshModeUsed == RefreshMode.Vrr ? $"; generated slots skipped (variable refresh: the next real frame came too late for them) {s.VrrSkippedSlots}" : "")}"));
         if (r.Verification is { } v)
         {
             o.WriteLine(string.Create(Ic,
@@ -329,6 +362,7 @@ internal static class PlayPrinter
         MissKind.MissedRefresh => "refresh without a new present",
         MissKind.DisplayLate => "display late",
         MissKind.CatchUp => "display catch-up",
+        MissKind.Discarded => "discarded by the compositor",
         MissKind.RateChange => "rate change",
         MissKind.LatePresent => "late present",
         MissKind.Dropped => "dropped",
@@ -337,6 +371,12 @@ internal static class PlayPrinter
         MissKind.BackPressure => "back-pressure",
         _ => "presenter backlog",
     };
+
+    private static string VrrProbe(PlaybackReport r) => r.VrrProbe is not { } p
+        ? ""
+        : string.Create(Ic,
+            $" (probe before playback: {p.Following} of {p.Pairs} pairs of shows as far apart as their presents, {p.OnGrid} on the refresh grid; " +
+            $"first pixel {Ms(p.DelayP50Ns)} ms after the present, at most {Ms(p.DelayMaxNs)}: {(p.Active ? "the display follows the presents" : "fixed refresh")})");
 
     private static string LeadHistory(PlaybackReport r) => r.LeadRaises == 0
         ? " (it did not need to adapt)"

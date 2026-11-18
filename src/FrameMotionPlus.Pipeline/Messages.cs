@@ -61,8 +61,12 @@ public readonly record struct PresentJob
 
     public ulong Write { get; init; }
 
-    /// <summary>The refresh it is for (the scheduler's V).</summary>
+    /// <summary>The refresh it is for: the scheduler's V plus the present lead (fixed refresh: the refresh; variable: the
+    /// first pixel expected).</summary>
     public long TargetNs { get; init; }
+
+    /// <summary>The scheduler's V: when its content is due. Variable refresh hands the present over then.</summary>
+    public long DueNs { get; init; }
 
     public SlotKind SlotKind { get; init; }
 
@@ -185,6 +189,9 @@ internal enum PresentOutcome : byte
 
     /// <summary>Submitted knowing it would be shown a refresh late (a new real frame, kept rather than dropped).</summary>
     ShownLate = 5,
+
+    /// <summary>A probe of the compositor's latch before playback (the last pre-roll image, handed over at a chosen time).</summary>
+    Probe = 6,
 }
 
 /// <summary>Present thread → collector: a present that was shown, or a slot that was not presented.</summary>

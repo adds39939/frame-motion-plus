@@ -42,6 +42,17 @@ repeats of a picture are dropped, a 30 fps game is found inside a 60 Hz signal),
 the same pipeline with VFG: `fmp capture`. Results, what the card does, and what still needs the owner's hardware or
 eyes: [`docs/benchmarks/phase5-capture.md`](docs/benchmarks/phase5-capture.md).
 
+Phase 6 (pacing and latency) makes the miss accounting and the offline verifier agree (a compositor's own catch-up is
+recognised; a repeat given up is judged by what its refresh showed), measures the compositor's latch before each run and
+starts the present lead from it (2.7 to 4.5 ms instead of 12.5 at 119.88 Hz, in most runs), removes the stride's extra
+refresh on phase-locked outputs, stretches a near-locked file's clock to lock it, and adds **variable refresh**:
+fullscreen, KWin follows the presents, and `--clock auto` (the default) then times each slot from the source with no
+present lead and no rounding to a refresh (`fmp capture` is fullscreen by default). A real 4K HDR 30 → 60 frame now
+reaches the screen 46.6 ms after its capture timestamp (63.3 before). The 10-minute gate run, verified from the
+telemetry: 0 missed on DP-3; 4 on HDMI-A-1, in one host stall (a handful is acceptable to the owner for now).
+Results, the compositor's measured behaviour, and what is not done:
+[`docs/benchmarks/phase6-pacing.md`](docs/benchmarks/phase6-pacing.md).
+
 ## Layout
 
 ```
@@ -217,7 +228,10 @@ decided by the display-time scheduler (a real frame, a generated one at timestep
 generated frames made by VFG (the default when the VFX SDK is found; otherwise blend, saying why) straight into the
 presentation ring, and shown one per refresh in a window (FIFO, at most two presents in flight, paced from present
 feedback: first-pixel times where the display reports them). The present lead (how long before its refresh a slot's
-content must be ready) starts at 1.5 refreshes and adapts to the compositor's latch. At the end it prints a summary:
+content must be ready) starts from the compositor's latch, measured before playback, plus 2 ms, and adapts. Fullscreen,
+where the display follows the presents (variable refresh), each slot is instead handed over at its own time
+(`--clock auto`, the default; `--clock fixed|vrr` to choose). A file a hair off the display's rate (60.000 fps on
+119.88 Hz) plays 0.1% slower to lock to it. At the end it prints a summary:
 slots, presents, every missed slot with its time and whose it was (the pipeline's unless the timestamps show the present
 was handed over in time and the display showed it late; misses while the output's rate changes are counted apart),
 output intervals from present feedback, the generation time d, the delay to light (lead + D + the stride's rounding),
@@ -230,10 +244,13 @@ ffmpeg -f lavfi -i "testsrc2=size=2560x1440:rate=60,trim=duration=60" -c:v libx2
 fmp play clip-1440p60.mp4 --loop                       # VFG Medium, 2x (60 → 120 output), window 1280x720
 fmp play clip-1440p60.mp4 --loop --multiplier 4        # 4x where the display allows (every refresh at 240 Hz)
 fmp play clip-1440p60.mp4 --generator blend --csv play.csv   # blend, per-slot timeline as CSV
-fmp play clip-1440p60.mp4 --fullscreen                 # borderless fullscreen on the window's output
+fmp play clip-1440p60.mp4 --fullscreen                 # borderless fullscreen on the window's output (variable refresh)
 fmp play clip-1440p60.mp4 --gate                       # the Phase 4 gate: 10 minutes VFG Medium 2x, no miss of the pipeline's
 fmp play clip.mkv --offscreen --generator blend --duration-s 5   # no window: offscreen on a virtual clock
 fmp verify play.csv                                    # recompute a run's verdict from its telemetry CSV alone
+fmp verify play.csv --vrr --rate 240.016               # ... of a variable-refresh run (the output's highest rate)
+fmp bench present --test latch                         # where this compositor takes a present (a window's latch)
+fmp bench present --test vrr --fullscreen              # whether first pixels follow the presents (variable refresh)
 ```
 
 A 60 fps file at `--multiplier 2` shows a new image every refresh of a 120 Hz display and every other refresh of a
@@ -256,9 +273,10 @@ cost of upload, cadence and conversion) and the latency the generation adds agai
 
 ```sh
 fmp capture --list                                   # the capture devices and what each offers
-fmp capture --mode 4k30-hdr                          # the owner's target: 3840x2160 P010 at 30, HDR10, VFG to 60 (window)
-fmp capture --mode 4k30-hdr --fullscreen             # the same, borderless fullscreen on the window's output
-fmp capture --mode 1440p60-hdr                       # 2560x1440 P010 at 60, HDR10, VFG to 120 (for 60 fps games)
+fmp capture --mode 4k30-hdr                          # the owner's target, lowest latency: 3840x2160 P010 at 30, HDR10, VFG
+                                                     # to 60, fullscreen (the default) with variable refresh (on DP-3, 240 Hz)
+fmp capture --mode 4k30-hdr --windowed               # the same in a window (fixed refresh, the measured present lead)
+fmp capture --mode 1440p60-hdr                       # 2560x1440 P010 at 60, HDR10, VFG to 120 (60 fps games), variable refresh
 fmp capture --mode 1440p60-hdr --multiplier 4        # a 30 fps game in that signal to 120
 fmp capture /dev/video0 --size 1920x1080 --fps 120 --format nv12 --hdr off   # any offered mode, SDR
 fmp capture --mode 4k30-hdr --duration-s 180 --csv capture.csv --frames-csv frames.csv   # timelines for fmp verify

@@ -63,7 +63,11 @@ internal sealed record CaptureOptions
 
     public int WindowHeight { get; init; } = 720;
 
+    /// <summary>Borderless fullscreen (the default unless --windowed or --window is given, or --offscreen).</summary>
     public bool Fullscreen { get; init; }
+
+    /// <summary>--clock: fixed refresh, variable refresh, or auto (variable when fullscreen and the display follows the presents).</summary>
+    public Pipeline.RefreshMode Refresh { get; init; } = Pipeline.RefreshMode.Auto;
 
     public bool Offscreen { get; init; }
 
@@ -90,7 +94,7 @@ internal sealed record CaptureOptions
 
     public static readonly IReadOnlySet<string> Flags = new HashSet<string>(StringComparer.Ordinal)
     {
-        "list", "fullscreen", "offscreen", "validate", "no-cadence",
+        "list", "fullscreen", "windowed", "offscreen", "validate", "no-cadence",
     };
 
     public static CaptureOptions Parse(IReadOnlyList<string> args)
@@ -120,6 +124,13 @@ internal sealed record CaptureOptions
         var hdrText = r.String("hdr");
         var hdr = hdrText is null ? preset?.Hdr ?? HdrMode.TenBit : ParseHdr(hdrText);
         var offscreen = r.Flag("offscreen");
+        var fullscreen = r.Flag("fullscreen");
+        var windowed = r.Flag("windowed") || r.Has("window");
+        if (fullscreen && r.Flag("windowed"))
+        {
+            throw new UsageException("'--fullscreen' and '--windowed' contradict each other.");
+        }
+
         var (windowWidth, windowHeight) = Size(r, "window", 1280, 720, 64, 8192);
         var o = new CaptureOptions
         {
@@ -143,7 +154,16 @@ internal sealed record CaptureOptions
             DurationS = r.Double("duration-s", 0, 0.05, 86_400),
             WindowWidth = windowWidth,
             WindowHeight = windowHeight,
-            Fullscreen = r.Flag("fullscreen"),
+            // Fullscreen by default: there KWin gives the window variable refresh, which --clock auto then uses (the
+            // lowest latency measured, Phase 6); --windowed or a --window size keeps a window (fixed refresh).
+            Fullscreen = !offscreen && (fullscreen || !windowed),
+            Refresh = r.String("clock")?.ToLowerInvariant() switch
+            {
+                null or "auto" => Pipeline.RefreshMode.Auto,
+                "fixed" => Pipeline.RefreshMode.Fixed,
+                "vrr" => Pipeline.RefreshMode.Vrr,
+                var v => throw new UsageException($"Option '--clock' expects auto, fixed or vrr, got '{v}'."),
+            },
             Offscreen = offscreen,
             OffscreenRate = r.Rate("display-hz", FrameRate.FromHz(120)),
             Validate = r.Flag("validate"),
@@ -167,7 +187,7 @@ internal sealed record CaptureOptions
             throw new UsageException("'--display-hz' only applies with '--offscreen'.");
         }
 
-        if (offscreen && (o.Fullscreen || rest.Any(static a => a.StartsWith("--window", StringComparison.Ordinal))))
+        if (offscreen && (fullscreen || rest.Any(static a => a.StartsWith("--window", StringComparison.Ordinal))))
         {
             throw new UsageException("'--window' and '--fullscreen' do not apply with '--offscreen'.");
         }

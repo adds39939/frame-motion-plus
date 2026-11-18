@@ -50,8 +50,13 @@ public enum MissKind
     /// consecutive shows).</summary>
     MissedRefresh = 11,
 
+    /// <summary>The display's: handed over in time (at least the measured deadline before its refresh) and never shown: the
+    /// compositor discarded it (its report came without a first-pixel time and another present took its refresh), or a
+    /// slot shown a refresh early behind such a discard (the compositor gave a refresh back that the FIFO did not owe).</summary>
+    Discarded = 12,
+
     /// <summary>Not a miss (a sentinel; never counted).</summary>
-    None = 12,
+    None = 13,
 }
 
 /// <summary>One missed slot: when (ns after the start of playback) and why.</summary>
@@ -63,7 +68,7 @@ public sealed class PlaybackStatistics
     public const int MaxMissEvents = 4096;
 
     private readonly MissEvent[] _misses = new MissEvent[MaxMissEvents];
-    private readonly long[] _missCounts = new long[12];
+    private readonly long[] _missCounts = new long[13];
 
     public long Slots { get; internal set; }
 
@@ -149,6 +154,10 @@ public sealed class PlaybackStatistics
     public RunningStats SubmitToShown { get; } = new(10 * Nanoseconds.PerMicrosecond, 500 * Nanoseconds.PerMillisecond);
 
 
+    /// <summary>Variable refresh: generated slots the scheduler skipped because the real frame after them came too late (the
+    /// image before stays on screen for both): not a missed refresh (there is no grid), counted on its own.</summary>
+    public long VrrSkippedSlots { get; internal set; }
+
     public long MaxOutstanding { get; internal set; }
 
     public long MaxPresentsInFlight { get; internal set; }
@@ -185,8 +194,9 @@ public sealed class PlaybackStatistics
     /// <summary>The pipeline's misses: every one the timestamps do not show to be the display's or a rate change's.</summary>
     public long PipelineMisses => TotalMisses - EnvironmentMisses - RateChangeMisses;
 
-    /// <summary>The display's: shown late although handed over in time, and the slots given up to catch up after those.</summary>
-    public long EnvironmentMisses => MissCount(MissKind.DisplayLate) + MissCount(MissKind.CatchUp);
+    /// <summary>The display's: shown late although handed over in time, the slots given up to catch up after those, and
+    /// presents handed over in time that the compositor discarded.</summary>
+    public long EnvironmentMisses => MissCount(MissKind.DisplayLate) + MissCount(MissKind.CatchUp) + MissCount(MissKind.Discarded);
 
     /// <summary>Misses while the output's refresh rate changed (the window moved).</summary>
     public long RateChangeMisses => MissCount(MissKind.RateChange);

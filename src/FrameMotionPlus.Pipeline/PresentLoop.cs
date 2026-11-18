@@ -46,8 +46,14 @@ public readonly record struct PresentedFrame
 /// refresh shortly before its latch, the last image is put in as a filler (counted: the pipeline was late). It predicts
 /// which refresh each submission lands on (the last one in flight plus one), checks it against the report, and when a
 /// present shows later than predicted (the compositor skipped a refresh, or a present came too late), every present
-/// behind it in the FIFO is late by as much, so it drops the next slot to get back on time: later content on time,
-/// never a queue that plays behind.
+/// behind it in the FIFO is late by as much: with two queued, KWin gives the refresh back itself (it discards one), so new
+/// presents keep their own refresh; otherwise, or when it did not, the thread drops a slot to get back on time: later
+/// content on time, never a queue that plays behind. Before playback it measures the compositor's latch (the present
+/// lead starts from it) or, fullscreen, whether the display follows the presents (variable refresh).
+/// </para>
+/// <para>
+/// <b>Window, variable refresh.</b> Each slot is handed over at its own time (the scheduler's V), the display refreshing
+/// for it; no grid, no fillers; repeats are not presented.
 /// </para>
 /// <para>
 /// <b>Offscreen, real clock.</b> No refreshes: each slot is submitted just before its time and counts as shown when
@@ -56,7 +62,7 @@ public readonly record struct PresentedFrame
 /// </para>
 /// Allocation-free per present.
 /// </summary>
-internal sealed class PresentLoop : IDisposable
+internal sealed partial class PresentLoop : IDisposable
 {
     private const long PollNs = 250_000;
     private const long OffscreenLeadNs = 300_000;
@@ -116,6 +122,62 @@ internal sealed class PresentLoop : IDisposable
     private long _sentLeadNs;
     private long _currentLeadNs;
     private long _untimedShows;
+
+    // Catching up after a late show. KWin gives a lost refresh back by itself: of two presents ready at a latch after a
+    // late show it shows the newer and discards the older (its report then comes without a first-pixel time); measured in
+    // every late show of the Phase 4b and 5 runs that had them. Dropping a slot as well then put the FIFO a refresh ahead,
+    // and the next two slots were shown a refresh early (the Phase 5 review's 180 s 4K run). So after a late show the
+    // presents already queued are taken to be behind, but new ones are submitted for their own refresh (the compositor is
+    // expected to give the refresh back), and the present thread drops slots to catch up only once a present submitted
+    // after the late show is late too (it did not). Each late show starts over expecting the compositor.
+    private int _expectedDiscards;
+    private MissKind _expectedDiscardCause = MissKind.CatchUp;
+    private long _lastLateNs = long.MinValue;
+
+    // The variable-refresh probe before playback, and the mode.
+    private bool _vrrProbeRequested;
+    private bool _vrrProbeDone;
+    private long _vrrProbeBudgetNs;
+    private long _vrrProbeUntilNs = long.MinValue;
+    private long _vrrProbeNextNs = long.MinValue;
+    private int _vrrProbeCount;
+    private readonly long[] _vrrProbeSubmit = new long[64];
+    private readonly long[] _vrrProbeShown = new long[64];
+    private VrrProbeResult? _vrrProbeResult;
+    private bool _vrrRequested;
+    private bool _vrr;
+    private long _vrrLeadNs;
+    private readonly long[] _vrrDelays = new long[256];
+    private int _vrrDelayCount;
+    private int _vrrDelayHead;
+
+    /// <summary>
+    /// Whether to expect the compositor to give back a refresh lost to a late show. Seen only with two presents queued (a
+    /// lead of a refresh or more: the Phase 4b runs at 240 Hz and the Phase 5 review's at 119.88 Hz, every time); with one
+    /// (a lead under a refresh, the measured latch at 119.88 Hz) KWin stayed a refresh behind.
+    /// </summary>
+    private bool ExpectGiveBack(long periodNs) => _lead.LeadNs >= periodNs;
+
+    // The latch sweep before playback (RequestLatchSweep).
+    private bool _sweepRequested;
+    private bool _sweepDone;
+    private long _sweepBudgetNs;
+    private long _sweepUntilNs = long.MinValue;
+    private long _sweepXNs;
+    private long _sweepAtNs = long.MinValue;
+    private long _sweepRefreshNs;
+    private bool _sweepOut;
+    private int _sweepProbes;
+    private int _sweepMade;
+    private int _sweepLate;
+    private int _sweepEarly;
+    private int _sweepReversals;
+    private int _sweepLastStep;
+    private long _sweepLateMax = long.MinValue;
+    private long _sweepMadeMin = long.MaxValue;
+    private LatchSweepResult? _sweepResult;
+    private long _compositorCatchUps;
+    private long _ownCatchUps;
 
     // Counters (this thread writes; others read snapshots).
     private long _shown;
@@ -191,11 +253,84 @@ internal sealed class PresentLoop : IDisposable
     /// <summary>The largest present lead used, ns.</summary>
     public long PeakLeadNs => _lead.PeakLeadNs;
 
+    /// <summary>Every change of the present lead (after the run: the present thread has stopped).</summary>
+    public void CopyLeadChanges(List<(long AtNs, long LeadNs, LeadChange Why)> into)
+    {
+        for (var i = 0; i < _lead.ChangeCount; i++)
+        {
+            into.Add(_lead.Change(i));
+        }
+    }
+
     /// <summary>Shows reported without a first-pixel time although the surface reports them.</summary>
     public long UntimedShows => Volatile.Read(ref _untimedShows);
 
     /// <summary>Shows a refresh (or more) earlier than predicted (the FIFO was ahead; corrected at once).</summary>
     public long EarlyShows => Volatile.Read(ref _earlyShows);
+
+    /// <summary>The latch measured before playback (<see cref="RequestLatchSweep"/>); null until it is done or when it was not run.</summary>
+    public LatchSweepResult? LatchSweep => Volatile.Read(ref _sweepResult);
+
+    /// <summary>The sweep asked for has finished (successfully or not).</summary>
+    public bool LatchSweepDone => Volatile.Read(ref _sweepDone);
+
+    /// <summary>
+    /// Before playback (the pre-roll is shown and nothing else is queued): measures how far ahead of a refresh the
+    /// compositor takes a present, for at most <paramref name="durationNs"/>, and starts the present lead from it (the
+    /// latest hand-over that missed its refresh, plus <see cref="SweepMarginNs"/>). Windowed only; any thread.
+    /// </summary>
+    public void RequestLatchSweep(long durationNs)
+    {
+        Volatile.Write(ref _sweepBudgetNs, durationNs);
+        Volatile.Write(ref _sweepRequested, true);
+        _wake.Set();
+    }
+
+    /// <summary>
+    /// What the lead adds to the latch measured before playback: a present is handed over up to a present-thread turn (0.25
+    /// ms) after its content deadline; the latch moves with the compositor's load (measured: it came 0.3 to 1 ms earlier
+    /// once playback was under way than over the pre-roll's black frames); and a present or pacing thread is now and then
+    /// woken a millisecond or two late on a busy desktop (Phase 2: 1 to 4% of wakes under heavy load).
+    /// </summary>
+    public const long SweepMarginNs = 2 * Nanoseconds.PerMillisecond;
+
+    /// <summary>
+    /// Before playback (fullscreen, the pre-roll shown, nothing else queued): presents the last pre-roll image at off-grid
+    /// intervals (1.37 and 1.71 refreshes in turn) into an empty queue and looks at where the first pixels land: following
+    /// the presents (variable refresh) or on the refresh grid. At most <paramref name="durationNs"/>. Any thread.
+    /// </summary>
+    public void RequestVrrProbe(long durationNs)
+    {
+        Volatile.Write(ref _vrrProbeBudgetNs, durationNs);
+        Volatile.Write(ref _vrrProbeRequested, true);
+        _wake.Set();
+    }
+
+    public bool VrrProbeDone => Volatile.Read(ref _vrrProbeDone);
+
+    public VrrProbeResult? VrrProbe => Volatile.Read(ref _vrrProbeResult);
+
+    /// <summary>
+    /// From now on (before playback) slots are presented as variable refresh wants them: each handed over at its slot's
+    /// time, no refresh grid, no fillers, repeats not presented (the display holds the last image), and a slot shown more
+    /// than half the output's shortest refresh period away from its time is missed. <paramref name="expectedDelayNs"/> is
+    /// how long after its hand-over a present's first pixel comes (measured by the probe): the present lead in this mode.
+    /// </summary>
+    public void EnterVrr(long expectedDelayNs)
+    {
+        Volatile.Write(ref _vrrLeadNs, Math.Clamp(expectedDelayNs, 300 * Nanoseconds.PerMicrosecond, 2 * Nanoseconds.PerMillisecond));
+        Volatile.Write(ref _vrrRequested, true);
+        _wake.Set();
+    }
+
+    /// <summary>Presenting for variable refresh (<see cref="EnterVrr"/> applied).</summary>
+    public bool IsVrr => Volatile.Read(ref _vrr);
+
+    /// <summary>Late shows after which the compositor gave the refresh back itself (it discarded a queued present).</summary>
+    public long CompositorCatchUps => Volatile.Read(ref _compositorCatchUps);
+
+    /// <summary>Late shows after which the present thread had to give refreshes back (the compositor did not).</summary>
+    public long OwnCatchUps => Volatile.Read(ref _ownCatchUps);
 
     /// <summary>The compositor's latch as measured: at least this far ahead of a refresh, ns (any thread; a snapshot).</summary>
     public long LatchLowNs => Volatile.Read(ref _latchLowSnapshot);
@@ -291,6 +426,21 @@ internal sealed class PresentLoop : IDisposable
 
     /// <summary>Lets the thread put fillers in (from the start of playback; the pre-roll shows its own frames).</summary>
     public void EnableFillers() => _fillersOn = true;
+
+    /// <summary>
+    /// Sends the grid and lead again on the next turn (the session drains the pre-roll's updates, which nobody read and which
+    /// may have filled the queue, before the pacing thread starts: it must begin from the current ones). Any thread.
+    /// </summary>
+    public void ResendGrid()
+    {
+        Volatile.Write(ref _resendGrid, true);
+        _wake.Set();
+    }
+
+    /// <summary>Grid updates sent so far (it changes when one has gone out). Any thread.</summary>
+    public int GridSends => Volatile.Read(ref _gridSeq);
+
+    private bool _resendGrid;
 
     public void Wake() => _wake.Set();
 
@@ -398,7 +548,38 @@ internal sealed class PresentLoop : IDisposable
                 _forceGrid = true;
             }
 
+            if (Volatile.Read(ref _resendGrid))
+            {
+                Volatile.Write(ref _resendGrid, false);
+                _forceGrid = true;
+            }
+
+            if (!_vrr && Volatile.Read(ref _vrrRequested))
+            {
+                _vrr = true;
+                Volatile.Write(ref _currentLeadNs, _vrrLeadNs);
+                _forceGrid = true;
+            }
+
             SendGrid(now);
+            if (Volatile.Read(ref _vrrProbeRequested) && !_vrrProbeDone && !_havePending && _jobs.IsEmpty)
+            {
+                waiter.WaitUntil(VrrProbeStep(now));
+                continue;
+            }
+
+            if (Volatile.Read(ref _sweepRequested) && !_sweepDone && !_havePending && _jobs.IsEmpty)
+            {
+                waiter.WaitUntil(SweepStep(now));
+                continue;
+            }
+
+            if (_vrr)
+            {
+                VrrTurn(now, waiter);
+                continue;
+            }
+
             if (!_havePending)
             {
                 _havePending = _jobs.TryDequeue(out _pending);
@@ -527,11 +708,11 @@ internal sealed class PresentLoop : IDisposable
                     continue;
                 }
 
-                WaitForJob(Math.Min(fillAt, now + (_inFlightCount > 0 ? PollNs : 1_000_000)));
+                WaitForJob(Math.Min(fillAt, now + (_inFlightCount > 0 ? PollNs : IdleWaitNs)));
                 continue;
             }
 
-            WaitForJob(now + (_inFlightCount > 0 ? PollNs : 1_000_000));
+            WaitForJob(now + (_inFlightCount > 0 ? PollNs : IdleWaitNs));
         }
     }
 
@@ -547,7 +728,7 @@ internal sealed class PresentLoop : IDisposable
     /// handed over now may be taken for the first refresh at least this far ahead. Offscreen: the configured latch.
     /// </summary>
     private long EarliestLatchNs => _display == DisplayKind.Window && _clock == PlaybackClock.Real
-        ? Math.Max(0, _latch.LowNs - LatchMarginNs)
+        ? Math.Max(0, Math.Max(_latch.LowNs, _sweepResult is { Bracketed: true } sweep ? sweep.LateMaxNs : 0) - LatchMarginNs)
         : _latchLeadNs;
 
     private const long LatchMarginNs = 250 * Nanoseconds.PerMicrosecond;
@@ -613,7 +794,7 @@ internal sealed class PresentLoop : IDisposable
 
             if (!_havePending)
             {
-                WaitForJob(now + (_inFlightCount > 0 ? PollNs : 1_000_000));
+                WaitForJob(now + (_inFlightCount > 0 ? PollNs : IdleWaitNs));
                 continue;
             }
 
@@ -749,6 +930,13 @@ internal sealed class PresentLoop : IDisposable
         }
     }
 
+    /// <summary>
+    /// Waits for a job, until <paramref name="untilNs"/> at the latest (the caller's loop goes round again either way). Two
+    /// milliseconds or more ahead: on the event, which a new job sets at once. Closer: a precise sleep, a tenth of a
+    /// millisecond at a time, so a job that comes meanwhile waits at most that. (It used to sleep through any wait under a
+    /// millisecond, and the idle wait of a millisecond always fell under it by the time it was measured: a job came up to a
+    /// millisecond before the present thread saw it, which variable refresh showed as a 0.5 ms jitter of real frames.)
+    /// </summary>
     private void WaitForJob(long untilNs)
     {
         if (!_jobs.IsEmpty || _stop)
@@ -756,15 +944,26 @@ internal sealed class PresentLoop : IDisposable
             return;
         }
 
-        var ms = (int)Math.Clamp((untilNs - Monotonic.NowNs + 999_999) / 1_000_000, 0, 50);
-        if (ms == 0 || (untilNs - Monotonic.NowNs) < 1_000_000)
+        var left = untilNs - Monotonic.NowNs;
+        if (left <= 0)
         {
-            DeadlineWaiter.Sleep.WaitUntil(untilNs);
             return;
         }
 
-        _ = _wake.WaitOne(ms);
+        if (left < 2 * Nanoseconds.PerMillisecond)
+        {
+            DeadlineWaiter.Sleep.WaitUntil(Math.Min(untilNs, Monotonic.NowNs + JobPollNs));
+            return;
+        }
+
+        _ = _wake.WaitOne((int)Math.Min(50, (left / Nanoseconds.PerMillisecond) - 1));
     }
+
+    /// <summary>How long a job can wait for the present thread while it sleeps briefly (polling feedback).</summary>
+    private const long JobPollNs = 100 * Nanoseconds.PerMicrosecond;
+
+    /// <summary>With nothing in flight and nothing to do: wait on the event this long at most.</summary>
+    private const long IdleWaitNs = 5 * Nanoseconds.PerMillisecond;
 
     /// <summary>The refresh a present submitted now would be shown at: behind the last one in flight, else the next one it can make.</summary>
     private long PredictNext(long now)
@@ -849,7 +1048,11 @@ internal sealed class PresentLoop : IDisposable
         var readyNs = write == 0 ? t2 : _presenter.Ring is { } ring && ring.ReadWrittenValue() >= write ? t2 : 0;
         var queuedNs = outcome == PresentOutcome.Filler ? t2 : Math.Min(_pendingSinceNs == 0 ? t2 : _pendingSinceNs, t2);
         _inFlight[(_inFlightHead + _inFlightCount) % InFlightCapacity] =
-            new InFlight(id, slotIndex, kind, outcome, write, target, t2, predicted, readyNs, lateAtSubmit, cause, _lead.LeadNs, queuedNs, stale);
+            new InFlight(id, slotIndex, kind, outcome, write, target, t2, predicted, readyNs, lateAtSubmit, cause, _lead.LeadNs, queuedNs, stale)
+            {
+                AfterLate = _expectedDiscards > 0,
+                CallNs = t2 - t1,
+            };
         _inFlightCount++;
         _lastPredictedNs = predicted;
         if (_inFlightCount > Volatile.Read(ref _maxInFlight))
@@ -886,7 +1089,9 @@ internal sealed class PresentLoop : IDisposable
         switch (outcome)
         {
             case PresentOutcome.DroppedAbsorbed:
-                _ = _accounting.OnCatchUp(now, givesBackARefresh: true, shownLate: false);
+                // Not a miss by itself (its refresh shows the image it repeats); the attribution stays in the record for
+                // the collector, which checks what that refresh did show.
+                miss = _accounting.OnCatchUp(now, givesBackARefresh: true, shownLate: false);
                 isMiss = false;
                 break;
             case PresentOutcome.DroppedLate:
@@ -899,6 +1104,8 @@ internal sealed class PresentLoop : IDisposable
         if (job.Kind == PresentKind.Repeat)
         {
             // A repeat's refresh shows the image it repeats anyway (the last one flipped), unless that image was given up.
+            // (Or unless that image is never shown, or shown late, or a newer one early: the collector checks the refresh
+            // against the shows around it, with this record's attribution.)
             isMiss = _staleCause != MissKind.None;
             miss = isMiss ? _staleCause : miss;
         }
@@ -967,17 +1174,44 @@ internal sealed class PresentLoop : IDisposable
 
     /// <summary>
     /// A present was reported shown. With a first-pixel time: it feeds the refresh grid; a show later than predicted makes
-    /// everything behind it in the FIFO late by as much (predictions shift, and the slots that cannot make their refresh
-    /// are given up or shown late, see <see cref="CatchUpPolicy"/>), and the miss is judged from host-clock facts
-    /// (<see cref="MissAccounting"/>); a write whose content was ready only after it was submitted raises the present lead
-    /// (<see cref="LeadController"/>). Without a first-pixel time on a surface that reports them (the report never came),
-    /// the show is counted as untimed and kept out of the grid, the lateness test and the intervals.
+    /// everything behind it in the FIFO late by as much (their predictions move), and the miss is judged from host-clock
+    /// facts (<see cref="MissAccounting"/>); a write whose content was ready only after it was submitted raises the present
+    /// lead (<see cref="LeadController"/>). Presents submitted after a late show are predicted for their own refresh while
+    /// the compositor is expected to give the lost refresh back (it discards a queued present: with two queued); if one of
+    /// them is late too, it did not, and the present thread catches up itself (<see cref="CatchUpPolicy"/>). Without a
+    /// first-pixel time on a surface that reports them, the present was discarded by the compositor (or its report lost
+    /// the time): counted as untimed, kept out of the grid, the lateness test and the intervals, and given the attribution
+    /// the collector uses if a timed neighbour took its refresh.
     /// </summary>
     private void OnShown(in InFlight entry, long reportedNs, long actualNs, bool offscreen)
     {
         var timed = actualNs > 0;
         var untimed = !timed && !offscreen && _presenter.ReportsPresentTimes;
         var shownNs = timed ? actualNs : reportedNs;
+        if (entry.Outcome == PresentOutcome.Probe)
+        {
+            if (entry.SlotIndex == -4)
+            {
+                OnVrrProbeShown(entry.SubmitNs, timed ? shownNs : 0);
+                return;
+            }
+
+            if (timed && _presenter.IsTimingKnown)
+            {
+                _grid.AddShow(shownNs);
+            }
+
+            OnProbeShown(entry, shownNs, timed);
+            _lastShownNs = timed ? shownNs : 0;
+            return;
+        }
+
+        if (_vrr && !offscreen)
+        {
+            OnShownVrr(entry, reportedNs, shownNs, timed, untimed);
+            return;
+        }
+
         var period = (long)Math.Round(_grid.PeriodNs);
         var isMiss = false;
         var miss = MissKind.LatePresent;
@@ -990,6 +1224,7 @@ internal sealed class PresentLoop : IDisposable
         else if (untimed)
         {
             Volatile.Write(ref _untimedShows, _untimedShows + 1);
+            miss = DiscardCause(entry, reportedNs);
         }
         else if (timed)
         {
@@ -1018,51 +1253,106 @@ internal sealed class PresentLoop : IDisposable
                 // The compositor's latch, from this show: taken for this refresh means handed over by its latch; and if
                 // nothing flipped at the refresh before, it missed that one's latch. Only a timed show just before tells
                 // that (none, or an untimed one, is no evidence: the refresh before may have been taken).
-                var previousFlip = _lastShownNs;
-                if (timed)
-                {
-                    var freeBefore = previousFlip != 0 && shownNs - previousFlip >= (2 * period) - (period / 2);
-                    _latch.Add(reportedNs, shownNs, handover, period, freeBefore);
-                }
-
                 // Shown later than predicted: everything behind it in the FIFO is late by as much. With first-pixel times that
                 // is exact (half a period); a report's own time lands some time after the refresh (three quarters).
                 var late = (shownNs - entry.PredictedNs + (timed ? period / 2 : period / 4)) / period;
+                var previousFlip = _lastShownNs;
+                if (timed)
+                {
+                    // An upper bound only. A free refresh before a show is no lower bound: the compositor may simply have
+                    // missed that refresh, or the present was held back to its own (the empty-queue rule); such bounds
+                    // claimed latches far earlier than the latch sweep measures (5 to 6 ms against 2 at 119.88 Hz) and
+                    // made presents look unreachable, which dropped them.
+                    _latch.Add(reportedNs, shownNs, handover, period, couldHaveMadeEarlier: false);
+                }
+
                 var lateCause = MissKind.LatePresent;
                 if (late >= 1)
                 {
                     Volatile.Write(ref _lateShows, _lateShows + 1);
+
+                    // Held back by the in-flight cap with its content ready: the lead could not have helped. After a late
+                    // show the cap holds the next present until the late one is shown, which can be past that present's
+                    // latch: then it is the late show's consequence, not the pipeline's.
+                    var capLimited = entry.SubmitNs - entry.QueuedNs > 2 * PollNs && ready <= entry.SubmitNs;
                     required = _accounting.RequiredLeadNs(reportedNs);
-                    lateCause = _accounting.OnLateShow(reportedNs, timed ? handoverLead : long.MinValue, (int)late);
-                    Shift(late * period, lateCause);
-                    if (timed && previousFlip != 0 && previousFlip <= entry.PredictedNs - period + (period / 2))
+                    lateCause = _accounting.OnLateShow(reportedNs, timed ? handoverLead : long.MinValue, (int)late,
+                        capLimited && entry.AfterLate ? _expectedDiscardCause : MissKind.None);
+
+                    if (entry.AfterLate || !ExpectGiveBack(period))
                     {
+                        // Submitted for its own refresh after a late show, and late as well: the compositor did not give the
+                        // refresh back. Or not expected at all. The present thread catches up itself (CatchUpPolicy, on the
+                        // next slots).
+                        _expectedDiscards = 0;
+                        Shift(late * period, lateCause, chain: true);
+                        Volatile.Write(ref _ownCatchUps, _ownCatchUps + 1);
+                    }
+                    else
+                    {
+                        // The presents queued behind it are late too; new ones keep their own refresh (the compositor
+                        // discards one of the queued presents to give the refresh back).
+                        Shift(late * period, lateCause, chain: false);
+                        _expectedDiscards += (int)late;
+                        _expectedDiscardCause = CatchUpCause(lateCause);
+                    }
+
+                    if (timed && lateCause == MissKind.LatePresent && previousFlip != 0 && previousFlip <= entry.PredictedNs - period + (period / 2))
+                    {
+                        // Evidence about the latch only from the pipeline's late shows: one the display's (handed over in
+                        // time, the compositor missed the refresh) would claim a latch as early as its hand-over.
                         _latch.AddMissed(reportedNs, entry.PredictedNs, handover);
                     }
 
-                    // Handed over as soon as it was there (its job came, or its content was written, only then) means it was
-                    // decided too late: the lead goes up. Held back by the in-flight cap with its content ready means the lead
-                    // could not have helped.
-                    var capLimited = entry.SubmitNs - entry.QueuedNs > 2 * PollNs && ready <= entry.SubmitNs;
-                    if (lateCause != MissKind.RateChange && entry.Outcome != PresentOutcome.Filler && !capLimited && _lead.OnLateContent(reportedNs))
+                    // A late show of a present handed over as soon as it was there (its job came, or its content was
+                    // written, only then) means it was decided too late for the latch: the lead goes up. Once the
+                    // pipeline's; the display's (handed over in time: the compositor missed the refresh, a higher lead
+                    // would not help) only when another came within a second: a latch that moved, not a missed refresh.
+                    // (KWin skipping one refresh every second, as seen on DP-3 with a browser open, shows presents handed
+                    // over 7.8 ms ahead a refresh late as well: no lead fixes that, so it must not raise one.)
+                    var own = entry.Outcome != PresentOutcome.Filler && !capLimited && !entry.AfterLate && lateCause != MissKind.RateChange;
+                    var again = _lastLateNs != long.MinValue && reportedNs - _lastLateNs < Nanoseconds.PerSecond;
+                    if (own && (lateCause == MissKind.LatePresent || again) && _lead.OnLateContent(reportedNs, timed ? handoverLead : long.MinValue))
                     {
                         _forceGrid = true;
+                    }
+
+                    if (own)
+                    {
+                        _lastLateNs = reportedNs;
                     }
                 }
                 else
                 {
                     if (timed)
                     {
-                        _accounting.RecordOnTime(reportedNs, handoverLead);
+                        // How much earlier than seen it may really have been handed over: the presenter's call (the present
+                        // went out somewhere in it), and a turn when its content was seen written only after it was submitted.
+                        _accounting.RecordOnTime(reportedNs, handoverLead, entry.CallNs + (entry.ReadyNs > entry.SubmitNs || entry.ReadyNs == 0 ? PollNs : 0));
                     }
 
-                    if (shownNs < entry.PredictedNs - (period / 2))
+                    var early = shownNs < entry.PredictedNs - (period / 2) ? (entry.PredictedNs - shownNs + (period / 2)) / period : 0;
+                    var expected = Math.Min(early, entry.Behind);
+                    if (expected > 0)
+                    {
+                        // It was predicted behind a late show and the compositor gave that refresh back (it discarded a
+                        // present queued ahead of it): the presents still behind it are back on their own refreshes.
+                        Unshift(expected * period);
+                    }
+
+                    if (early > expected)
                     {
                         // Shown earlier than predicted: the FIFO is ahead of the refreshes it was meant for, and so is every
                         // present behind it. The predictions follow at once, so the next slot finds a refresh before its own
-                        // free and a filler goes in for it: the FIFO is back on the slots' refreshes from there.
+                        // free and a filler goes in for it: the FIFO is back on the slots' refreshes from there. Behind a
+                        // present the compositor discarded (its report came without a time), that is the compositor's doing.
                         Volatile.Write(ref _earlyShows, _earlyShows + 1);
-                        Shift(-((entry.PredictedNs - shownNs + (period / 2)) / period) * period, MissKind.Early);
+                        Shift(-(early - expected) * period, _untimedSinceTimed > 0 ? MissKind.Discarded : MissKind.Early, chain: true);
+                    }
+                    else if (entry.AfterLate && early == 0)
+                    {
+                        // A present submitted for its own refresh after a late show made it: the FIFO is back on time.
+                        _expectedDiscards = 0;
                     }
                 }
 
@@ -1075,7 +1365,7 @@ internal sealed class PresentLoop : IDisposable
                         if (deviation < -(period / 2))
                         {
                             isMiss = true;
-                            miss = MissKind.Early;
+                            miss = entry.EarlyCause == MissKind.Discarded || _untimedSinceTimed > 0 ? MissKind.Discarded : MissKind.Early;
                         }
                         else if (deviation > period / 2)
                         {
@@ -1144,19 +1434,79 @@ internal sealed class PresentLoop : IDisposable
         }
     }
 
-    /// <summary>Moves the predictions of every present in flight (they are behind or ahead of their refreshes by as much as the
-    /// one just shown); <paramref name="cause"/> is whose that is, for the ones that will be shown away from their refresh.</summary>
-    private void Shift(long deltaNs, MissKind cause)
+    /// <summary>
+    /// Whose a present reported without a first-pixel time is, should a timed neighbour have taken its refresh (the
+    /// collector judges that): the compositor's give-back after a late show carries the late show's attribution; otherwise
+    /// a present handed over in time (at least the measured deadline before its refresh) that the compositor did not show is
+    /// the display's (<see cref="MissKind.Discarded"/>), one handed over later the pipeline's (<see cref="MissKind.NotShown"/>).
+    /// </summary>
+    private MissKind DiscardCause(in InFlight entry, long nowNs)
     {
+        if (_expectedDiscards > 0)
+        {
+            _expectedDiscards--;
+            Volatile.Write(ref _compositorCatchUps, _compositorCatchUps + 1);
+            return _expectedDiscardCause;
+        }
+
+        if (_accounting.InRateChange(nowNs))
+        {
+            return MissKind.RateChange;
+        }
+
+        var ready = entry.ReadyNs > 0 ? entry.ReadyNs : nowNs;
+        var lead = entry.TargetNs - Math.Max(entry.SubmitNs, ready);
+        return lead >= _accounting.RequiredLeadNs(nowNs) ? MissKind.Discarded : MissKind.NotShown;
+    }
+
+    /// <summary>The attribution of a refresh given back after a late show of <paramref name="lateCause"/>.</summary>
+    private static MissKind CatchUpCause(MissKind lateCause) => lateCause switch
+    {
+        MissKind.DisplayLate or MissKind.CatchUp or MissKind.Discarded => MissKind.CatchUp,
+        MissKind.RateChange => MissKind.RateChange,
+        _ => MissKind.NotShown,
+    };
+
+    /// <summary>
+    /// Moves the predictions of every present in flight (they are behind or ahead of their refreshes by as much as the one
+    /// just shown); <paramref name="cause"/> is whose that is, for the ones that will be shown away from their refresh.
+    /// <paramref name="chain"/>: new presents are predicted behind the moved ones (otherwise they keep their own refresh,
+    /// the compositor being expected to give the refresh back).
+    /// </summary>
+    private void Shift(long deltaNs, MissKind cause, bool chain)
+    {
+        var periods = _grid.PeriodNs > 0 ? (int)Math.Round(deltaNs / _grid.PeriodNs) : 0;
         for (var i = 0; i < _inFlightCount; i++)
         {
             ref var e = ref _inFlight[(_inFlightHead + i) % InFlightCapacity];
-            e = e with { PredictedNs = e.PredictedNs + deltaNs, Inherited = e.Inherited == MissKind.None ? cause : e.Inherited };
+            e = e with
+            {
+                PredictedNs = e.PredictedNs + deltaNs,
+                Inherited = e.Inherited == MissKind.None && deltaNs > 0 ? cause : e.Inherited,
+                EarlyCause = deltaNs < 0 && e.EarlyCause == MissKind.None ? cause : e.EarlyCause,
+                Behind = deltaNs > 0 ? e.Behind + periods : e.Behind,
+            };
         }
 
-        if (_lastPredictedNs != long.MinValue)
+        if (chain && _lastPredictedNs != long.MinValue)
         {
             _lastPredictedNs += deltaNs;
+        }
+    }
+
+    /// <summary>The compositor gave back a refresh the presents in flight were predicted behind: they move back (only those
+    /// that were moved).</summary>
+    private void Unshift(long deltaNs)
+    {
+        var periods = _grid.PeriodNs > 0 ? (int)Math.Round(deltaNs / _grid.PeriodNs) : 0;
+        for (var i = 0; i < _inFlightCount; i++)
+        {
+            ref var e = ref _inFlight[(_inFlightHead + i) % InFlightCapacity];
+            var back = Math.Min(e.Behind, periods);
+            if (back > 0)
+            {
+                e = e with { PredictedNs = e.PredictedNs - (long)Math.Round(back * _grid.PeriodNs), Behind = e.Behind - back };
+            }
         }
     }
 
@@ -1184,13 +1534,14 @@ internal sealed class PresentLoop : IDisposable
         {
             Volatile.Write(ref _rateChanges, _rateChanges + 1);
             _accounting.BeginRateChange(now, RateChangeWindowNs);
+            Volatile.Write(ref _sweepResult, null); // measured on the old output
         }
 
         _latch.Clear();
 
         if (_display == DisplayKind.Window && _clock == PlaybackClock.Real)
         {
-            _lead.Reset(BaseLead(rate), MaxLead(rate), now);
+            _lead.Reset(BaseLead(rate), MaxLead(rate), now, moved ? LeadChange.NewOutput : LeadChange.Start);
         }
 
         _forceGrid = true;
@@ -1205,6 +1556,24 @@ internal sealed class PresentLoop : IDisposable
     /// <summary>Sends the grid and lead to the pacing thread when first known, when the rate or lead changes, or when the phase moved by 100 µs.</summary>
     private void SendGrid(long now)
     {
+        if (_vrr)
+        {
+            // No grid under variable refresh: the rate (the shortest refresh period) and the expected delay to the first
+            // pixel (the lead: the slots' targets are their hand-over plus that).
+            if (_forceGrid && _displayUpdates.TryEnqueue(new DisplayUpdate(now, _grid.Rate, _vrrLeadNs)))
+            {
+                _forceGrid = false;
+                Interlocked.Increment(ref _gridSeq);
+                Volatile.Write(ref _sentAnchorNs, now);
+                Volatile.Write(ref _sentRateNum, _grid.Rate.Numerator);
+                Volatile.Write(ref _sentRateDen, _grid.Rate.Denominator);
+                Volatile.Write(ref _sentLeadNs, _vrrLeadNs);
+                Interlocked.Increment(ref _gridSeq);
+            }
+
+            return;
+        }
+
         Volatile.Write(ref _currentLeadNs, _lead.LeadNs);
         if (!_grid.HasPhase || !_presenter.IsTimingKnown)
         {
@@ -1249,5 +1618,18 @@ internal sealed class PresentLoop : IDisposable
         long LeadNs,
         long QueuedNs,
         MissKind StaleCause = MissKind.None,
-        MissKind Inherited = MissKind.None);
+        MissKind Inherited = MissKind.None)
+    {
+        /// <summary>Refreshes its prediction was moved later because a present ahead of it in the FIFO was shown late.</summary>
+        public int Behind { get; init; }
+
+        /// <summary>Submitted for its own refresh while the compositor was expected to give back a refresh lost to a late show.</summary>
+        public bool AfterLate { get; init; }
+
+        /// <summary>Whose it is if it is shown early: a compositor's discard ahead of it (the display's) or the FIFO being ahead.</summary>
+        public MissKind EarlyCause { get; init; }
+
+        /// <summary>How long the presenter's call took: the present went to the compositor somewhere in it, before <see cref="SubmitNs"/>.</summary>
+        public long CallNs { get; init; }
+    }
 }

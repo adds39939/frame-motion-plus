@@ -45,6 +45,9 @@ internal sealed record PlayOptions
 
     public bool Fullscreen { get; init; }
 
+    /// <summary>--clock: fixed refresh, variable refresh, or auto (variable when fullscreen and the display follows the presents).</summary>
+    public Pipeline.RefreshMode Refresh { get; init; } = Pipeline.RefreshMode.Auto;
+
     /// <summary>No window: an offscreen target on the virtual clock (deterministic), or the real clock with <see cref="Realtime"/>.</summary>
     public bool Offscreen { get; init; }
 
@@ -107,6 +110,13 @@ internal sealed record PlayOptions
             WindowWidth = windowWidth,
             WindowHeight = windowHeight,
             Fullscreen = r.Flag("fullscreen"),
+            Refresh = r.String("clock")?.ToLowerInvariant() switch
+            {
+                null or "auto" => Pipeline.RefreshMode.Auto,
+                "fixed" => Pipeline.RefreshMode.Fixed,
+                "vrr" => Pipeline.RefreshMode.Vrr,
+                var v => throw new UsageException($"Option '--clock' expects auto, fixed or vrr, got '{v}'."),
+            },
             Offscreen = offscreen,
             Realtime = r.Flag("realtime"),
             OffscreenRate = r.Rate("rate", FrameRate.FromHz(120)),

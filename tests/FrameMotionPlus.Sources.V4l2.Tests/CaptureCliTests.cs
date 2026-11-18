@@ -82,7 +82,9 @@ public sealed class CaptureCliTests
         }
 
         var environment = new Dictionary<string, string> { [variable] = value };
-        var (exit, _, err) = await RunOutOfProcess(environment, null, 120, "capture", path, "--size", "320x180", "--generator", "blend");
+        // Windowed and bounded, should the missing piece ever not stop it before a window opens (capture is fullscreen and
+        // unlimited by default).
+        var (exit, _, err) = await RunOutOfProcess(environment, null, 120, "capture", path, "--size", "320x180", "--generator", "blend", "--windowed", "--duration-s", "2");
         Assert.Equal(PatternCommand.ExitUnavailable, exit);
         Assert.Single(err.Split('\n', StringSplitOptions.RemoveEmptyEntries));
         Assert.StartsWith("fmp: capture", err, StringComparison.Ordinal);

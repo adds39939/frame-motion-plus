@@ -31,6 +31,7 @@ public enum StopReason
 internal sealed class PacingLoop
 {
     private const long MaxIdleNs = 2 * Nanoseconds.PerMillisecond;
+    private const long LiveIdleNs = 250 * Nanoseconds.PerMicrosecond;
     private const int PresentBacklogLimit = 3;
     private const long ProgressCheckNs = 100 * Nanoseconds.PerMillisecond;
 
@@ -96,7 +97,8 @@ internal sealed class PacingLoop
         long warmupNs,
         long presentLeadNs,
         int startupFrames,
-        long startLeadNs)
+        long startLeadNs,
+        double resample = 1.0)
     {
         _scheduler = scheduler;
         _source = source;
@@ -116,7 +118,24 @@ internal sealed class PacingLoop
         _presentLeadNs = presentLeadNs;
         _startupFrames = Math.Max(1, startupFrames);
         _startLeadNs = startLeadNs;
+        _resample = resample > 0 ? resample : 1.0;
     }
+
+    /// <summary>
+    /// How a file's content times are stretched (1: not at all): to lock a file whose rate is a hair off the display's
+    /// (60.000 fps on 119.88 Hz: 1.001, the file plays 0.1% slower), so real frames land on refreshes instead of 96% of the
+    /// slots being generated. A file has no live constraint; a live source is never resampled.
+    /// </summary>
+    public double Resample => _resample;
+
+    private readonly double _resample;
+    private long _resampleInNs;
+    private long _resampleOutNs;
+
+    /// <summary>A frame's content time on the playback's clock, once the start-up frames have fixed the origin.</summary>
+    private long MapContent(long sourceNs) => _resample == 1.0
+        ? sourceNs + _contentOffsetNs
+        : _resampleOutNs + (long)Math.Round((sourceNs - _resampleInNs) * _resample);
 
     /// <summary>
     /// The constant added to a file's content times so its first frame is due <paramref name="startLeadNs"/> from now (the
@@ -227,7 +246,9 @@ internal sealed class PacingLoop
                 }
                 else
                 {
-                    waiter.WaitUntil(Math.Min(next, now + MaxIdleNs));
+                    // A live source's next frame comes when it comes: look for it often (its arrival is part of the
+                    // latency; under variable refresh a real frame is decided the moment it is there).
+                    waiter.WaitUntil(Math.Min(next, now + (_source.IsLive ? LiveIdleNs : MaxIdleNs)));
                 }
 
                 continue;
@@ -236,6 +257,7 @@ internal sealed class PacingLoop
             _phase = 3;
             var decision = _scheduler.Schedule(now);
             Execute(decision);
+            ApplyDeferredDisplay();
             ReleaseUnreferenced();
             if (CheckLimits(decision))
             {
@@ -280,7 +302,7 @@ internal sealed class PacingLoop
             if (_heldCount < _held.Length && frames.TryRead(out var frame))
             {
                 _framesRead++;
-                var contentNs = _contentOffsetNs == long.MinValue ? frame.ContentTimeNs : frame.ContentTimeNs + _contentOffsetNs;
+                var contentNs = _contentOffsetNs == long.MinValue ? frame.ContentTimeNs : MapContent(frame.ContentTimeNs);
                 if (contentNs <= _lastFrameContentNs)
                 {
                     // Out of order (cannot happen for the file source): never referenced, given back at once.
@@ -333,14 +355,15 @@ internal sealed class PacingLoop
             // The scheduler's first decision is at the next refresh, and τ = V − D is never past it: a first frame due a
             // start lead from now is shown first.
             var offset = StartOffset(_source.IsLive, now, _startLeadNs, _held[_heldHead].ContentNs);
+            _resampleInNs = _held[_heldHead].Frame.ContentTimeNs;
+            _resampleOutNs = _held[_heldHead].ContentNs + offset;
+            Volatile.Write(ref _contentOffsetNs, offset);
             for (var i = 0; i < _heldCount; i++)
             {
                 ref var h = ref _held[(_heldHead + i) % _held.Length];
-                h = h with { ContentNs = h.ContentNs + offset };
+                h = h with { ContentNs = MapContent(h.Frame.ContentTimeNs) };
+                _lastFrameContentNs = h.ContentNs;
             }
-
-            _lastFrameContentNs += offset;
-            Volatile.Write(ref _contentOffsetNs, offset);
         }
 
         while (_fedCount < _heldCount)
@@ -385,16 +408,46 @@ internal sealed class PacingLoop
     {
         while (_presenter.DisplayUpdates.TryDequeue(out var update))
         {
-            if (!_virtual)
+            if (_virtual)
             {
-                // The present thread's lead (it adapts): the scheduler's grid is the refreshes shifted earlier by it, so a
-                // change moves the decisions, never the refreshes the slots are for.
-                Volatile.Write(ref _presentLeadNs, update.LeadNs);
-                _scheduler.UpdateDisplayTiming(update.AnchorNs - _presentLeadNs, update.Rate);
-                Volatile.Write(ref _displayUpdates, _displayUpdates + 1);
+                continue;
             }
+
+            if (update.LeadNs > _presentLeadNs && _scheduler.Counters.Slots > 0)
+            {
+                // A higher lead moves every decision earlier: the slot about to be decided could find its (earlier) time
+                // already past and be skipped, a refresh lost to the raise. It is decided on the old grid; the raise
+                // applies from the slot after it (ApplyDeferredDisplay).
+                _deferredDisplay = update;
+                _haveDeferredDisplay = true;
+                continue;
+            }
+
+            _haveDeferredDisplay = false;
+            ApplyDisplay(update);
         }
     }
+
+    /// <summary>The present thread's lead (it adapts): the scheduler's grid is the refreshes shifted earlier by it, so a
+    /// change moves the decisions, never the refreshes the slots are for.</summary>
+    private void ApplyDisplay(in DisplayUpdate update)
+    {
+        Volatile.Write(ref _presentLeadNs, update.LeadNs);
+        _scheduler.UpdateDisplayTiming(update.AnchorNs - _presentLeadNs, update.Rate);
+        Volatile.Write(ref _displayUpdates, _displayUpdates + 1);
+    }
+
+    private void ApplyDeferredDisplay()
+    {
+        if (_haveDeferredDisplay)
+        {
+            _haveDeferredDisplay = false;
+            ApplyDisplay(_deferredDisplay);
+        }
+    }
+
+    private DisplayUpdate _deferredDisplay;
+    private bool _haveDeferredDisplay;
 
     private void Execute(in SlotDecision decision)
     {
@@ -621,6 +674,7 @@ internal sealed class PacingLoop
             Request = request,
             Write = write,
             TargetNs = decision.TargetTimeNs + _presentLeadNs,
+            DueNs = decision.TargetTimeNs,
             SlotKind = decision.Kind,
             FrameA = decision.FrameA,
             FrameB = decision.FrameB,

@@ -32,6 +32,21 @@ public enum DisplayKind
     Offscreen = 1,
 }
 
+/// <summary>How output slots are timed against the display (the design doc's two clock modes).</summary>
+public enum RefreshMode
+{
+    /// <summary>Variable refresh when the window is fullscreen, the display follows the presents (measured before
+    /// playback) and the output's highest rate can show the source's rate times the multiplier; fixed refresh otherwise.</summary>
+    Auto = 0,
+
+    /// <summary>Slots are the output's refreshes; each present is handed over before the compositor's latch for its refresh.</summary>
+    Fixed = 1,
+
+    /// <summary>Slots follow the source (V = ts + D + kT/M); each present is handed over at its slot's time and the display
+    /// refreshes for it.</summary>
+    Vrr = 2,
+}
+
 /// <summary>The clock the pacing runs on.</summary>
 public enum PlaybackClock
 {
@@ -101,6 +116,15 @@ public sealed record PlaybackOptions
 
     /// <summary>Borderless fullscreen on the output the window is on, once it has shown a frame.</summary>
     public bool Fullscreen { get; init; }
+
+    /// <summary>Fixed refresh, variable refresh, or variable when the display does it (windowed: fixed).</summary>
+    public RefreshMode Refresh { get; init; } = RefreshMode.Auto;
+
+    /// <summary>
+    /// A file within 0.5% of a whole number of refreshes per frame plays that much slower or faster so it phase-locks to
+    /// fixed refresh (60.000 fps on 119.88 Hz: 0.1% slower). Never a live source.
+    /// </summary>
+    public bool ResampleToDisplay { get; init; } = true;
 
     /// <summary>Vulkan validation layer with synchronization checks.</summary>
     public bool Validate { get; init; }

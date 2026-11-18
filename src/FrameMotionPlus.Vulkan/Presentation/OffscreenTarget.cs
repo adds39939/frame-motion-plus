@@ -206,14 +206,33 @@ public sealed unsafe class OffscreenTarget : PresentTarget
         _readbackFrame[imageIndex] = frame;
     }
 
-    internal override PresentOutcome Present(int imageIndex, int frameSlot, ulong presentId) => PresentOutcome.Presented;
+    internal override PresentOutcome Present(int imageIndex, int frameSlot, ulong presentId)
+    {
+        PresentSubmitted?.Invoke(presentId);
+        return PresentOutcome.Presented;
+    }
+
+    /// <summary>Simulations: told each present's id as it is submitted (on the presenter's thread).</summary>
+    public Action<ulong>? PresentSubmitted { get; set; }
 
     /// <summary>
-    /// Tests: makes the target report first-pixel times through this source (present id → time; 0 while its report has not
-    /// come; negative for a report that came without a time), as a swapchain with present timing does, so the presenter's
-    /// handling of late, missing and time-less reports can be checked offscreen.
+    /// Simulations (with <see cref="PresentTimeSource"/>): a present counts as complete only once its report has come, as
+    /// present-wait reports a swapchain's present complete once shown, so the presenter caps presents in flight the way it
+    /// does on a window.
     /// </summary>
-    internal Func<ulong, long>? PresentTimeSource { get; set; }
+    public bool CompletesOnReport { get; set; }
+
+    internal override bool SupportsPresentWait => CompletesOnReport && PresentTimeSource is not null;
+
+    internal override bool PollPresentComplete(ulong presentId) => (PresentTimeSource?.Invoke(presentId) ?? 1) != 0;
+
+    /// <summary>
+    /// Tests and simulations: makes the target report first-pixel times through this source (present id → time; 0 while its
+    /// report has not come; negative for a report that came without a time), as a swapchain with present timing does, so the
+    /// presenter's handling of late, missing and time-less reports, and a pipeline's pacing against a model of a compositor,
+    /// can be checked offscreen. Called on the presenter's thread, only for presents whose GPU work has completed.
+    /// </summary>
+    public Func<ulong, long>? PresentTimeSource { get; set; }
 
     internal override bool ReportsPresentTimes => PresentTimeSource is not null;
 

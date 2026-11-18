@@ -6,6 +6,44 @@ namespace FrameMotionPlus.Core.Tests.Scheduling;
 
 public class FallbackSchedulingTests
 {
+    /// <summary>
+    /// Phase 6: at stride 2 a phase-locked source used to show every real frame (and every generated one) a whole refresh
+    /// after τ reached it: the alignment keeps τ within the phase hysteresis of each real frame, often a few microseconds
+    /// before it, and the stride buckets, measured from the frame before with a 1 µs tolerance, then put the slot in the
+    /// previous bucket (a repeat), so the frame came a refresh later (measured 4.11 ms at p50, a refresh at 240.016 Hz, in
+    /// the Phase 4b runs of a 60 fps file at 2x; Phase 1's simulator showed the same). With the snap as the tolerance, the
+    /// real frame is shown at the slot τ reaches it (within the snap), the cadence stays real, repeat, generated, repeat,
+    /// and generations stay a stride apart.
+    /// </summary>
+    [Fact]
+    public void At_stride_two_a_phase_locked_source_shows_each_real_frame_at_the_slot_its_time_reaches()
+    {
+        var display = FrameRate.FromDouble(240.016);
+        var options = Fixed(240) with { DisplayRate = display, MaxMultiplier = 2 };
+        var run = Run(options, Sim(FrameRate.FromHz(60), 20));
+        var steady = run.From(5 * Second);
+        var real = steady.Where(r => r.Kind == SlotKind.Real).ToList();
+
+        Assert.Equal(2, run.Result.Diagnostics.Stride);
+        Assert.True(run.Result.Diagnostics.PhaseCoherent);
+        Assert.Equal(0, run.Result.Missed);
+        Assert.True(real.Count > 800);
+        var snap = 0.02 * FrameRate.FromHz(60).PeriodNs;
+        Assert.All(real, r => Assert.InRange(r.IdealContentNs - r.ContentNs, -snap, display.PeriodNs / 4));
+
+        var start = steady.FindIndex(r => r.Kind == SlotKind.Real);
+        for (var i = start; i + 4 <= steady.Count; i += 4)
+        {
+            Assert.Equal(SlotKind.Real, steady[i].Kind);
+            Assert.Equal(SlotKind.Repeat, steady[i + 1].Kind);
+            Assert.Equal(SlotKind.Generated, steady[i + 2].Kind);
+            Assert.InRange(steady[i + 2].Timestep, 0.499, 0.501); // two refreshes of 240.016 Hz over 1/60 s
+            Assert.Equal(SlotKind.Repeat, steady[i + 3].Kind);
+        }
+
+        Assert.True(run.Result.RealLatencyMeanNs < 12.6 * Ms, $"real frames {run.Result.RealLatencyMeanNs / 1e6:0.000} ms after their content time");
+    }
+
     [Fact]
     public void Thirty_to_120_drops_to_2x_when_d_exceeds_the_4x_budget()
     {

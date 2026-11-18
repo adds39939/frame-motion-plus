@@ -2,6 +2,7 @@ using FrameMotionPlus.App.Capture;
 using FrameMotionPlus.App.Cli;
 using FrameMotionPlus.Core.Frames;
 using FrameMotionPlus.Cuda.Kernels;
+using FrameMotionPlus.Pipeline;
 using FrameMotionPlus.Sources.V4l2.Interop;
 using FrameMotionPlus.Sources.V4l2.Tests.Support;
 
@@ -213,6 +214,24 @@ public class NegotiationTests
         Assert.True(CaptureOptions.Parse(["--list"]).List);
     }
 
+    /// <summary>
+    /// Capture is fullscreen unless asked otherwise (Phase 6): there KWin gives the window variable refresh and --clock
+    /// auto uses it, the lowest latency measured; --windowed or a --window size keeps a window, --offscreen has none.
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { "--mode", "4k30-hdr" }, true)]
+    [InlineData(new[] { "--mode", "1440p60-hdr" }, true)]
+    [InlineData(new[] { "--mode", "4k30-hdr", "--fullscreen" }, true)]
+    [InlineData(new[] { "--mode", "4k30-hdr", "--windowed" }, false)]
+    [InlineData(new[] { "--mode", "4k30-hdr", "--window", "960x540" }, false)]
+    [InlineData(new[] { "--mode", "4k30-hdr", "--offscreen" }, false)]
+    public void Capture_is_fullscreen_unless_a_window_is_asked_for(string[] args, bool fullscreen)
+    {
+        var o = CaptureOptions.Parse(args);
+        Assert.Equal(fullscreen, o.Fullscreen);
+        Assert.Equal(RefreshMode.Auto, o.Refresh);
+    }
+
     [Theory]
     [InlineData(new[] { "--mode", "8k240" }, "--mode")]
     [InlineData(new[] { "--mode", "4k30-hdr", "--fps", "60" }, "not both")]
@@ -224,6 +243,7 @@ public class NegotiationTests
     [InlineData(new[] { "--multiplier", "2", "--output-hz", "120" }, "not both")]
     [InlineData(new[] { "--display-hz", "60" }, "only applies with '--offscreen'")]
     [InlineData(new[] { "--offscreen", "--fullscreen" }, "do not apply with '--offscreen'")]
+    [InlineData(new[] { "--fullscreen", "--windowed" }, "contradict")]
     [InlineData(new[] { "--size", "4kx2k" }, "--size")]
     [InlineData(new[] { "--bogus", "1" }, "Unknown option")]
     public void Bad_options_are_usage_errors(string[] args, string message)

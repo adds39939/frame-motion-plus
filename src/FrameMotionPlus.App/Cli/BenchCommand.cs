@@ -15,7 +15,7 @@ internal static class BenchCommand
     {
         if (args.Length == 0)
         {
-            throw new UsageException("'fmp bench' needs a benchmark name: jitter, vfg or vfg-quality.");
+            throw new UsageException("'fmp bench' needs a benchmark name: jitter, vfg, vfg-quality or present.");
         }
 
         var rest = args.AsSpan(1).ToArray();
@@ -24,6 +24,7 @@ internal static class BenchCommand
             "jitter" => RunJitter(rest, output),
             "vfg" => VfgBenchCommand.Run(rest, output, error),
             "vfg-quality" => VfgQualityCommand.Run(rest, output, error),
+            "present" => new PresentProbe(PresentProbeOptions.Parse(rest), output).Run(),
             _ => throw new UsageException($"Unknown benchmark '{args[0]}'."),
         };
     }

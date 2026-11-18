@@ -72,6 +72,9 @@ internal static class CommandDispatcher
                                     multipliers, with the 1440p Medium gate (design doc Phase 0)
           fmp bench vfg-quality [options]
                                     VFG on SDR and PQ scenes with known motion: scores and 16-bit PNG frame dumps
+          fmp bench present [options]
+                                    What the desktop compositor does with presents, from first-pixel times: its latch,
+                                    the output's regularity, whether variable refresh is active (Phase 6)
           fmp pattern [options]     CUDA test pattern through the presentation ring to a window or offscreen (Phase 2)
           fmp decode <file> [options]
                                     Decode a video file with NVDEC into CUDA, convert it to RGB and check it (Phase 4)
@@ -82,10 +85,11 @@ internal static class CommandDispatcher
                                     CUDA-pinned buffers, repeats of a picture dropped by the cadence detector, interpolated
                                     (VFG, blend or repeat) and presented, paced by the display-time scheduler (Phase 5)
           fmp capture --list        The V4L2 capture devices and the formats, sizes and rates each offers
-          fmp verify <file.csv> [--rate <hz>] [--warmup-s <s>] [--slots <a>-<b>]
+          fmp verify <file.csv> [--rate <hz>] [--vrr] [--warmup-s <s>] [--slots <a>-<b>]
                                     Recompute a play run's verdict from its telemetry CSV alone (early, late, not shown,
                                     untimed, wrong image, order, refreshes without a present) and compare it with the
-                                    live accounting in the CSV; exit 1 on any miss, unjudged slot or disagreement
+                                    live accounting in the CSV; exit 1 on any miss, unjudged slot or disagreement. A
+                                    variable-refresh run: --vrr --rate <the output's highest rate>
           fmp --version
           fmp --help
 
@@ -176,6 +180,19 @@ internal static class CommandDispatcher
           --no-photo                Skip the photo scenes
           --vfx-sdk <dir>, --settings <file>   As for bench vfg
 
+        bench present options:
+          --test <latch|vrr|cadence>  latch: presents into an empty queue at times before a refresh (a staircase) to find
+                                    the compositor's latch; vrr: presents at off-grid intervals, first pixels following
+                                    them means variable refresh; cadence: as fast as two in flight allow (regularity)
+                                                                                              (latch)
+          --mode <fifo|fifo-latest-ready|mailbox|immediate>  The swapchain's present mode            (fifo)
+          --fullscreen              Borderless fullscreen on the window's output (KWin's VRR "automatic" needs it)
+          --interval-ms <list>      With --test vrr: the intervals presented in turn          (1.37 and 1.71 refreshes)
+          --duration-s <s>          Measured time, at most 120 s; Escape, closing the window, Ctrl+C or SIGTERM end it
+                                    early with the results so far                             (10)
+          --window <WxH>            Window size                                               (640x360)
+          --csv <path>              Every present: submitted, aimed at, first pixel
+
         pattern options:
           --size <WxH>              Pattern and ring size                                     (2560x1440)
           --format <8|10>           8-bit RGBA8 (SDR) or 10-bit RGB10A2 (PQ)                  (8)
@@ -235,6 +252,11 @@ internal static class CommandDispatcher
           --frames <n>              Play this many output slots instead
           --window <WxH>            Window size                                               (1280x720)
           --fullscreen              Borderless fullscreen on the output the window is on (off by default)
+          --clock <auto|fixed|vrr>  Output slots on the display's refresh grid (fixed), or following the source with
+                                    variable refresh (vrr: each present at its own time, the display refreshing for it).
+                                    auto: vrr when fullscreen, a probe before playback shows the display following the
+                                    presents (KWin's "automatic" VRR does so for a fullscreen window) and the output's
+                                    highest rate can show the source's rate times the multiplier; else fixed   (auto)
           --offscreen               No window: an offscreen target the file's size on a virtual clock (deterministic:
                                     every slot decided exactly on time, the threads waiting for each other); for tests
           --realtime                With --offscreen: the real clock instead (slots paced at --rate)
@@ -248,8 +270,9 @@ internal static class CommandDispatcher
                                     /usr/local/VideoFX)
           --warmup-s <s>            Excluded from the statistics, allocation and GC counts    (2)
           --present-lead-ms <ms>    The present lead to start from (how long before its refresh a slot's content must be
-                                    ready; windowed: 1.5 refreshes; offscreen: 0). It adapts: up a millisecond at once
-                                    when a frame decided too late misses the compositor's latch, slowly back down
+                                    ready; windowed: the compositor's latch, measured before playback, plus 2 ms, else
+                                    1.5 refreshes; offscreen: 0). It adapts: up a millisecond at once when a frame decided
+                                    too late misses the compositor's latch, slowly back down to where it started
           --latch-ms <ms>           The least a present is assumed to need before its refresh (offscreen: how early a
                                     slot is submitted; windowed: a floor under the adaptive lead)     (1)
           --cuda-sync <mode>        How threads wait in CUDA synchronisations: blocking (sleep; VFG's blocking call
@@ -290,7 +313,10 @@ internal static class CommandDispatcher
           --buffer-mode <mode>      auto (USERPTR into CUDA pinned memory, else USERPTR into registered memory, else
                                     MMAP registered with CUDA), userptr, userptr-registered, mmap                (auto)
           --buffers <n>             Capture buffers, 2 to 16                                     (4)
-          --generator, --quality, --multiplier, --output-hz, --duration-s, --window, --fullscreen, --validate, --csv,
+          --windowed                A window instead of borderless fullscreen (also implied by --window <WxH>). By
+                                    default capture is fullscreen on the window's output: there KWin gives it variable
+                                    refresh, which --clock auto uses (the lowest latency); a window is fixed refresh
+          --generator, --quality, --multiplier, --output-hz, --duration-s, --window, --fullscreen, --clock, --validate, --csv,
           --settings, --vfx-sdk, --warmup-s, --present-lead-ms, --latch-ms, --cuda-sync   As for play (the duration is
                                     unlimited by default: until Ctrl+C, closing the window or Escape)
           --offscreen               No window: an offscreen target on the real clock at --display-hz

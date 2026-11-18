@@ -531,6 +531,43 @@ public class WindowedTests
         Frame = ring.ConsumerFrame(n),
     };
 
+    /// <summary>
+    /// The present mode asked for is the one the swapchain is created with when the surface offers it (Phase 6 compared all
+    /// four under variable refresh with <c>fmp bench present</c>), and one it does not offer is refused, naming those it does.
+    /// </summary>
+    [Fact]
+    [Trait(Category.Name, Category.Display)]
+    public void The_swapchain_takes_the_present_mode_asked_for_and_refuses_one_the_surface_does_not_offer()
+    {
+        Requirements.SkipUnlessDisplay();
+        using var window = SdlWindow.Create(new SdlWindowOptions { Title = "fmp Vulkan test", Width = 480, Height = 270 });
+        Gpu.Run(ctx =>
+        {
+            IReadOnlyList<string> offered;
+            using (var fifo = new SwapchainTarget(ctx.Device, window))
+            {
+                Assert.Equal("Fifo", fifo.PresentModeName);
+                offered = fifo.Surface.PresentModes;
+            }
+
+            Gpu.WriteLine($"offered: {string.Join(", ", offered)}; fifo_latest_ready on the device: {ctx.Device.Capabilities.FifoLatestReady}");
+            foreach (var mode in Enum.GetValues<SwapchainPresentMode>())
+            {
+                var options = new SwapchainTargetOptions { PresentMode = mode };
+                if (offered.Contains(mode.ToString()) && (mode != SwapchainPresentMode.FifoLatestReady || ctx.Device.Capabilities.FifoLatestReady))
+                {
+                    using var target = new SwapchainTarget(ctx.Device, window, options);
+                    Assert.Equal(mode.ToString(), target.PresentModeName);
+                }
+                else
+                {
+                    var e = Assert.Throws<NotSupportedException>(() => new SwapchainTarget(ctx.Device, window, options).Dispose());
+                    Assert.Contains("offered: ", e.Message, StringComparison.Ordinal);
+                }
+            }
+        }, window.RequiredInstanceExtensions);
+    }
+
     internal static void Windowed(
         PixelFormat format,
         Action<GpuContext, SdlWindow, SwapchainTarget, VulkanPresenter, DiagnosticRingProducer> body,

@@ -14,12 +14,13 @@ internal static class VerifyCommand
     {
         if (args.Length == 0 || args[0].StartsWith("--", StringComparison.Ordinal))
         {
-            throw new UsageException("fmp verify needs a telemetry CSV: fmp verify <file.csv> [--rate <hz>] [--warmup-s <s>] [--slots <a>-<b>].");
+            throw new UsageException("fmp verify needs a telemetry CSV: fmp verify <file.csv> [--rate <hz>] [--vrr] [--warmup-s <s>] [--slots <a>-<b>].");
         }
 
         var path = args[0];
         double? rate = null;
         var warmupS = 2.0;
+        var vrr = false;
         (long From, long To)? show = null;
         for (var i = 1; i < args.Length; i++)
         {
@@ -27,6 +28,9 @@ internal static class VerifyCommand
             {
                 case "--rate" when i + 1 < args.Length:
                     rate = double.Parse(args[++i], CultureInfo.InvariantCulture);
+                    break;
+                case "--vrr":
+                    vrr = true;
                     break;
                 case "--warmup-s" when i + 1 < args.Length:
                     warmupS = double.Parse(args[++i], CultureInfo.InvariantCulture);
@@ -55,9 +59,9 @@ internal static class VerifyCommand
         var period = rate is { } hz ? (long)Math.Round(1e9 / hz) : MedianInterval(rows);
         var first = rows.Where(r => r.Kind is VerifierKind.Real or VerifierKind.Generated).Select(r => r.TargetNs).DefaultIfEmpty(0).Min();
         var from = first + (long)(warmupS * 1e9);
-        var result = TelemetryVerifier.Verify(rows, period, from);
+        var result = TelemetryVerifier.Verify(rows, period, from, long.MaxValue, vrr);
         output.WriteLine(string.Create(CultureInfo.InvariantCulture,
-            $"fmp verify: {path}: refresh period {period / 1e6:0.000} ms, judged from {warmupS:0.#} s after the first new image"));
+            $"fmp verify: {path}: {(vrr ? "variable refresh, shortest refresh period" : "refresh period")} {period / 1e6:0.000} ms, judged from {warmupS:0.#} s after the first new image"));
         output.WriteLine(string.Create(CultureInfo.InvariantCulture,
             $"  slots       {result.Judged} judged: {result.Misses} missed (early {result.EarlySlots}, late {result.Count(VerifierFinding.Late)}, not shown {result.Count(VerifierFinding.NotShown)}, " +
             $"refresh taken by another {result.Count(VerifierFinding.RefreshTaken)}, wrong image {result.Count(VerifierFinding.WrongImage)}, out of order {result.Count(VerifierFinding.OutOfOrder)}), " +

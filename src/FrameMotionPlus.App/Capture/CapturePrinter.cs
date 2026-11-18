@@ -138,11 +138,14 @@ internal static class CapturePrinter
             $"  added       by frame generation (the scheduler's D less its arrival lag): hold {Ms(d.HoldNs)} + lead {Ms(d.LeadNs)} + alignment {Ms(d.AlignmentNs)} = " +
             $"{Ms(added)} ms; latency model ΔL = d + (M−1)/M·T = {Ms(model.GenerationTimeNs)} + {Ms(model.HoldNs)} = {Ms(model.AddedLatencyNs)} ms " +
             $"(M {model.Multiplier}, T {Ms(model.SourceIntervalNs)}); difference {Ms(added - model.AddedLatencyNs)} ms (the lead's wake and margin, the stride's alignment)"));
+        var display = r.RefreshModeUsed == Pipeline.RefreshMode.Vrr
+            ? string.Create(Ic, $"the display's delay from hand-over to first pixel (variable refresh: no present lead, no rounding to a refresh; measured {Ms(s.StrideDelay.Count > 0 ? s.StrideDelay.Percentile(0.5) + s.PresentLeads.Percentile(0.5) : s.PresentLeads.Percentile(0.5))})")
+            : string.Create(Ic, $"present lead {Ms(s.PresentLeads.Percentile(0.5))} + the stride's rounding (p50 {Ms(s.StrideDelay.Count > 0 ? s.StrideDelay.Percentile(0.5) : 0)})");
         o.WriteLine(lat.Count == 0
             ? "  latency     no real frame shown in the measured window"
             : string.Create(Ic,
                 $"  latency     a real frame is shown {Ms(lat.Mean)} ms after its capture timestamp (p99 {Ms(lat.Percentile(0.99))}): arrival lag {Ms(d.ArrivalLagNs)} " +
-                $"(USB delivery, upload, conversion) + the generation's {Ms(added)} + present lead {Ms(s.PresentLeads.Percentile(0.5))} + the stride's rounding; " +
+                $"(USB delivery, upload, conversion) + the generation's {Ms(added)} + {display}; " +
                 $"before the timestamp, the card's own HDMI-to-USB latency is not measurable here (photodiode or camera)"));
     }
 

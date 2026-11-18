@@ -35,6 +35,20 @@ internal sealed class TelemetryCollector
     private VerifierRow[] _rows = [];
     private int _rowCount;
 
+    // What is on screen, from the shows in present order (feedback comes in present order): a dropped repeat is judged
+    // by the image the refresh it was meant for showed (the latest timed show at or before it), as the verifier does.
+    private const int ScreenCapacity = 16;
+    private const long PreRollImage = -2;
+    private readonly long[] _screenAt = new long[ScreenCapacity];
+    private readonly long[] _screenImage = new long[ScreenCapacity];
+    private readonly int[] _screenUntimedAfter = new int[ScreenCapacity];
+    private int _screenHead;
+    private int _screenCount;
+    private long _presentedImage = -1;
+    private long _lastScheduledImage = -1;
+    private readonly long[] _pendingRepeats = new long[PendingCapacity];
+    private int _pendingRepeatCount;
+
     public TelemetryCollector(int capacity, long warmupNs)
     {
         _warmupNs = warmupNs;
@@ -75,6 +89,9 @@ internal sealed class TelemetryCollector
     /// <summary>The refresh period the presents were judged with, ns (0 before the first).</summary>
     public long PeriodNs => _periodNs;
 
+    /// <summary>Variable refresh: shows are not on a refresh grid (no refreshes without a present, no off-grid intervals).</summary>
+    public bool Vrr { get; set; }
+
     /// <summary>Sizes the verifier's buffer (before playback: no allocation while it runs).</summary>
     public void ReserveVerifierRows(int rows) => _rows = new VerifierRow[Math.Max(rows, 1024)];
 
@@ -82,67 +99,91 @@ internal sealed class TelemetryCollector
     {
         while (pacing.Decisions.TryDequeue(out var d))
         {
-            OnDecision(d);
+            Add(d);
         }
 
         while (writer.Records.TryDequeue(out var w))
         {
-            if (w.SlotIndex >= 0)
-            {
-                ref var e = ref Get(w.SlotIndex);
-                if (e.SlotIndex == w.SlotIndex)
-                {
-                    e.Write = w;
-                    e.HasWrite = true;
-                    TryComplete(ref e);
-                }
-            }
+            Add(w);
         }
 
         while (presenter.Records.TryDequeue(out var p))
         {
-            if (p.PeriodNs > 0)
-            {
-                _periodNs = p.PeriodNs;
-            }
+            Add(p);
+        }
+    }
 
-            var timedShow = p.Timed && p.ShownNs > 0;
-            if (p.Kind == PresentKind.PreRoll)
-            {
-                // The pre-roll's black frames are not slots of the playback, but their shows are neighbours.
-                JudgeUntimed(timedShow, p.ShownNs);
-                continue;
-            }
+    /// <summary>A decision (pacing thread's records, in slot order).</summary>
+    internal void Add(in DecisionRecord d) => OnDecision(d);
 
-            if (p.SlotIndex < 0)
+    /// <summary>A ring write's record (generator thread's, in write order).</summary>
+    internal void Add(in WriteRecord w)
+    {
+        if (w.SlotIndex >= 0)
+        {
+            ref var e = ref Get(w.SlotIndex);
+            if (e.SlotIndex == w.SlotIndex)
             {
-                OnFiller(p);
-                JudgeUntimed(timedShow, p.ShownNs);
-                continue;
-            }
-
-            ref var e = ref Get(p.SlotIndex);
-            if (e.SlotIndex == p.SlotIndex)
-            {
-                e.Present = p;
-                e.HasPresent = true;
-                if (p.Untimed && _pendingCount < PendingCapacity)
-                {
-                    e.AwaitingNeighbour = true;
-                    e.PreviousTimedNs = _lastTimedShowNs;
-                    _pendingUntimed[_pendingCount++] = p.SlotIndex;
-                }
-
+                e.Write = w;
+                e.HasWrite = true;
                 TryComplete(ref e);
             }
-            else
+        }
+    }
+
+    /// <summary>A present's record (present thread's: shows in present order, slots not presented when they were given up).</summary>
+    internal void Add(in PresentRecord p)
+    {
+        if (p.PeriodNs > 0)
+        {
+            _periodNs = p.PeriodNs;
+        }
+
+        var timedShow = p.Timed && p.ShownNs > 0;
+        OnScreen(p);
+        if (p.Kind == PresentKind.PreRoll)
+        {
+            // The pre-roll's black frames are not slots of the playback, but their shows are neighbours.
+            JudgeUntimed(timedShow, p.ShownNs);
+            return;
+        }
+
+        if (p.SlotIndex < 0)
+        {
+            OnFiller(p);
+            JudgeUntimed(timedShow, p.ShownNs);
+            return;
+        }
+
+        ref var e = ref Get(p.SlotIndex);
+        if (e.SlotIndex == p.SlotIndex)
+        {
+            e.Present = p;
+            e.HasPresent = true;
+            if (p.Untimed && _pendingCount < PendingCapacity)
             {
-                // Its decision was flushed already (or it is a pre-roll present): count the show alone.
-                Show(p, false);
+                e.AwaitingNeighbour = true;
+                e.PreviousTimedNs = _lastTimedShowNs;
+                _pendingUntimed[_pendingCount++] = p.SlotIndex;
             }
 
-            JudgeUntimed(timedShow, p.ShownNs);
+            if (p.Kind == PresentKind.Repeat && !p.IsMiss && IsDropped(p.Outcome) && _pendingRepeatCount < PendingCapacity)
+            {
+                // Given up, not counted as a miss because its refresh shows the image it repeats: the next timed show
+                // after that refresh says whether it did.
+                e.AwaitingScreen = true;
+                _pendingRepeats[_pendingRepeatCount++] = p.SlotIndex;
+            }
+
+            TryComplete(ref e);
         }
+        else
+        {
+            // Its decision was flushed already (or it is a pre-roll present): count the show alone.
+            Show(p, false);
+        }
+
+        JudgeUntimed(timedShow, p.ShownNs);
     }
 
     /// <summary>
@@ -178,6 +219,101 @@ internal sealed class TelemetryCollector
         _lastTimedShowNs = shownNs;
     }
 
+    private static bool IsDropped(PresentOutcome o) => o is PresentOutcome.DroppedLate or PresentOutcome.DroppedRefused or PresentOutcome.DroppedAbsorbed;
+
+    /// <summary>
+    /// Follows the image on screen through the presents in present order: a write shows its own slot, a repeat or filler the
+    /// last write presented before it. Each timed show first settles the given-up repeats whose refresh lies more than half a
+    /// refresh before it: that refresh showed the latest timed show's image at or before it, unless a present without a time
+    /// came after that show (it may have been shown in between: not judged, as the verifier does not).
+    /// </summary>
+    private void OnScreen(in PresentRecord p)
+    {
+        if (IsDropped(p.Outcome))
+        {
+            return;
+        }
+
+        var image = p.Kind switch
+        {
+            PresentKind.Write => p.SlotIndex,
+            PresentKind.PreRoll => PreRollImage,
+            _ => _presentedImage,
+        };
+        if (p.Kind != PresentKind.Repeat)
+        {
+            _presentedImage = image;
+        }
+
+        if (p.Untimed)
+        {
+            if (_screenCount > 0)
+            {
+                _screenUntimedAfter[(_screenHead + _screenCount - 1) % ScreenCapacity]++;
+            }
+
+            return;
+        }
+
+        if (!p.Timed || p.ShownNs <= 0)
+        {
+            return;
+        }
+
+        SettleRepeats(p.ShownNs);
+        if (_screenCount == ScreenCapacity)
+        {
+            _screenHead = (_screenHead + 1) % ScreenCapacity;
+            _screenCount--;
+        }
+
+        var at = (_screenHead + _screenCount) % ScreenCapacity;
+        _screenAt[at] = p.ShownNs;
+        _screenImage[at] = image;
+        _screenUntimedAfter[at] = 0;
+        _screenCount++;
+    }
+
+    private void SettleRepeats(long showNs)
+    {
+        var half = _periodNs / 2;
+        var kept = 0;
+        for (var i = 0; i < _pendingRepeatCount; i++)
+        {
+            var slot = _pendingRepeats[i];
+            ref var e = ref Get(slot);
+            if (e.SlotIndex != slot || !e.AwaitingScreen)
+            {
+                continue;
+            }
+
+            var refresh = e.Decision.RefreshNs;
+            if (showNs <= refresh + half)
+            {
+                _pendingRepeats[kept++] = slot;
+                continue;
+            }
+
+            // The latest timed show at or before its refresh (plus half a refresh), and whether an untimed present came after it.
+            var found = -1;
+            for (var k = _screenCount - 1; k >= 0; k--)
+            {
+                var j = (_screenHead + k) % ScreenCapacity;
+                if (_screenAt[j] <= refresh + half)
+                {
+                    found = j;
+                    break;
+                }
+            }
+
+            e.AwaitingScreen = false;
+            e.ScreenMiss = found >= 0 && _screenUntimedAfter[found] == 0 && e.ScheduledImage >= 0 && _screenImage[found] != e.ScheduledImage;
+            TryComplete(ref e);
+        }
+
+        _pendingRepeatCount = kept;
+    }
+
     /// <summary>Completes whatever is still open (the end of the run).</summary>
     public void Flush()
     {
@@ -192,6 +328,16 @@ internal sealed class TelemetryCollector
         }
 
         _pendingCount = 0;
+        for (var i = 0; i < _pendingRepeatCount; i++)
+        {
+            ref var e = ref Get(_pendingRepeats[i]);
+            if (e.SlotIndex == _pendingRepeats[i])
+            {
+                e.AwaitingScreen = false; // no show came after its refresh: the run stopped first (the verifier does not judge it either)
+            }
+        }
+
+        _pendingRepeatCount = 0;
 
         for (var i = 0; i < _entries.Length; i++)
         {
@@ -226,6 +372,12 @@ internal sealed class TelemetryCollector
         e.SlotIndex = slot;
         e.Decision = d;
         e.HasDecision = true;
+        if (d.Decision.Kind is SlotKind.Real or SlotKind.Generated)
+        {
+            _lastScheduledImage = slot;
+        }
+
+        e.ScheduledImage = _lastScheduledImage;
         _newestSlot = Math.Max(_newestSlot, slot);
         TryComplete(ref e);
     }
@@ -239,7 +391,7 @@ internal sealed class TelemetryCollector
 
         var needsWrite = e.Decision.Outcome == DecisionOutcome.Written;
         var needsPresent = e.Decision.Outcome is DecisionOutcome.Written or DecisionOutcome.Repeat;
-        if ((needsWrite && !e.HasWrite) || (needsPresent && !e.HasPresent) || e.AwaitingNeighbour)
+        if ((needsWrite && !e.HasWrite) || (needsPresent && !e.HasPresent) || e.AwaitingNeighbour || e.AwaitingScreen)
         {
             return;
         }
@@ -313,7 +465,13 @@ internal sealed class TelemetryCollector
             }
 
             s.MaxOutstanding = Math.Max(s.MaxOutstanding, e.Decision.Outstanding);
-            if (d.SkippedSlots > 0)
+            if (d.SkippedSlots > 0 && Vrr)
+            {
+                // Variable refresh has no refresh that goes without a slot: a generated slot the scheduler skipped (the
+                // next real frame came too late for it) leaves the image before it on screen longer. Counted apart.
+                s.VrrSkippedSlots += d.SkippedSlots;
+            }
+            else if (d.SkippedSlots > 0)
             {
                 s.AddMiss(refresh - _originNs, MissKind.SkippedVblank, (int)Math.Min(d.SkippedSlots, int.MaxValue));
                 missed = true;
@@ -357,12 +515,24 @@ internal sealed class TelemetryCollector
                 unjudged = e.Unjudged;
                 if (measured && e.UntimedMiss)
                 {
-                    Statistics.AddMiss(refresh - _originNs, MissKind.NotShown, 1);
+                    // Whose: the present thread's attribution (a present handed over in time that the compositor
+                    // discarded is the display's, and so is its give-back after a display-late show).
+                    Statistics.AddMiss(refresh - _originNs, p.Miss is MissKind.Discarded or MissKind.CatchUp or MissKind.RateChange ? p.Miss : MissKind.NotShown, 1);
                 }
 
                 if (measured && e.Unjudged)
                 {
                     Statistics.UnjudgedSlots++;
+                }
+            }
+
+            if (e.ScreenMiss)
+            {
+                // A repeat given up whose refresh showed another image (the one it repeats was never shown there).
+                missed = true;
+                if (measured)
+                {
+                    Statistics.AddMiss(refresh - _originNs, p.Miss, 1);
                 }
             }
             if (measured && d.Kind == SlotKind.Real && p.Outcome == PresentOutcome.Shown && p.ShownNs > 0 && !p.Untimed)
@@ -480,7 +650,7 @@ internal sealed class TelemetryCollector
             {
                 var interval = p.ShownNs - p.PreviousShownNs;
                 s.OutputIntervals.Add(interval);
-                if (p.Timed && p.PeriodNs > 0)
+                if (p.Timed && p.PeriodNs > 0 && !Vrr)
                 {
                     var periods = interval / (double)p.PeriodNs;
                     s.TimedIntervals++;
@@ -488,7 +658,7 @@ internal sealed class TelemetryCollector
                 }
             }
 
-            if (p.Timed && p.PreviousTimedNs > 0 && p.PeriodNs > 0
+            if (p.Timed && p.PreviousTimedNs > 0 && p.PeriodNs > 0 && !Vrr
                 && p.ShownNs - p.PreviousTimedNs > (p.UntimedBefore + 1.25) * p.PeriodNs)
             {
                 // Perhaps refreshes between this timed show and the one before that no present accounts for (each untimed
@@ -626,5 +796,11 @@ internal sealed class TelemetryCollector
         public long PreviousTimedNs;
         public bool UntimedMiss;
         public bool Unjudged;
+
+        // The last real or generated slot scheduled at or before it (what a repeat shows), and a given-up repeat waiting for
+        // the show after its refresh.
+        public long ScheduledImage;
+        public bool AwaitingScreen;
+        public bool ScreenMiss;
     }
 }
