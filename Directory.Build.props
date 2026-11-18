@@ -40,4 +40,9 @@
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
+
+  <!-- Tests never read or write the owner's saved settings (~/.config/fmp): each test process gets its own config directory. -->
+  <ItemGroup Condition="$(MSBuildProjectName.EndsWith('.Tests'))">
+    <Compile Include="$(MSBuildThisFileDirectory)tests/Shared/IsolatedSettings.cs" Link="Support/IsolatedSettings.cs" />
+  </ItemGroup>
 </Project>

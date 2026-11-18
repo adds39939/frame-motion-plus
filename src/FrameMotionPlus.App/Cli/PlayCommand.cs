@@ -21,13 +21,15 @@ internal static class PlayCommand
 {
     public static int Run(string[] args, TextWriter output, TextWriter error)
     {
-        var options = PlayOptions.Parse(args);
+        var loaded = UserSettings.LoadFor(args, out args);
+        var applied = UserSettings.Apply(SettingsTarget.Play, args, loaded);
+        var options = PlayOptions.Parse(applied.Args);
         if (options.CsvPath is { } csv)
         {
             VfgBenchCommand.CheckWritable(csv);
         }
 
-        var settings = options.SettingsPath is null ? null : SettingsCommand.Load(options.SettingsPath);
+        var settings = loaded.Exists ? loaded.Settings : null;
         error = TextWriter.Synchronized(error);
 
         // Signals first: a stop asked for at any point of the start-up (loading, opening the device, the pre-roll) is kept
@@ -148,6 +150,7 @@ internal static class PlayCommand
                 }
 
                 PlayPrinter.PrintSetup(output, options, playback, setup, why, cuda);
+                output.WriteLine(UserSettings.Describe(loaded, applied));
                 output.Flush();
                 report = session.Run();
             }

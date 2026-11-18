@@ -18,10 +18,11 @@ public readonly record struct SampleDepthReading(SampleDepth Depth, int Samples,
 
 /// <summary>
 /// Tells an 8-bit signal from a 10-bit one in a P010 capture by its luma codes. The Elgato 4K X captures an 8-bit HDMI
-/// signal into P010 with the two low bits of every 10-bit code zero (measured 2026-11-18: an SDR PS5 signal, every luma
-/// and chroma code a multiple of 4 at 2160p30 and 1440p60), and a 10-bit one with them in use (the same day's HDR captures:
-/// brightest-cell means in sixteenths, impossible with codes in steps of 4). A PS5 sends SDR in 8 bits and HDR10 in 10 or
-/// more, so on this setup the depth says SDR or HDR. (A console set to send SDR with more than 8 bits would read as 10-bit.)
+/// signal into P010 with the two low bits of every 10-bit code zero (assumed, not yet seen: the 2026-11-18 reading of "an
+/// SDR PS5 signal, every code a multiple of 4" came from the ffmpeg CLI's NV12 fallback, docs/benchmarks/phase7-hdr.md),
+/// and a 10-bit one with them in use (the same day's HDR captures: brightest-cell means in sixteenths, impossible with
+/// codes in steps of 4). A PS5 is assumed to send SDR in 8 bits and HDR10 in 10 or more (no real SDR signal has been
+/// seen through this card yet), so on this setup the depth would say SDR or HDR. (A console set to send SDR with more than 8 bits would read as 10-bit.)
 /// <para>
 /// A frame is judged from a grid of luma samples (<see cref="Columns"/> x <see cref="Rows"/>) read from the capture buffer
 /// on the CPU while the GPU uploads it (no added latency): samples at or below black + 16 codes are left out; with at least

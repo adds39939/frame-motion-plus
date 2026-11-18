@@ -23,7 +23,10 @@ internal static class CaptureCommand
 {
     public static int Run(string[] args, TextWriter output, TextWriter error)
     {
-        var options = CaptureOptions.Parse(args);
+        // Saved settings (the default file, or --settings): added as the options they stand for, the command line winning.
+        var loaded = UserSettings.LoadFor(args, out args);
+        var applied = UserSettings.Apply(SettingsTarget.Capture, args, loaded);
+        var options = CaptureOptions.Parse(applied.Args);
         if (!CaptureDevices.IsAvailable(out var unavailable))
         {
             error.WriteLine($"fmp: {unavailable}");
@@ -45,7 +48,7 @@ internal static class CaptureCommand
             VfgBenchCommand.CheckWritable(framesCsv);
         }
 
-        var settings = options.SettingsPath is null ? null : SettingsCommand.Load(options.SettingsPath);
+        var settings = loaded.Exists ? loaded.Settings : null;
         error = TextWriter.Synchronized(error);
         var signals = 0;
         PlaybackSession? live = null;
@@ -174,6 +177,7 @@ internal static class CaptureCommand
                 }
 
                 CapturePrinter.PrintSetup(output, options, playback, setup, why, cuda);
+                output.WriteLine(UserSettings.Describe(loaded, applied));
                 audio.PrintSetup(output, options);
                 output.Flush();
                 using var switcher = SwitchEvery(session, error);

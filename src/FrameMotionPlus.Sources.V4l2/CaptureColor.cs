@@ -23,9 +23,9 @@ public enum HdrMode
 
     /// <summary>
     /// A 10-bit (P010) capture follows the signal: HDR10 while its samples carry 10 significant bits, SDR while they carry
-    /// only 8 (<see cref="SampleDepthProbe"/>). A PS5 sends SDR in 8 bits and HDR10 in 10 or more, and the Elgato 4K X puts
-    /// an 8-bit signal into P010 with the two low bits zero, so this tells the console's switches apart without the card
-    /// signalling them. Starts as HDR10. Other captures: as <see cref="Auto"/>. <c>fmp capture</c>'s default.
+    /// only 8 (<see cref="SampleDepthProbe"/>). A PS5 is assumed to send SDR in 8 bits and HDR10 in 10 or more, and the
+    /// Elgato 4K X to put an 8-bit signal into P010 with the two low bits zero (assumed; no real SDR signal seen yet), so
+    /// this would tell the console's switches apart without the card signalling them. Starts as HDR10. Other captures: as <see cref="Auto"/>. <c>fmp capture</c>'s default.
     /// </summary>
     Follow = 4,
 }

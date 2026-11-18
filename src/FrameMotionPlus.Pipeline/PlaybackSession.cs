@@ -131,6 +131,10 @@ public sealed class PlaybackSession : IDisposable
         return true;
     }
 
+    /// <summary>A capture of 10-bit samples (P010), the only kind that can be HDR10.</summary>
+    private bool CaptureIsTenBit =>
+        OperatingSystem.IsLinux() && _source is CapturePlaybackSource capture && capture.Source.Format.Format == CapturePixelFormat.P010;
+
     /// <summary>Continues the file from <paramref name="mediaTimeNs"/> (any thread): a discontinuity, never interpolated across.</summary>
     public void Seek(long mediaTimeNs)
     {
@@ -863,7 +867,8 @@ public sealed class PlaybackSession : IDisposable
                 }
 
                 // H: SDR or HDR10 by hand (the capture's next frame, then the output with it); A: follow the signal again.
-                if ((events & WindowEvents.HdrTogglePressed) != 0)
+                // Only a 10-bit (P010) capture can carry HDR10: H is ignored on an 8-bit one (it would show SDR codes as PQ).
+                if ((events & WindowEvents.HdrTogglePressed) != 0 && CaptureIsTenBit)
                 {
                     _ = RequestCaptureColor(CaptureColorRequest.Toggle);
                 }

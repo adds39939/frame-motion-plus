@@ -231,3 +231,38 @@ public class SettingsTests
         Assert.StartsWith("generator.quality", errors[1], StringComparison.Ordinal);
     }
 }
+
+public class LenientSettingsTests
+{
+    [Fact]
+    public void Lenient_reading_reports_unknown_keys_and_the_keys_present()
+    {
+        var present = new List<string>();
+        var unknown = new List<string>();
+        var settings = FmpSettingsSerializer.DeserializeLenient(
+            """{ "version": 1, "capture": { "mode": "4k30-hdr", "device": null, "extra": 1 }, "hdr": { "peakNits": 2000 }, "nope": {} }""", present, unknown);
+        Assert.Equal("4k30-hdr", settings.Capture.Mode);
+        Assert.Equal(2000, settings.Hdr.PeakNits);
+        Assert.Equal(["version", "capture.mode", "hdr.peakNits"], present);
+        Assert.Equal(["capture.extra", "nope"], unknown);
+        Assert.Empty(settings.Validate());
+    }
+
+    [Fact]
+    public void Lenient_reading_still_rejects_malformed_json_wrong_types_and_duplicates()
+    {
+        Assert.ThrowsAny<JsonException>(() => FmpSettingsSerializer.DeserializeLenient("{ \"hdr\": { \"peakNits\": \"x\" } }", [], []));
+        Assert.ThrowsAny<JsonException>(() => FmpSettingsSerializer.DeserializeLenient("{ \"capture\": ", [], []));
+        Assert.ThrowsAny<JsonException>(() => FmpSettingsSerializer.DeserializeLenient("{ \"capture\": null }", [], []));
+        Assert.ThrowsAny<JsonException>(() => FmpSettingsSerializer.DeserializeLenient("{ \"hdr\": { \"peakNits\": 1, \"peakNits\": 2 } }", [], []));
+    }
+
+    [Fact]
+    public void The_strict_reader_still_rejects_unknown_keys_and_old_files_read_as_version_1()
+    {
+        Assert.ThrowsAny<JsonException>(() => FmpSettingsSerializer.Deserialize("""{ "capture": { "extra": 1 } }"""));
+        Assert.Equal(1, FmpSettingsSerializer.Deserialize("""{ "display": { "refreshHz": 60 } }""").Version);
+        Assert.StartsWith("version", Assert.Single(FmpSettingsSerializer.Deserialize("""{ "version": 3 }""").Validate()), StringComparison.Ordinal);
+        Assert.StartsWith("audio.sink", Assert.Single(FmpSettingsSerializer.Deserialize("""{ "audio": { "sink": " " } }""").Validate()), StringComparison.Ordinal);
+    }
+}

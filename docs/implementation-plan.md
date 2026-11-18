@@ -618,6 +618,29 @@ playback audio is left for later and Remote Play is left out entirely (both are 
 - **Automated gate carried here from Phase 4:** a 1440p60 file at 2x for 10 minutes on a direct
   display with zero missed slots of any cause (the design doc's milestone 1 gate as written).
 
+- **Step 9a outcome (2026-11-18, `docs/benchmarks/phase9-polish.md`):**
+  - **Saved settings.** `fmp capture` and `fmp play` load `$XDG_CONFIG_HOME/fmp/settings.json`
+    (else `~/.config/fmp/settings.json`); `fmp settings show | path | set | unset` manage it;
+    `--settings <file>` reads another and `--no-settings` ignores it. Built-in defaults, then the
+    file, then the command line. Covers the capture device and mode, generator and quality, clock,
+    window, audio (sink, source, offset) and HDR (mode, peak, MaxCLL, MaxFALL). A bare `fmp capture`
+    uses the saved device and mode. Tests run with a config directory of their own.
+  - **Soak, 10 minutes only** (the owner needed the machine): 143,532 slots, none missed, no
+    collections in the measured window, audio drift correction -25.9 ppm against a measured -28.2,
+    files, threads and GPU memory flat. **Process memory crept from 476.9 to 488.1 MB**, about
+    35 MB an hour if it continued. The two-hour soak is not run; only it will show whether the
+    creep levels off.
+  - **Direct display, read only:** the driver lists both monitors through `VK_KHR_display` and has
+    `VK_EXT_acquire_drm_display`; KWin offers DRM leasing but no monitors to lease, so it has to
+    run from a text console. Nothing is built.
+  - **Not done:** live quality switching (loading the High model mid-run stalls the whole GPU
+    context; the generator can switch between two models loaded at start, at a cost in start-up
+    time and GPU memory not yet measured); memory, drift and handle figures in every run's summary;
+    the two-hour soak; direct display mode and its gates; a graphical settings window.
+  - Test robustness: `PipeWireLoopbackTests.Clicks_through_the_delay_line…` failed twice in a
+    whole-solution run (it runs beside the other assemblies with an audio thread that is not
+    real-time) and passed three times alone.
+
 ### Phase 10: Windows portability
 
 *Design doc: milestone 7.* **Left for now by the owner on 2026-11-18** (listed under "Deferred"). The

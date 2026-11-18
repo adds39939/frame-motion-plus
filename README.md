@@ -306,10 +306,12 @@ fmp capture --mode 4k30-hdr --duration-s 180 --csv capture.csv --frames-csv fram
 The Elgato 4K X offers 10-bit P010 only up to 1440p60 and 2160p30 (it takes 30 of the console's 60 Hz itself in that
 mode), and reports Rec. 709 whatever the console sends. A P010 capture therefore starts as HDR10 (PQ, BT.2020 primaries,
 limited range, the BT.2020 matrix) and **follows the console** (`--hdr follow`, the default): samples that carry 10
-significant bits are HDR10, samples that carry only 8 (how a PS5 sends SDR, padded into P010 by the card) SDR (BT.709).
+significant bits are HDR10, samples that carry only 8 (how a PS5 is assumed to send SDR, padded into P010 by the card;
+not yet seen) SDR (BT.709).
 The HDR side of that rule is measured; the SDR side is not yet (the console stayed in HDR while this was built): if a
 console in SDR is still shown as HDR10, press **H** in the window, which switches between SDR and HDR10 by hand at the
-next frame (the output is rebuilt with it, within a frame or two); **A** follows the signal again. `--hdr on|off` fixes it
+next frame (the output is rebuilt with it, within a frame or two; on 10-bit captures only); **A** follows the signal
+again. Keys act when pressed, not while held: Esc stops, H and A as above. `--hdr on|off` fixes it
 for the run. The NV12 modes (`-sdr`) are SDR: the card fits an HDR signal into SDR itself for its 8-bit formats.
 `--hdr-peak-nits` (and `--hdr-max-cll`, `--hdr-max-fall`) set the HDR metadata sent with the picture, since the card
 carries none: best the peak the PS5's own HDR calibration was done for. At the start `fmp capture` says what the signal is
@@ -317,6 +319,32 @@ taken to be, what the output is (format, colour space, the metadata sent) and wh
 light) or shown pixel for pixel. `--range` and `--matrix` override the rest. MJPEG is never used. Window close, Escape,
 Ctrl+C and SIGTERM stop it cleanly; the device is released on every way out. Set `$FMP_VFX_SDK` for a binary outside the
 checkout, as for `fmp play`.
+
+### Saved settings
+
+So that `fmp capture` alone gives your setup, save the options you always type:
+
+```sh
+fmp settings set capture.mode 4k30-hdr               # checked exactly as --mode is
+fmp settings set audio.sink inzone                   # --audio-sink
+fmp settings set hdr.peakNits 1000                   # --hdr-peak-nits
+fmp capture                                          # now the same as: fmp capture --mode 4k30-hdr --audio-sink inzone --hdr-peak-nits 1000
+fmp settings show                                    # every key, its value and whether it came from the file or the default
+fmp settings unset audio.sink                        # back to the default (your selected output)
+fmp settings path                                    # where the file is
+```
+
+The file is `$XDG_CONFIG_HOME/fmp/settings.json`, else `~/.config/fmp/settings.json` (`%APPDATA%\fmp\settings.json` on
+Windows); `fmp capture` and `fmp play` read it when it exists, `--settings <file>` reads another and `--no-settings` none.
+Precedence: built-in defaults < the file < the command line: an option you type (or one that conflicts with a saved one,
+such as `--size` against a saved mode, or `--audio off` against a saved sink) wins for that run. At the start both commands
+print one `settings` line naming the file and every value taken from it, and what was not used and why. A malformed file
+stops the command with one error naming the file and the line; a key this fmp does not know is reported and skipped. The
+keys are `capture.device`, `capture.mode`, `generator.backend`, `generator.quality`, `generator.multiplier`,
+`display.clock`, `display.fullscreen` (true or false), `display.window` (the window's size when windowed), `audio.mode`,
+`audio.sink`, `audio.source`, `audio.offsetMs`, `hdr.mode`, `hdr.peakNits`, `hdr.maxCll`, `hdr.maxFall` and
+`generator.vfxSdkDirectory` (`fmp --help`, "saved settings"). `set` writes the file atomically and keeps the other keys
+(comments in a hand-edited file are not kept).
 
 ### HDR test patterns
 

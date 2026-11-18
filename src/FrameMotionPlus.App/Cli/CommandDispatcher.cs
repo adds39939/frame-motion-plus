@@ -67,6 +67,8 @@ internal static class CommandDispatcher
         Usage:
           fmp simulate [options]    Run the real scheduler against a simulated source and display
           fmp settings [options]    Print default settings JSON, or validate a settings file
+          fmp settings show|path|set <key> <value>|unset <key> [--settings <file>]
+                                    Saved settings for fmp capture and fmp play (see "saved settings" below)
           fmp bench jitter [options]
                                     Measure pacing-thread wake-up jitter on the real clock (design doc Phase 0)
           fmp bench vfg [options]   Measure NVIDIA VFG's cost per generated frame over sizes, modes, formats and
@@ -132,6 +134,25 @@ internal static class CommandDispatcher
 
         settings options:
           --validate <file>         Validate a settings file instead of printing defaults
+
+        saved settings (fmp capture and fmp play read them when the file exists; nothing else does):
+          The file is $XDG_CONFIG_HOME/fmp/settings.json, else ~/.config/fmp/settings.json (%APPDATA%\fmp\settings.json on
+          Windows); --settings <file> reads another, --no-settings none. Precedence: built-in defaults < the file < options on
+          the command line. Each saved value stands for an option and is checked exactly as that option is; an option given on
+          the command line (or one that conflicts with it, such as --size against a saved mode) wins. fmp capture and fmp play
+          print one line saying which file was used and every value taken from it. A malformed file is an error naming it and
+          the position; a key this fmp does not know is reported and skipped.
+          fmp settings show         Every key, its value and where it comes from (the file, or the default)
+          fmp settings path         The file's path
+          fmp settings set <key> <value>   Check and save one value (creates the file; other keys are kept; atomic)
+          fmp settings unset <key>  Remove one value (the default applies again)
+          keys: capture.device (/dev/videoN), capture.mode (--mode), generator.backend (--generator), generator.quality
+          (--quality), generator.multiplier (--multiplier), display.clock (--clock), display.fullscreen (true: --fullscreen,
+          false: a window), display.window (WxH: the window's size when windowed; unlike --window it does not choose a window),
+          audio.mode (--audio), audio.sink (--audio-sink), audio.source (--audio-source), audio.offsetMs (--audio-offset-ms),
+          hdr.mode (--hdr), hdr.peakNits (--hdr-peak-nits), hdr.maxCll (--hdr-max-cll), hdr.maxFall (--hdr-max-fall),
+          generator.vfxSdkDirectory (after --vfx-sdk and $FMP_VFX_SDK). capture.*, audio.* and hdr.* apply to fmp capture only.
+          Example: fmp settings set capture.mode 4k30-hdr; fmp settings set audio.sink inzone; then just: fmp capture
 
         bench jitter options:
           --duration-s <s>          Measured time per loop, after the warm-up                 (10)
@@ -289,7 +310,9 @@ internal static class CommandDispatcher
           --validate                Vulkan validation layer with synchronization checks; any message fails the run
           --csv <path>              Write the per-slot timeline (content time, decode available, decision, generation
                                     start and end on the GPU, write signalled, present submitted, shown) as CSV
-          --settings <file>         Scheduler, display and generator settings (and generator.vfxSdkDirectory)
+          --settings <file>         The saved settings file to use instead of the default one (see "saved settings"); its
+                                    scheduler, display and generator sections apply too
+          --no-settings             Ignore the saved settings file
           --vfx-sdk <dir>           The VFX SDK directory (else $FMP_VFX_SDK, --settings, lib/VideoFX of a checkout,
                                     /usr/local/VideoFX)
           --warmup-s <s>            Excluded from the statistics, allocation and GC counts    (2)
@@ -320,7 +343,8 @@ internal static class CommandDispatcher
                                     FMP_PLAY_FAULT=gpu-wait@N (a GPU wait that never completes at the N-th generated frame)
                                     or gpu-busy@N:S (S seconds of GPU work there) checks that the run still ends.
 
-        capture options (device: /dev/videoN; default: the first capture device with a 10-bit mode, else the first one):
+        capture options (device: /dev/videoN; default: the saved capture.device, else the first capture device with a 10-bit
+        mode, else the first one):
           --list                    List the capture devices: formats, sizes, rates, the presets each one can do
           --mode <preset>           4k30-hdr (3840x2160 P010 at 30: the Elgato 4K X's 10-bit 4K mode; generate to 60),
                                     1440p60-hdr (2560x1440 P010 at 60: for 60 fps games; to 120), both HDR10 or SDR as
@@ -332,10 +356,12 @@ internal static class CommandDispatcher
           --format <nv12|p010|yuyv> Pixel format (MJPEG is never used: its decode adds latency)  (P010 first)
           --hdr <mode>              HDR10 (PQ, BT.2020, limited range, BT.2020 matrix) or SDR (BT.709): follow (a P010
                                     capture follows the console: HDR10 while the samples carry 10 bits, SDR while they
-                                    carry 8, as a PS5 sends SDR; the Elgato 4K X reports Rec. 709 whatever it gets), on,
+                                    carry 8, as a PS5 is assumed to send SDR (not yet seen); the Elgato 4K X reports Rec. 709 whatever it gets), on,
                                     off, auto (as the device reports it), 10bit (on for any 10-bit capture)  (follow)
                                     In the window: H switches between SDR and HDR10 by hand (stops following; the output
-                                    follows within a few frames), A follows the signal again
+                                    follows within a few frames; P010 captures only), A follows the signal again
+                                    Keys in the window act when pressed (not while held), with or without modifiers:
+                                    Esc stops, H switches SDR/HDR10 by hand, A follows the signal again
           --hdr-peak-nits <n>       HDR10 metadata sent with the picture (the card carries none): mastering peak, and
                                     MaxCLL unless given. Best set to the peak the PS5's HDR calibration was done for
                                     (the display's). KWin shows a PQ window's 203 nits at the output's SDR brightness
@@ -352,8 +378,9 @@ internal static class CommandDispatcher
                                     default capture is fullscreen on the window's output: there KWin gives it variable
                                     refresh, which --clock auto uses (the lowest latency); a window is fixed refresh
           --generator, --quality, --multiplier, --output-hz, --duration-s, --window, --fullscreen, --clock, --validate, --csv,
-          --settings, --vfx-sdk, --warmup-s, --present-lead-ms, --latch-ms, --cuda-sync   As for play (the duration is
-                                    unlimited by default: until Ctrl+C, closing the window or Escape)
+          --settings, --no-settings, --vfx-sdk, --warmup-s, --present-lead-ms, --latch-ms, --cuda-sync   As for play (the
+                                    duration is unlimited by default: until Ctrl+C, closing the window or Escape)
+                                    Without a device or --mode, the saved capture.device and capture.mode are used if set
           --offscreen               No window: an offscreen target on the real clock at --display-hz
           --display-hz <hz>         With --offscreen: the refresh rate the target stands for     (120)
           --audio <on|off|auto>     The card's sound, delayed to its picture by the measured video latency (a real frame's

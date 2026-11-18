@@ -102,7 +102,7 @@ internal static class CapturePrinter
             $"{(bits == 10 ? "10 bits kept from capture to the swapchain" : "8 bits")})");
         if (options.Color.Hdr == HdrMode.Follow && f.Format == CapturePixelFormat.P010)
         {
-            o.WriteLine("              following the console: samples with 10 significant bits are HDR10, with 8 (how a PS5 sends SDR) SDR " +
+            o.WriteLine("              following the console: samples with 10 significant bits are HDR10, with 8 (how a PS5 is assumed to send SDR; not yet seen) SDR " +
                 "(BT.709, the same range); in the window H switches by hand, A follows again");
         }
         else

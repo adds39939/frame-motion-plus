@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace FrameMotionPlus.Core.Settings;
 
@@ -20,6 +21,20 @@ namespace FrameMotionPlus.Core.Settings;
 [JsonSerializable(typeof(FmpSettings))]
 internal sealed partial class FmpSettingsJsonContext : JsonSerializerContext;
 
+/// <summary>As <see cref="FmpSettingsJsonContext"/>, except that unknown properties are skipped (and reported by the caller).</summary>
+[JsonSourceGenerationOptions(
+    WriteIndented = true,
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    UseStringEnumConverter = true,
+    ReadCommentHandling = JsonCommentHandling.Skip,
+    AllowTrailingCommas = true,
+    NumberHandling = JsonNumberHandling.Strict,
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip,
+    RespectNullableAnnotations = true,
+    AllowDuplicateProperties = false)]
+[JsonSerializable(typeof(FmpSettings))]
+internal sealed partial class FmpSettingsLenientJsonContext : JsonSerializerContext;
+
 /// <summary>Reflection-free (source-generated) JSON for <see cref="FmpSettings"/>; safe under NativeAOT.</summary>
 public static class FmpSettingsSerializer
 {
@@ -39,6 +54,87 @@ public static class FmpSettingsSerializer
         ArgumentNullException.ThrowIfNull(json);
         return JsonSerializer.Deserialize(json, FmpSettingsJsonContext.Default.FmpSettings)
             ?? throw new JsonException("Settings document is null.");
+    }
+
+    /// <summary>
+    /// Parses a user's settings file as <see cref="Deserialize"/> does, except that a property this build does not know
+    /// is skipped and its dotted name (<c>audio.sinc</c>) added to <paramref name="unknown"/> instead of failing. The
+    /// dotted names of the known leaf properties the file sets to a value other than null go to <paramref name="present"/>.
+    /// Throws <see cref="JsonException"/> (with the line and byte position) for malformed JSON, a wrong type, a duplicate
+    /// property or a null section.
+    /// </summary>
+    public static FmpSettings DeserializeLenient(string json, ICollection<string> present, ICollection<string> unknown)
+    {
+        ArgumentNullException.ThrowIfNull(json);
+        ArgumentNullException.ThrowIfNull(present);
+        ArgumentNullException.ThrowIfNull(unknown);
+        var settings = JsonSerializer.Deserialize(json, FmpSettingsLenientJsonContext.Default.FmpSettings)
+            ?? throw new JsonException("Settings document is null.");
+        using var document = JsonDocument.Parse(json, new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true });
+        Walk(document.RootElement, FmpSettingsJsonContext.Default.FmpSettings, "", present, unknown);
+        return settings;
+    }
+
+    /// <summary>The dotted names of every leaf setting this build knows (<c>capture.mode</c>, <c>scheduler.marginMs</c> ...).</summary>
+    public static IReadOnlyList<string> KnownKeys()
+    {
+        var keys = new List<string>();
+        Collect(FmpSettingsJsonContext.Default.FmpSettings, "", keys);
+        return keys;
+    }
+
+    private static void Collect(JsonTypeInfo type, string prefix, List<string> keys)
+    {
+        foreach (var property in type.Properties)
+        {
+            var section = FmpSettingsJsonContext.Default.GetTypeInfo(property.PropertyType);
+            if (section is { Kind: JsonTypeInfoKind.Object })
+            {
+                Collect(section, prefix + property.Name + ".", keys);
+            }
+            else
+            {
+                keys.Add(prefix + property.Name);
+            }
+        }
+    }
+
+    private static void Walk(JsonElement element, JsonTypeInfo type, string prefix, ICollection<string> present, ICollection<string> unknown)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        foreach (var member in element.EnumerateObject())
+        {
+            JsonPropertyInfo? match = null;
+            foreach (var property in type.Properties)
+            {
+                if (string.Equals(property.Name, member.Name, StringComparison.Ordinal))
+                {
+                    match = property;
+                    break;
+                }
+            }
+
+            var name = prefix + member.Name;
+            if (match is null)
+            {
+                unknown.Add(name);
+                continue;
+            }
+
+            var section = FmpSettingsJsonContext.Default.GetTypeInfo(match.PropertyType);
+            if (section is { Kind: JsonTypeInfoKind.Object })
+            {
+                Walk(member.Value, section, name + ".", present, unknown);
+            }
+            else if (member.Value.ValueKind != JsonValueKind.Null)
+            {
+                present.Add(name);
+            }
+        }
     }
 }
 
