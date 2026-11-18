@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>FrameMotionPlus.Sources.V4l2.Tests</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The zero-allocation tests read GC.GetAllocatedBytesForCurrentThread(), which a background (concurrent) gen2
+         collection triggered by another thread can move by a few KB on a thread that allocated nothing. Blocking
+         collections leave it exact (GcConfigurationTests guards this, as in the other hardware test projects). -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- Dynamic PGO off in this test host, as in the other hardware test projects: re-compiling a LibraryImport stub at
+         a higher tier binds the P/Invoke again, and binding allocates the library name on the calling thread, which
+         would land in a zero-allocation window by chance (seen here: 64 B on the capture thread with PGO on). The
+         NativeAOT binary has no tiers. -->
+    <TieredPGO>false</TieredPGO>
+    <!-- As the pipeline tests: tier-up's suspension (8 to 9 ms about 2.5 s into a run) would show as a pacing hitch in
+         the windowed capture run. -->
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3.mtp-off" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="RepositoryRoot" Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../'))" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Sources.V4l2\FrameMotionPlus.Sources.V4l2.csproj" />
+    <ProjectReference Include="..\..\src\FrameMotionPlus.Pipeline\FrameMotionPlus.Pipeline.csproj" />
+    <!-- fmp capture is tested in-process through the dispatcher and out of process for the missing-hardware paths; the
+         CPU reference of the YCbCr conversion (YuvReference) is the App's. -->
+    <ProjectReference Include="..\..\src\FrameMotionPlus.App\FrameMotionPlus.App.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- One GPU hardware test assembly at a time on a machine: see the remarks in the file. -->
+    <Compile Include="..\Shared\GpuMachineLock.cs" Link="Support\GpuMachineLock.cs" />
+    <Compile Include="..\Shared\ChildProcess.cs" Link="Support\ChildProcess.cs" />
+    <!-- The repository and external-tool helpers (gcc for the layout test). -->
+    <Compile Include="..\FrameMotionPlus.Cuda.Tests\Support\Repo.cs" Link="Support\Repo.cs" />
+  </ItemGroup>
+
+</Project>

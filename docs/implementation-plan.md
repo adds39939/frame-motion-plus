@@ -392,6 +392,10 @@ step reviewed in one go costs more rounds than several small ones:
   sequences run through the real kernel; capture pipeline runs against `vivid` when loaded.
 - **Manual gate:** end-to-end latency measured; 60 to 120 at 1440p within 2 ms of the latency model;
   a 30 fps game inside a 60 Hz signal is detected.
+  **Partly passed 2026-11-18:** the owner ran `fmp capture` on the PS5 through the Elgato with VFG
+  and confirmed "it works". Still open: end-to-end latency measured with a camera or photodiode,
+  the 1440p 60 to 120 comparison with the latency model, and a 30 fps *game* (the home screen was
+  detected) inside a 60 Hz signal.
 - **Cadence tracker backlog from the Phase 1 review** (accepted as non-blocking there; these become
   acceptance cases once the real metric kernel and a capture card set the thresholds):
   1. The estimate is frozen while in-band frames (metric between the low and high thresholds) arrive
@@ -439,6 +443,18 @@ step reviewed in one go costs more rounds than several small ones:
   - The NVIDIA driver takes about 1.6 ms in `vkQueueSubmit2` on every 1,024th queue submission when
     nothing is presented to a swapchain (offscreen); not seen in windowed presentation. Re-measure
     on a direct display.
+- **Found in Phase 5 with the capture card** (`docs/benchmarks/phase5-capture.md`, "Known issues"):
+  - Live 4K HDR 30 to 60 works. A real frame is shown about 62 ms after the card's timestamp: 26 ms
+    arrival (USB delivery alone is 25.4 ms at 2160p P010, 11.3 ms at 1440p P010) + about 19 ms hold
+    and generation + 12.5 ms present lead + rounding to the refresh. The present lead and the stride
+    rounding are this phase's to reduce; the card's own HDMI-to-USB delay is not measurable from
+    the host.
+  - A 3-minute capture run ended with 4 missed slots from one present shown a refresh late, and
+    `fmp verify` disagreed with the live counters on one slot.
+  - Capture is not phase-locked to the 119.88 Hz output (the console sends 60.00 Hz), so most output
+    frames are generated.
+  - At 2160p P010 the card repeats one frame about every 33 s (its 30 fps output drifts against the
+    console's 60 Hz); the app drops it, which is a one-frame hold.
 - **Pacing backlog from step 4b** (`docs/benchmarks/phase4b-pipeline.md`, "Known issues carried to
   Phase 6"). The owner chose on 2026-11-18 to document these and move on: playback looks right on
   screen, and exact frame timing against the compositor is this phase's subject.

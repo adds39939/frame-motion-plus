@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>FrameMotionPlus.Sources.V4l2</RootNamespace>
+    <AssemblyName>FrameMotionPlus.Sources.V4l2</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FrameMotionPlus.Core\FrameMotionPlus.Core.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Cuda\FrameMotionPlus.Cuda.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Platform\FrameMotionPlus.Platform.csproj" />
+    <!-- The RGB frame history (FrameHistory: preallocated CUDA buffers, a Ready event each, release with the last
+         reader's GPU point) is the file source's; a capture source uses the same one and the same protocol. Nothing of
+         FFmpeg is loaded by this reference. -->
+    <ProjectReference Include="..\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The layout test reads every declared offset and constant; the source tests reach counters and test hooks. -->
+    <InternalsVisibleTo Include="FrameMotionPlus.Sources.V4l2.Tests" />
+  </ItemGroup>
+
+</Project>

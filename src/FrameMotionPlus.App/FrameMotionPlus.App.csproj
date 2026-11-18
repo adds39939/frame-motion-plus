@@ -29,6 +29,7 @@
     <InternalsVisibleTo Include="FrameMotionPlus.Vfx.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Sources.File.Tests" />
     <InternalsVisibleTo Include="FrameMotionPlus.Pipeline.Tests" />
+    <InternalsVisibleTo Include="FrameMotionPlus.Sources.V4l2.Tests" />
   </ItemGroup>
 
 </Project>

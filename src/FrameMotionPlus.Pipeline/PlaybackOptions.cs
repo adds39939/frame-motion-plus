@@ -2,6 +2,7 @@ using FrameMotionPlus.Core.Abstractions;
 using FrameMotionPlus.Core.Settings;
 using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Platform.Threading;
+using FrameMotionPlus.Sources.V4l2;
 
 namespace FrameMotionPlus.Pipeline;
 
@@ -49,8 +50,14 @@ public enum PlaybackClock
 /// <summary>Configuration of a <see cref="PlaybackSession"/> (what <c>fmp play</c> resolves its options into).</summary>
 public sealed record PlaybackOptions
 {
-    /// <summary>The video file.</summary>
+    /// <summary>The video file, or with <see cref="Capture"/> the V4L2 capture device (/dev/videoN).</summary>
     public required string Path { get; init; }
+
+    /// <summary>
+    /// Capture live from the V4L2 device at <see cref="Path"/> instead of playing a file (Phase 5). Its device is
+    /// <see cref="Path"/>; the session supplies the streams and kernels and sizes its history. Real clock only.
+    /// </summary>
+    public CaptureSourceOptions? Capture { get; init; }
 
     public GeneratorKind Generator { get; init; } = GeneratorKind.Vfg;
 
@@ -154,6 +161,11 @@ public sealed record PlaybackOptions
         ArgumentOutOfRangeException.ThrowIfNegative(WarmupNs, nameof(WarmupNs));
         ArgumentOutOfRangeException.ThrowIfNegative(LatchLeadNs, nameof(LatchLeadNs));
         ArgumentOutOfRangeException.ThrowIfLessThan(PresentLeadNs, -1, nameof(PresentLeadNs));
+        if (Capture is not null && Clock == PlaybackClock.Virtual)
+        {
+            throw new ArgumentException("A live capture runs on the real clock: its frames come when they come.", nameof(Clock));
+        }
+
         if (Clock == PlaybackClock.Virtual && Display != DisplayKind.Offscreen)
         {
             throw new ArgumentException("The virtual clock needs the offscreen display: a window's refreshes run on real time.", nameof(Clock));

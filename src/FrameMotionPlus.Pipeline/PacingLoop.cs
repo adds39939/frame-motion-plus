@@ -66,6 +66,7 @@ internal sealed class PacingLoop
     private long _writtenSeen = -1;
     private long _progressNs;
     private long _nextProgressCheckNs;
+    private long _launchNs = long.MinValue;
 
     // Counters.
     private long _framesRead;
@@ -198,6 +199,7 @@ internal sealed class PacingLoop
     public void Run()
     {
         PreRoll();
+        _launchNs = Now;
         var waiter = DeadlineWaiter.Sleep;
         while (!_stop)
         {
@@ -734,6 +736,14 @@ internal sealed class PacingLoop
     {
         if (_playbackStartNs == long.MinValue)
         {
+            // Nothing shown yet: a run with a duration counts it from launch, so a source that never delivers a frame (a
+            // capture with no buffers coming) ends with a reason instead of running for ever.
+            if (_durationNs > 0 && _launchNs != long.MinValue && decision.TargetTimeNs - _launchNs >= _durationNs)
+            {
+                throw new TimeoutException(string.Create(CultureInfo.InvariantCulture,
+                    $"No frames arrived from the source in the run's {_durationNs / 1e9:0.###} s ({_framesRead} read, none shown): nothing to play."));
+            }
+
             return false;
         }
 

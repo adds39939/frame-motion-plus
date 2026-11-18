@@ -13,6 +13,7 @@
     <ProjectReference Include="..\FrameMotionPlus.CudaVulkan\FrameMotionPlus.CudaVulkan.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.Vfx\FrameMotionPlus.Vfx.csproj" />
     <ProjectReference Include="..\FrameMotionPlus.Sources.File\FrameMotionPlus.Sources.File.csproj" />
+    <ProjectReference Include="..\FrameMotionPlus.Sources.V4l2\FrameMotionPlus.Sources.V4l2.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,9 +1,12 @@
+using FrameMotionPlus.Core.Cadence;
+using FrameMotionPlus.Core.Frames;
 using FrameMotionPlus.Core.Scheduling;
 using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Cuda;
 using FrameMotionPlus.Cuda.Kernels;
 using FrameMotionPlus.Platform.Runtime;
 using FrameMotionPlus.Sources.File;
+using FrameMotionPlus.Sources.V4l2;
 using FrameMotionPlus.Vfx;
 using FrameMotionPlus.Vulkan;
 
@@ -59,10 +62,63 @@ public sealed class PlaybackHooks
     public bool OffscreenReadback { get; init; }
 }
 
+/// <summary>What a session's source delivers (a file or a capture), in the terms every source shares.</summary>
+public readonly record struct SourceDescription
+{
+    public int Width { get; init; }
+
+    public int Height { get; init; }
+
+    /// <summary>The frames' RGB format (RGBA8, or RGB10A2 for 10-bit sources).</summary>
+    public PixelFormat Format { get; init; }
+
+    /// <summary>What the frames' pixels are (identity matrix, full range, the content's primaries and transfer).</summary>
+    public ColorMetadata Color { get; init; }
+
+    /// <summary>The file's frame rate, or the capture signal's rate.</summary>
+    public FrameRate NominalRate { get; init; }
+
+    public bool IsLive { get; init; }
+
+    /// <summary>One line: what it is.</summary>
+    public string? Text { get; init; }
+}
+
+/// <summary>What a capture source negotiated and resolved (for the start-up lines).</summary>
+public sealed record CaptureSetup
+{
+    public required V4l2DeviceInfo Device { get; init; }
+
+    public required NegotiatedFormat Format { get; init; }
+
+    public required CaptureColor Color { get; init; }
+
+    public required CaptureBufferMode BufferMode { get; init; }
+
+    public IReadOnlyList<string> RefusedBufferModes { get; init; } = [];
+
+    public int Buffers { get; init; }
+
+    public bool SourceChangeEvents { get; init; }
+
+    public string? Input { get; init; }
+
+    public bool Cadence { get; init; }
+
+    public CadenceOptions? CadenceOptions { get; init; }
+}
+
 /// <summary>What <see cref="PlaybackSession.Open"/> resolved.</summary>
 public sealed class PlaybackSetup
 {
-    public required FileStreamInfo Stream { get; init; }
+    /// <summary>The file's stream (file playback only).</summary>
+    public FileStreamInfo? Stream { get; init; }
+
+    /// <summary>What the source delivers, file or capture.</summary>
+    public SourceDescription Source { get; init; }
+
+    /// <summary>The capture's negotiation (capture only).</summary>
+    public CaptureSetup? Capture { get; init; }
 
     public required string GeneratorName { get; init; }
 
@@ -196,6 +252,9 @@ public sealed class PlaybackReport
 
     public FileSourceStatistics SourceStatistics { get; set; }
 
+    /// <summary>The capture's counters and distributions (capture only).</summary>
+    public CaptureSummary? Capture { get; set; }
+
     public bool SourceLeaked { get; set; }
 
     /// <summary>GPU work did not finish at teardown: nothing GPU-side was freed (see <see cref="Abandoned"/>); the caller
@@ -306,7 +365,7 @@ public sealed class PlaybackReport
 
         if (SourceLeaked)
         {
-            f.Add("the source could not be freed (its decode thread did not stop)");
+            f.Add(Capture is null ? "the source could not be freed (its decode thread did not stop)" : "the capture source could not be freed");
         }
 
         if (Measured)
@@ -322,6 +381,11 @@ public sealed class PlaybackReport
             if (SourceStatistics.DecodeThreadAllocatedBytes > 0)
             {
                 f.Add($"the decode thread allocated {SourceStatistics.DecodeThreadAllocatedBytes} B");
+            }
+
+            if (Capture is { Counters.DequeueThreadAllocatedBytes: > 0 } c)
+            {
+                f.Add($"the capture thread allocated {c.Counters.DequeueThreadAllocatedBytes} B");
             }
         }
 

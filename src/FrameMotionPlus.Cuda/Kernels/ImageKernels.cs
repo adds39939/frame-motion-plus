@@ -6,14 +6,14 @@ namespace FrameMotionPlus.Cuda.Kernels;
 
 /// <summary>
 /// The kernels in native/kernels, loaded from the PTX embedded in this assembly: test pattern, blend, format
-/// conversion, YCbCr 4:2:0 to RGB and a GPU delay. Each Enqueue method validates its frames on the host, launches on the given stream
+/// conversion, YCbCr 4:2:0 and packed 4:2:2 to RGB, the capture cadence metric and a GPU delay. Each Enqueue method validates its frames on the host, launches on the given stream
 /// and returns; none waits on <see cref="GpuFrame.Ready"/> (callers that need it do <see cref="CudaStream.Wait(in GpuSignal)"/>).
 /// Allocation-free per call.
 /// </summary>
 public sealed unsafe class ImageKernels : IDisposable
 {
     /// <summary>Embedded module names (native/kernels/*.cu).</summary>
-    public static readonly IReadOnlyList<string> ModuleNames = ["blend", "convert", "pattern", "util", "yuv"];
+    public static readonly IReadOnlyList<string> ModuleNames = ["blend", "cadence", "convert", "pattern", "util", "yuv"];
 
     private static readonly CudaDim3 _block = new(32, 8);
 
@@ -27,16 +27,20 @@ public sealed unsafe class ImageKernels : IDisposable
     private readonly CudaKernel _swapRedBlue8;
     private readonly CudaKernel _delay;
     private readonly CudaKernel _yuvToRgb;
+    private readonly CudaKernel _yuyvToRgb;
+    private readonly CudaKernel _cadence;
 
     private ImageKernels(CudaModule[] modules)
     {
         _modules = modules;
         Context = modules[0].Context;
-        var blend = modules[0];
-        var convert = modules[1];
-        var pattern = modules[2];
-        var util = modules[3];
-        var yuv = modules[4];
+        CudaModule Module(string name) => modules[ModuleIndex(name)];
+        var blend = Module("blend");
+        var cadence = Module("cadence");
+        var convert = Module("convert");
+        var pattern = Module("pattern");
+        var util = Module("util");
+        var yuv = Module("yuv");
         _patternRgba8 = pattern.GetKernel("fmp_pattern_rgba8");
         _patternRgb10A2 = pattern.GetKernel("fmp_pattern_rgb10a2");
         _blendRgba8 = blend.GetKernel("fmp_blend_rgba8");
@@ -46,6 +50,21 @@ public sealed unsafe class ImageKernels : IDisposable
         _swapRedBlue8 = convert.GetKernel("fmp_swap_red_blue8");
         _delay = util.GetKernel("fmp_delay_ns");
         _yuvToRgb = yuv.GetKernel("fmp_yuv420_to_rgb");
+        _yuyvToRgb = yuv.GetKernel("fmp_yuyv_to_rgb");
+        _cadence = cadence.GetKernel("fmp_cadence_metric");
+    }
+
+    private static int ModuleIndex(string name)
+    {
+        for (var i = 0; i < ModuleNames.Count; i++)
+        {
+            if (ModuleNames[i] == name)
+            {
+                return i;
+            }
+        }
+
+        throw new ArgumentException($"No kernel module '{name}'.", nameof(name));
     }
 
     /// <summary>The context the modules are loaded in; launches must use streams of the same context.</summary>
@@ -244,6 +263,77 @@ public sealed unsafe class ImageKernels : IDisposable
         _yuvToRgb.Launch(stream, Grid(width, height), _block, 0, args);
     }
 
+    /// <summary>
+    /// Converts packed 4:2:2 8-bit YCbCr (V4L2 YUYV: Y0 Cb Y1 Cr per pixel pair) at <paramref name="source"/> (device or
+    /// mapped address, <paramref name="sourcePitch"/> bytes per row) into <paramref name="destination"/> by
+    /// <paramref name="conversion"/> (an 8-bit conversion; only its horizontal siting applies: chroma is full height).
+    /// Same arithmetic as <see cref="EnqueueYuvToRgb"/>. Allocation-free.
+    /// </summary>
+    public void EnqueueYuyvToRgb(CudaStream stream, ulong source, int sourcePitch, in GpuFrame destination, in YuvConversion conversion)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        FrameChecks.ValidateCudaImage(destination, nameof(destination));
+        if (!conversion.IsValid || destination.Format != conversion.Output)
+        {
+            ThrowYuvOutput(destination.Format, conversion.Output);
+        }
+
+        if (conversion.SourceBits != 8)
+        {
+            ThrowYuvFormat(YuvSampleFormat.Nv12, conversion.SourceBits);
+        }
+
+        var width = destination.Width;
+        var height = destination.Height;
+        if (source == 0 || (width & 1) != 0 || sourcePitch < 2L * width)
+        {
+            ThrowPacked(source, sourcePitch, width);
+        }
+
+        var src = source;
+        var srcPitch = (uint)sourcePitch;
+        var dst = destination.Address + destination.Offset;
+        var dstPitch = (uint)destination.PitchBytes;
+        var parameters = conversion.Parameters;
+        var args = stackalloc void*[7] { &src, &srcPitch, &dst, &dstPitch, &width, &height, &parameters };
+        _yuyvToRgb.Launch(stream, Grid(width, height), _block, 0, args);
+    }
+
+    /// <summary>
+    /// The capture cadence metric of one frame's luma (native/kernels/cadence.cu): sums its 4x4-sample cells into
+    /// <paramref name="current"/> (<see cref="CadenceGrid.Cells"/> 32-bit sums), compares them with
+    /// <paramref name="reference"/> (the last unique frame's grid) and writes into <paramref name="result"/> (two 64-bit
+    /// words, zeroed here first) the largest 32x32-pixel tile's mean absolute difference per luma sample in 1/65536 code
+    /// units, and the largest cell sum. All addresses are device memory. Allocation-free.
+    /// </summary>
+    public void EnqueueCadenceMetric(CudaStream stream, ulong luma, int lumaPitch, in CadenceGrid grid, ulong reference, ulong current, ulong result)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (luma == 0 || reference == 0 || current == 0 || result == 0 || grid.CellsX <= 0 || grid.CellsY <= 0 ||
+            lumaPitch < (long)grid.CellsX * CadenceGrid.CellSize * grid.Sampling.SampleBytes || (result & 7) != 0)
+        {
+            ThrowCadence(grid, lumaPitch);
+        }
+
+        stream.MemsetAsync(result, 0, 16);
+        var src = luma;
+        var pitch = (uint)lumaPitch;
+        var refGrid = reference;
+        var curGrid = current;
+        var res = result;
+        var parameters = new CadenceKernelParameters
+        {
+            CellsX = grid.CellsX,
+            CellsY = grid.CellsY,
+            SampleBytes = grid.Sampling.SampleBytes,
+            Sixteen = grid.Sampling.Sixteen ? 1 : 0,
+            Shift = grid.Sampling.Shift,
+        };
+        var args = stackalloc void*[6] { &src, &pitch, &refGrid, &curGrid, &res, &parameters };
+        var blocks = new CudaDim3((uint)((grid.CellsX + CadenceGrid.TileCells - 1) / CadenceGrid.TileCells), (uint)((grid.CellsY + CadenceGrid.TileCells - 1) / CadenceGrid.TileCells));
+        _cadence.Launch(stream, blocks, new CudaDim3(CadenceGrid.TileCells, CadenceGrid.TileCells), 0, args);
+    }
+
     /// <summary>Keeps <paramref name="stream"/> busy for <paramref name="nanoseconds"/> of GPU time (diagnostics, tests).</summary>
     public void EnqueueDelay(CudaStream stream, long nanoseconds)
     {
@@ -304,6 +394,14 @@ public sealed unsafe class ImageKernels : IDisposable
     [DoesNotReturn]
     private static void ThrowPlanes(in YuvPlanes source) =>
         throw new ArgumentException($"Invalid planes: {source}.", nameof(source));
+
+    [DoesNotReturn]
+    private static void ThrowPacked(ulong source, int pitch, int width) =>
+        throw new ArgumentException($"Invalid packed 4:2:2 source: address 0x{source:x}, pitch {pitch} for width {width} (an even width, at least 2 bytes per pixel).", nameof(source));
+
+    [DoesNotReturn]
+    private static void ThrowCadence(in CadenceGrid grid, int pitch) =>
+        throw new ArgumentException($"Invalid cadence metric arguments: {grid}, luma pitch {pitch} (non-zero device addresses, an 8-byte aligned result).");
 
     [DoesNotReturn]
     private static void ThrowTimestep(float t) =>

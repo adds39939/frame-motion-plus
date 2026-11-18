@@ -36,6 +36,12 @@ milestone 1). Results, the threading and time model, and the frame-timing issues
 gate has not been verified on the current code):
 [`docs/benchmarks/phase4b-pipeline.md`](docs/benchmarks/phase4b-pipeline.md). The HUD and the quality harness are 4c.
 
+Phase 5 (capture card) adds `FrameMotionPlus.Sources.V4l2`: a live source for a V4L2 capture card (a PS5 on an Elgato
+4K X), captured into CUDA-pinned buffers, uploaded, judged by the cadence detector (a GPU kernel feeding Core's tracker:
+repeats of a picture are dropped, a 30 fps game is found inside a 60 Hz signal), converted on the GPU, and played through
+the same pipeline with VFG: `fmp capture`. Results, what the card does, and what still needs the owner's hardware or
+eyes: [`docs/benchmarks/phase5-capture.md`](docs/benchmarks/phase5-capture.md).
+
 ## Layout
 
 ```
@@ -47,6 +53,7 @@ src/FrameMotionPlus.Vulkan/       device selection, exportable presentation ring
 src/FrameMotionPlus.CudaVulkan/   the IGpuBridge: the presenter's ring and timelines imported into CUDA (Linux, opaque FDs)
 src/FrameMotionPlus.Vfx/          NVIDIA VFX SDK bindings and loading, VfgGenerator (Video Frame Generation, CUDA domain)
 src/FrameMotionPlus.Sources.File/ FFmpeg 9 bindings, NVDEC decode into CUDA, the file IFrameSource and its frame history
+src/FrameMotionPlus.Sources.V4l2/ V4L2 bindings, format negotiation, the capture IFrameSource (pinned buffers, cadence)
 src/FrameMotionPlus.Pipeline/     playback: source → scheduler → generator → ring → presenter on dedicated threads, telemetry
 native/kernels/, native/shaders/  CUDA kernel and shader sources with the generated PTX and SPIR-V checked in
 tests/FrameMotionPlus.Core.Tests/ xUnit v3 tests of the core and the CLI (always run)
@@ -57,12 +64,14 @@ tests/FrameMotionPlus.Gpu.Tests/    CUDA/Vulkan interop end to end and `fmp patt
 tests/FrameMotionPlus.Vfx.Tests/    SDK loading, VfgGenerator, measured SDK behaviour, the VFG commands (Vfx)
 tests/FrameMotionPlus.Sources.File.Tests/ FFmpeg layouts, the convert kernel, decode against software, `fmp decode` (Media)
 tests/FrameMotionPlus.Pipeline.Tests/ the whole path checked frame by frame offscreen, faults, allocations, windowed runs, `fmp play`
+tests/FrameMotionPlus.Sources.V4l2.Tests/ V4L2 layouts, negotiation, the cadence kernel and tracker, vivid, the card, `fmp capture`
 ```
 
 Hardware tests carry the category `Gpu` (NVIDIA GPU, CUDA driver, Vulkan with the validation layer),
 `Display` (a Wayland session and SDL3 as well), `Vfx` (the NVIDIA VFX SDK as well) or `Media` (FFmpeg 9's
 shared libraries and the `ffmpeg` CLI, which makes the test clips at test time) and skip, never fail, when
-that is missing, so hosted CI stays green. The pipeline tests need all of a GPU, FFmpeg 9 and the `ffmpeg` CLI
+that is missing, so hosted CI stays green. The capture tests add `Capture` (the kernel's `vivid` test driver, loaded by
+hand with `sudo modprobe vivid`) and `Elgato` (the Elgato 4K X with a picture on its input). The pipeline tests need all of a GPU, FFmpeg 9 and the `ffmpeg` CLI
 (category `Gpu`), and a display or the SDK for some. Vulkan tests run under the validation layer and
 fail on any message.
 
@@ -232,6 +241,34 @@ A 60 fps file at `--multiplier 2` shows a new image every refresh of a 120 Hz di
 Escape, Ctrl+C and SIGTERM stop it cleanly with its summary, during the start-up too; if GPU work never finishes, it
 stops, says what its teardown had to leave and ends the process. A published binary outside a checkout does not find
 the VFX SDK in `lib/VideoFX`: set `$FMP_VFX_SDK` (or `--vfx-sdk`). See `fmp --help` for every option.
+
+## Capturing from a capture card
+
+`fmp capture [device]` captures a V4L2 capture card live (a PS5 over HDMI on an Elgato 4K X) and plays it with frame
+generation through the same pipeline as `fmp play`. Each frame is written by the driver straight into CUDA-pinned memory
+(V4L2 USERPTR), uploaded and judged by the cadence detector (repeats of a picture are dropped, so a 30 fps game in a 60 Hz
+signal is seen as 30 fps, with the time each picture first appeared), then converted to RGB on the GPU (RGB10A2 for 10-bit
+P010, RGBA8 for NV12 and YUYV). Nothing waits for anything: when the pipeline does not take frames, the capture drops them
+itself, newest first kept. At the start it prints what the device negotiated (and anything the driver changed), the colour
+it resolved and why, and the buffer mode; at the end the play summary plus the capture's statistics (frames captured,
+unique, repeats dropped, skipped as stale, the detected game frame rate, holds, timestamp jitter, USB delivery, the GPU
+cost of upload, cadence and conversion) and the latency the generation adds against the design doc's latency model.
+
+```sh
+fmp capture --list                                   # the capture devices and what each offers
+fmp capture --mode 4k30-hdr                          # the owner's target: 3840x2160 P010 at 30, HDR10, VFG to 60 (window)
+fmp capture --mode 4k30-hdr --fullscreen             # the same, borderless fullscreen on the window's output
+fmp capture --mode 1440p60-hdr                       # 2560x1440 P010 at 60, HDR10, VFG to 120 (for 60 fps games)
+fmp capture --mode 1440p60-hdr --multiplier 4        # a 30 fps game in that signal to 120
+fmp capture /dev/video0 --size 1920x1080 --fps 120 --format nv12 --hdr off   # any offered mode, SDR
+fmp capture --mode 4k30-hdr --duration-s 180 --csv capture.csv --frames-csv frames.csv   # timelines for fmp verify
+```
+
+The Elgato 4K X offers 10-bit P010 only up to 1440p60 and 2160p30 (it takes 30 of the console's 60 Hz itself in that
+mode), and reports Rec. 709 for a PQ signal: `fmp capture` therefore takes a 10-bit capture as HDR10 (PQ, BT.2020) by
+default; `--hdr off` for a console in SDR, `--range` and `--matrix` to override the rest. MJPEG is never used. Window
+close, Escape, Ctrl+C and SIGTERM stop it cleanly; the device is released on every way out. Set `$FMP_VFX_SDK` for a
+binary outside the checkout, as for `fmp play`.
 
 ## Benchmarking VFG
 

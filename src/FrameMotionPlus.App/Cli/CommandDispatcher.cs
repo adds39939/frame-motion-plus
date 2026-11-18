@@ -36,6 +36,7 @@ internal static class CommandDispatcher
                 "pattern" => PatternCommand.Run(rest, output, error),
                 "decode" => DecodeCommand.Run(rest, output, error),
                 "play" => PlayCommand.Run(rest, output, error),
+                "capture" => CaptureCommand.Run(rest, output, error),
                 "verify" => VerifyCommand.Run(rest, output, error),
                 _ => throw new UsageException($"Unknown command '{args[0]}'."),
             };
@@ -76,6 +77,11 @@ internal static class CommandDispatcher
                                     Decode a video file with NVDEC into CUDA, convert it to RGB and check it (Phase 4)
           fmp play <file> [options] Play a video file with frame generation in real time: decoded, interpolated (VFG,
                                     blend or repeat) and presented, paced by the display-time scheduler (Phase 4)
+          fmp capture [device] [options]
+                                    Capture a capture card (V4L2: a PS5 over HDMI) live with frame generation: captured into
+                                    CUDA-pinned buffers, repeats of a picture dropped by the cadence detector, interpolated
+                                    (VFG, blend or repeat) and presented, paced by the display-time scheduler (Phase 5)
+          fmp capture --list        The V4L2 capture devices and the formats, sizes and rates each offers
           fmp verify <file.csv> [--rate <hz>] [--warmup-s <s>] [--slots <a>-<b>]
                                     Recompute a play run's verdict from its telemetry CSV alone (early, late, not shown,
                                     untimed, wrong image, order, refreshes without a present) and compare it with the
@@ -266,6 +272,38 @@ internal static class CommandDispatcher
                                     Diagnostics: FMP_PLAY_WATCHDOG=1 prints where each pipeline thread is once a second;
                                     FMP_PLAY_FAULT=gpu-wait@N (a GPU wait that never completes at the N-th generated frame)
                                     or gpu-busy@N:S (S seconds of GPU work there) checks that the run still ends.
+
+        capture options (device: /dev/videoN; default: the first capture device with a 10-bit mode, else the first one):
+          --list                    List the capture devices: formats, sizes, rates, the presets each one can do
+          --mode <preset>           4k30-hdr (3840x2160 P010 at 30, HDR10: the Elgato 4K X's 10-bit 4K mode; generate to
+                                    60), 1440p60-hdr (2560x1440 P010 at 60, HDR10: for 60 fps games; to 120), 4k60-sdr,
+                                    1440p60-sdr, 1440p120-sdr, 1080p60-sdr, 1080p120-sdr (NV12, SDR)
+                                    Without --mode or the three below: the largest 10-bit mode, at its highest rate
+          --size <WxH>              Capture size (must be one the device offers)
+          --fps <rate>              Capture rate: 30, 60, 59.94 ... (59.94 and 60 differ)        (the highest offered)
+          --format <nv12|p010|yuyv> Pixel format (MJPEG is never used: its decode adds latency)  (P010 first)
+          --hdr <on|off|auto|10bit> HDR10 (PQ, BT.2020): on, off, auto (as the device reports it), or 10bit (on for a
+                                    10-bit capture: the Elgato 4K X reports Rec. 709 even for a PQ signal)  (10bit)
+          --range <limited|full|auto>  YCbCr range override (a PS5 sends limited)                (auto: the device's)
+          --matrix <bt709|bt2020|bt601|auto>  YCbCr matrix override               (auto: the device's; BT.2020 with HDR)
+          --no-cadence              Every captured frame is new (no repeat detection)
+          --buffer-mode <mode>      auto (USERPTR into CUDA pinned memory, else USERPTR into registered memory, else
+                                    MMAP registered with CUDA), userptr, userptr-registered, mmap                (auto)
+          --buffers <n>             Capture buffers, 2 to 16                                     (4)
+          --generator, --quality, --multiplier, --output-hz, --duration-s, --window, --fullscreen, --validate, --csv,
+          --settings, --vfx-sdk, --warmup-s, --present-lead-ms, --latch-ms, --cuda-sync   As for play (the duration is
+                                    unlimited by default: until Ctrl+C, closing the window or Escape)
+          --offscreen               No window: an offscreen target on the real clock at --display-hz
+          --display-hz <hz>         With --offscreen: the refresh rate the target stands for     (120)
+                                    Prints what it negotiated (and what the driver changed), the colour it resolved and
+                                    why, the buffer mode, then the play summary plus capture statistics: frames dequeued,
+                                    skipped as stale (newest wins), dropped by the driver, unique, repeats dropped, dropped
+                                    while the pipeline was behind, the detected game rate, holds, black frames, timestamp
+                                    jitter, USB delivery (dequeue − timestamp), capture to available, upload, cadence and
+                                    convert GPU time, and the latency added by generation against the latency model.
+                                    Exits 1 on a failure (the device unplugged, a format change, a stream error), 2 for a
+                                    mode the device does not offer, 69 when capture (Linux), the device, the GPU or a
+                                    display is missing. The device is released on every way out.
 
         Exit codes: 0 success, 1 check or validation failed, 2 usage error, 70 internal error; 69 when a GPU or display is required but not there.
 

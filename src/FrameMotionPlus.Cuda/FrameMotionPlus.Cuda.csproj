@@ -28,6 +28,8 @@
     <!-- The file source's tests read the stream counters and the context's reference count, and compare the YCbCr
          conversion's kernel parameters with an independent derivation. -->
     <InternalsVisibleTo Include="FrameMotionPlus.Sources.File.Tests" />
+    <!-- The capture tests check the cadence kernel's parameter block against cadence.cu's struct. -->
+    <InternalsVisibleTo Include="FrameMotionPlus.Sources.V4l2.Tests" />
   </ItemGroup>
 
 </Project>

@@ -1,4 +1,5 @@
 using System.Globalization;
+using FrameMotionPlus.App.Capture;
 using FrameMotionPlus.Core.Scheduling;
 using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Cuda;
@@ -13,7 +14,7 @@ internal static class PlayPrinter
 
     public static void PrintSetup(TextWriter o, PlayOptions options, PlaybackOptions playback, PlaybackSetup s, string why, CudaContext cuda)
     {
-        var info = s.Stream;
+        var info = s.Stream ?? throw new InvalidOperationException("fmp play prints a file's setup.");
         o.WriteLine($"fmp play: {info.Path}{(options.Gate ? "  [gate: milestone 1, 10 minutes VFG Medium 2x, zero missed slots, zero gen0 collections]" : "")}");
         o.WriteLine(string.Create(Ic,
             $"  file        {info.Describe()}; {(info.DurationNs > 0 ? $"{info.DurationNs / 1e9:0.###} s" : "length unknown")}" +
@@ -41,7 +42,10 @@ internal static class PlayPrinter
     }
 
     /// <summary>Prints the summary; returns the verdict (true: pass).</summary>
-    public static bool PrintSummary(TextWriter o, PlayOptions options, PlaybackReport r)
+    public static bool PrintSummary(TextWriter o, PlayOptions options, PlaybackReport r) => PrintSummary(o, options.Gate, r);
+
+    /// <summary>Prints the summary of a file or capture run (with <paramref name="gate"/>, the Phase 4 gate's verdict too).</summary>
+    public static bool PrintSummary(TextWriter o, bool gate, PlaybackReport r)
     {
         var s = r.Statistics;
         var d = r.Diagnostics;
@@ -145,12 +149,20 @@ internal static class PlayPrinter
         }
         var model = LatencyModel.Evaluate(d.SourceIntervalNs, Math.Max(1, d.Multiplier), g.Count > 0 ? g.Percentile(0.99) : d.GenerationTimeNs);
         var lat = s.RealFrameLatency;
-        o.WriteLine(lat.Count == 0
-            ? "  latency     no real frame shown in the measured window"
-            : string.Create(Ic,
-                $"  latency     real frames shown {Ms(lat.Mean)} ms after their content time (p99 {Ms(lat.Percentile(0.99))}); latency model ΔL = d + (M−1)/M·T = " +
-                $"{Ms(model.GenerationTimeNs)} + {Ms(model.HoldNs)} = {Ms(model.AddedLatencyNs)} ms (M {model.Multiplier}, T {Ms(model.SourceIntervalNs)}); " +
-                $"the rest is the present lead, the scheduler's margin and alignment, and the stride's rounding (a file is not latency-bound)"));
+        if (r.Capture is null)
+        {
+            o.WriteLine(lat.Count == 0
+                ? "  latency     no real frame shown in the measured window"
+                : string.Create(Ic,
+                    $"  latency     real frames shown {Ms(lat.Mean)} ms after their content time (p99 {Ms(lat.Percentile(0.99))}); latency model ΔL = d + (M−1)/M·T = " +
+                    $"{Ms(model.GenerationTimeNs)} + {Ms(model.HoldNs)} = {Ms(model.AddedLatencyNs)} ms (M {model.Multiplier}, T {Ms(model.SourceIntervalNs)}); " +
+                    $"the rest is the present lead, the scheduler's margin and alignment, and the stride's rounding (a file is not latency-bound)"));
+        }
+        else
+        {
+            CapturePrinter.PrintLatency(o, r, model);
+        }
+
         o.WriteLine(string.Create(Ic,
             $"  pipeline    bridge lead at most {r.MaxOutstanding} (limit {r.Setup.MaxLead}); slots skipped for back-pressure {r.SkippedBackPressure}, for presenter backlog " +
             $"{r.SkippedPresenterBacklog}; refresh-grid updates {r.DisplayUpdates}; ring writes: {r.Copies} copies, {r.GeneratedWrites} generated, " +
@@ -159,9 +171,16 @@ internal static class PlayPrinter
             ? "  faults      generator: none"
             : $"  faults      generator: {r.GeneratorFaults} (faulted: {r.GeneratorFaulted}; playback carried on with real frames); first: {r.FirstGeneratorFault}");
         var src = r.SourceStatistics;
-        o.WriteLine(string.Create(Ic,
-            $"  source      {src.FramesDecoded} decoded, {src.FramesDelivered} delivered, {r.FramesRead} read; loops {src.Loops}, discontinuities {r.Discontinuities} " +
-            $"(scheduler {r.Counters.Discontinuities}); frame-pool growth {src.PoolGrowth}; decode thread waited for the pipeline {src.BackPressureWaits}x"));
+        if (r.Capture is { } capture)
+        {
+            CapturePrinter.PrintCapture(o, r, capture);
+        }
+        else
+        {
+            o.WriteLine(string.Create(Ic,
+                $"  source      {src.FramesDecoded} decoded, {src.FramesDelivered} delivered, {r.FramesRead} read; loops {src.Loops}, discontinuities {r.Discontinuities} " +
+                $"(scheduler {r.Counters.Discontinuities}); frame-pool growth {src.PoolGrowth}; decode thread waited for the pipeline {src.BackPressureWaits}x"));
+        }
         foreach (var (name, cost) in r.Threads)
         {
             o.WriteLine(cost.AllocatedBytes < 0
@@ -173,7 +192,8 @@ internal static class PlayPrinter
 
         o.WriteLine(string.Create(Ic,
             $"  gc          measured window gen0/1/2 {r.MeasuredGc.Gen0Collections}/{r.MeasuredGc.Gen1Collections}/{r.MeasuredGc.Gen2Collections}; whole run " +
-            $"{r.RunGc.Gen0Collections}/{r.RunGc.Gen1Collections}/{r.RunGc.Gen2Collections}; decode thread {src.DecodeThreadAllocatedBytes} B; {r.GcMode}"));
+            $"{r.RunGc.Gen0Collections}/{r.RunGc.Gen1Collections}/{r.RunGc.Gen2Collections}; " +
+            $"{(r.Capture is { } cap ? $"capture thread {cap.Counters.DequeueThreadAllocatedBytes} B" : $"decode thread {src.DecodeThreadAllocatedBytes} B")}; {r.GcMode}"));
         o.WriteLine(r.CsvPath is null
             ? $"  telemetry   {r.TelemetryRecords} records (--csv writes them)"
             : $"  telemetry   {r.TelemetryRecords} records written to {r.CsvPath}{(r.TelemetryDropped > 0 ? $" ({r.TelemetryDropped} dropped)" : "")}");
@@ -209,7 +229,7 @@ internal static class PlayPrinter
         }
 
         var pass = failures.Count == 0;
-        if (options.Gate)
+        if (gate && r.Setup.Stream is { } stream)
         {
             var gateFailures = new List<string>();
             if (r.StopReason != StopReason.Duration)
@@ -244,9 +264,9 @@ internal static class PlayPrinter
                 gateFailures.Add($"{r.MeasuredGc.Gen0Collections} gen0 collection(s) in the measured window");
             }
 
-            if (r.Setup.Stream.Width != 2560 || r.Setup.Stream.Height != 1440 || !r.Setup.Stream.NominalRate.IsValid || Math.Abs(r.Setup.Stream.NominalRate.Hz - 60) > 0.01)
+            if (stream.Width != 2560 || stream.Height != 1440 || !stream.NominalRate.IsValid || Math.Abs(stream.NominalRate.Hz - 60) > 0.01)
             {
-                warnings.Add($"the gate is defined for a 1440p60 file; this is {r.Setup.Stream.Width}x{r.Setup.Stream.Height} at {r.Setup.Stream.NominalRate}");
+                warnings.Add($"the gate is defined for a 1440p60 file; this is {stream.Width}x{stream.Height} at {stream.NominalRate}");
             }
 
             if (Math.Abs((r.DisplayRate.Hz / Math.Max(1, d.Stride)) - 120) > 1)
@@ -272,7 +292,7 @@ internal static class PlayPrinter
             o.WriteLine($"  WARNING     {w}");
         }
 
-        if (failures.Count == 0 && r.StopReason == StopReason.User && !r.Measured && !options.Gate)
+        if (failures.Count == 0 && r.StopReason == StopReason.User && !r.Measured && !gate)
         {
             o.WriteLine("  verdict     STOPPED by the user before anything was measured (no verdict)");
         }

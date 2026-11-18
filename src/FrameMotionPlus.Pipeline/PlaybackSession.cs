@@ -14,6 +14,7 @@ using FrameMotionPlus.Platform.Runtime;
 using FrameMotionPlus.Platform.Threading;
 using FrameMotionPlus.Platform.Time;
 using FrameMotionPlus.Sources.File;
+using FrameMotionPlus.Sources.V4l2;
 using FrameMotionPlus.Vfx;
 using FrameMotionPlus.Vulkan;
 using FrameMotionPlus.Vulkan.Windowing;
@@ -21,10 +22,12 @@ using FrameMotionPlus.Vulkan.Windowing;
 namespace FrameMotionPlus.Pipeline;
 
 /// <summary>
-/// File playback with frame generation: source → scheduler → generator → presentation ring → presenter, on dedicated
-/// threads. See docs/benchmarks/phase4b-pipeline.md for the threading and time model.
+/// Playback with frame generation, of a file or a live capture: source → scheduler → generator → presentation ring →
+/// presenter, on dedicated threads. See docs/benchmarks/phase4b-pipeline.md for the threading and time model and
+/// docs/benchmarks/phase5-capture.md for the live source.
 /// <list type="bullet">
-/// <item><b>Decode thread</b> (the source's own): FFmpeg/NVDEC and the conversion into the frame history, ahead of time.</item>
+/// <item><b>Decode thread</b> (the file source's own): FFmpeg/NVDEC and the conversion into the frame history, ahead of
+/// time; or the <b>capture thread</b> (the capture source's own): dequeue, upload, cadence and conversion as frames come.</item>
 /// <item><b>Pacing thread</b> (<see cref="PacingLoop"/>): the scheduler and the source's consumer; hands each slot to the
 /// two threads below; never blocks on the GPU, the generator or the presenter.</item>
 /// <item><b>Generator thread</b> (<see cref="RingWriter"/>): every ring write in order on one stream; VFG blocks here.</item>
@@ -41,6 +44,9 @@ public sealed class PlaybackSession : IDisposable
     private const long StartDelayNs = 100 * Nanoseconds.PerMillisecond;
     private const int RingWriterQueue = 32;
     private const int PresentQueue = 16;
+
+    /// <summary>Frames a capture may have waiting for the pacing thread (it drains them at least every 2 ms).</summary>
+    private const int CaptureQueueDepth = 2;
 
     private readonly PlaybackOptions _o;
     private readonly CudaContext _cuda;
@@ -62,7 +68,7 @@ public sealed class PlaybackSession : IDisposable
     private CudaStream? _copyStream;
     private CudaStream? _computeStream;
     private CudaStream? _generatorStream;
-    private FilePlaybackSource? _source;
+    private IPlaybackSource? _source;
     private GeneratorHandle? _generator;
     private RingWriter? _writer;
     private PresentLoop? _presentLoop;
@@ -94,8 +100,11 @@ public sealed class PlaybackSession : IDisposable
     /// <summary>The offscreen target (offscreen sessions), for tests that read frames back.</summary>
     public OffscreenTarget? OffscreenTarget => _target as OffscreenTarget;
 
-    /// <summary>The file source once open (tests: its statistics; seeks).</summary>
-    public FilePlaybackSource? Source => _source;
+    /// <summary>The file source once open (tests: its statistics; seeks); null for a capture.</summary>
+    public FilePlaybackSource? Source => _source as FilePlaybackSource;
+
+    /// <summary>The source once open, file or capture.</summary>
+    public IPlaybackSource? PlaybackSource => _source;
 
     /// <summary>The scheduler once playback has started (diagnostics; read it on the pacing thread or after the run).</summary>
     public FrameScheduler? Scheduler => _pacing?.Scheduler;
@@ -110,12 +119,13 @@ public sealed class PlaybackSession : IDisposable
     /// <summary>Continues the file from <paramref name="mediaTimeNs"/> (any thread): a discontinuity, never interpolated across.</summary>
     public void Seek(long mediaTimeNs)
     {
-        var source = _source ?? throw new InvalidOperationException("The session is not open.");
+        var source = _source as FilePlaybackSource ?? throw new InvalidOperationException("The session is not playing a file.");
         source.Seek(mediaTimeNs);
     }
 
     /// <summary>Builds the whole pipeline. Throws <see cref="PlaybackUnavailableException"/> (one line) when a GPU, FFmpeg,
-    /// the VFX SDK (for VFG) or a display is missing, <see cref="FileSourceException"/> for a file that cannot be played.</summary>
+    /// the VFX SDK (for VFG), a display or the capture device is missing, <see cref="FileSourceException"/> for a file that
+    /// cannot be played, <see cref="CaptureFormatException"/> when the device does not offer what was asked.</summary>
     public PlaybackSetup Open()
     {
         ObjectDisposedException.ThrowIf(_tornDown, this);
@@ -139,7 +149,16 @@ public sealed class PlaybackSession : IDisposable
     private PlaybackSetup OpenCore()
     {
         Require(OperatingSystem.IsLinux(), "needs Linux: CUDA/Vulkan interop shares memory through opaque file descriptors (Windows is Phase 10)");
-        Require(FileFrameSource.IsAvailable(out var ffmpeg), $"needs the FFmpeg 9 shared libraries: {ffmpeg}");
+        var capture = _o.Capture;
+        if (capture is null)
+        {
+            Require(FileFrameSource.IsAvailable(out var ffmpeg), $"needs the FFmpeg 9 shared libraries: {ffmpeg}");
+        }
+        else
+        {
+            Require(CaptureDevices.IsAvailable(out var v4l2), v4l2 ?? "capture is unavailable");
+        }
+
         string? sdk = null;
         if (_o.Generator == GeneratorKind.Vfg && _hooks.GeneratorFactory is null)
         {
@@ -160,7 +179,7 @@ public sealed class PlaybackSession : IDisposable
             {
                 _window = SdlWindow.Create(new SdlWindowOptions
                 {
-                    Title = $"fmp play - {Path.GetFileName(_o.Path)}",
+                    Title = capture is null ? $"fmp play - {Path.GetFileName(_o.Path)}" : $"fmp capture - {_o.Path}",
                     Width = _o.WindowWidth,
                     Height = _o.WindowHeight,
                 });
@@ -201,11 +220,13 @@ public sealed class PlaybackSession : IDisposable
         _copyStream = CudaStream.Create(_cuda);
         _computeStream = CudaStream.Create(_cuda);
         _generatorStream = CudaStream.Create(_cuda, CudaStreamPriority.High);
-        _source = new FilePlaybackSource(_cuda, _o.Path, FilePlaybackSource.OptionsFor(_o, _copyStream, _computeStream, _kernels));
-        var stream = _source.StreamInfo;
-        var width = stream.Width;
-        var height = stream.Height;
-        var format = stream.OutputFormat;
+        _source = capture is null
+            ? new FilePlaybackSource(_cuda, _o.Path, FilePlaybackSource.OptionsFor(_o, _copyStream, _computeStream, _kernels))
+            : OpenCapture(capture);
+        var info = _source.Frames.Info;
+        var width = info.Width;
+        var height = info.Height;
+        var format = info.Format;
 
         if (_window is not null)
         {
@@ -225,7 +246,7 @@ public sealed class PlaybackSession : IDisposable
         _presenter = new VulkanPresenter(_device, _target, new VulkanPresenterOptions { MeasureGpuTime = true });
 
         // The generator first: VFG's load and warm-up synchronise the context, so they belong here, before anything runs.
-        var config = new FrameGenConfig { Width = width, Height = height, Format = format, Quality = _o.Quality, Color = stream.Color };
+        var config = new FrameGenConfig { Width = width, Height = height, Format = format, Quality = _o.Quality, Color = info.Color };
         VfgLoadReport? load = null;
         if (_hooks.GeneratorFactory is { } factory)
         {
@@ -288,7 +309,7 @@ public sealed class PlaybackSession : IDisposable
         {
             OperationsPerWrite = operations,
             MaxLead = maxLead,
-            OutputColor = stream.Color,
+            OutputColor = info.Color,
         });
         _bridge.Configure(new BridgeConfig { Width = width, Height = height, Format = format });
 
@@ -315,7 +336,18 @@ public sealed class PlaybackSession : IDisposable
         var ring = _bridge.Ring!;
         _setup = new PlaybackSetup
         {
-            Stream = stream,
+            Stream = (_source as FilePlaybackSource)?.StreamInfo,
+            Source = new SourceDescription
+            {
+                Width = width,
+                Height = height,
+                Format = format,
+                Color = info.Color,
+                NominalRate = _source.NominalRate,
+                IsLive = _source.IsLive,
+                Text = _source.Describe(),
+            },
+            Capture = CaptureSetupOf(_source, capture),
             Generator = _generator is null ? GeneratorKind.None : _o.Generator,
             GeneratorName = _generator?.Name ?? "none (real frames only)",
             Quality = new FrameGenQualityName(QualityName(_o.Quality)),
@@ -341,6 +373,62 @@ public sealed class PlaybackSession : IDisposable
         };
         return _setup;
     }
+
+    /// <summary>
+    /// Opens the capture device with the session's streams and kernels (a drained point). A missing or busy device is
+    /// <see cref="PlaybackUnavailableException"/> (one line); a mode it does not offer, <see cref="CaptureFormatException"/>.
+    /// </summary>
+    private CapturePlaybackSource OpenCapture(CaptureSourceOptions capture)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlaybackUnavailableException("capture needs Linux (V4L2)");
+        }
+
+        try
+        {
+            return new CapturePlaybackSource(_cuda, capture with
+            {
+                Device = _o.Path,
+                CopyStream = _copyStream,
+                ComputeStream = _computeStream,
+                Kernels = _kernels,
+                QueueDepth = CaptureQueueDepth,
+                HistoryDepth = _o.HistoryDepth,
+            });
+        }
+        catch (CaptureUnavailableException e)
+        {
+            throw new PlaybackUnavailableException(e.Message, e);
+        }
+    }
+
+    private static CaptureSetup? CaptureSetupOf(IPlaybackSource source, CaptureSourceOptions? options)
+    {
+        if (!OperatingSystem.IsLinux() || source is not CapturePlaybackSource capture)
+        {
+            return null;
+        }
+
+        var s = capture.Source;
+        return new CaptureSetup
+        {
+            Device = s.DeviceInfo,
+            Format = s.Format,
+            Color = s.Color,
+            BufferMode = s.BufferMode,
+            RefusedBufferModes = s.RefusedBufferModes,
+            Buffers = s.BufferCount,
+            SourceChangeEvents = s.SourceChangeEvents,
+            Input = s.InputDescription,
+            Cadence = options?.Cadence ?? false,
+            CadenceOptions = s.Cadence.Options,
+        };
+    }
+
+    /// <summary>The capture's summary once it has stopped (or as it stands, when it could not be stopped).</summary>
+    private static CaptureSummary? CaptureSummaryOf(IPlaybackSource? source) =>
+        OperatingSystem.IsLinux() && source is CapturePlaybackSource capture ? capture.Summarise() : null;
 
     /// <summary>Pre-rolls, plays until a stop and tears down. Returns what was measured.</summary>
     public PlaybackReport Run()
@@ -389,7 +477,7 @@ public sealed class PlaybackSession : IDisposable
                 _generator?.Generator,
                 _writer,
                 _presentLoop,
-                _o.DecodeAhead + _o.HistoryDepth,
+                (_o.Capture is null ? _o.DecodeAhead : CaptureQueueDepth) + _o.HistoryDepth,
                 Math.Max(_o.TelemetryCapacity, 1024),
                 _o.Clock,
                 startNs,
@@ -799,10 +887,12 @@ public sealed class PlaybackSession : IDisposable
             }
         }
 
-        if (_source is { } source)
+        if (_source is FilePlaybackSource file)
         {
-            report.SourceStatistics = source.Source.Statistics;
+            report.SourceStatistics = file.Source.Statistics;
         }
+
+        report.Capture = CaptureSummaryOf(_source);
 
         report.OutOfOrderSignals = _bridge?.OutOfOrderSignals ?? 0;
         if (_watchdog is not null && _presentLoop is not null)
@@ -860,6 +950,11 @@ public sealed class PlaybackSession : IDisposable
         if (_source is { } source)
         {
             Try(source.Stop);
+            if (report is not null && CaptureSummaryOf(source) is { } stopped)
+            {
+                // Taken again now that the capture thread has stopped: its last counters and samples.
+                report.Capture = stopped;
+            }
         }
 
         if (_source is { } toFree)
@@ -867,7 +962,7 @@ public sealed class PlaybackSession : IDisposable
             Try(toFree.Dispose);
             if (report is not null)
             {
-                report.SourceLeaked = toFree.Source.Leaked;
+                report.SourceLeaked = toFree is FilePlaybackSource f ? f.Source.Leaked : OperatingSystem.IsLinux() && toFree is CapturePlaybackSource c && c.Source.Leaked;
             }
         }
 
@@ -927,10 +1022,27 @@ public sealed class PlaybackSession : IDisposable
         {
         }
 
+        // A capture device is let go of even so (no GPU wait is involved): another program can use it at once.
+        try
+        {
+            _source?.Abandon();
+            if (report is not null && CaptureSummaryOf(_source) is { } summary)
+            {
+                report.Capture = summary;
+            }
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            errors.Add(e);
+        }
+
         if (report is not null)
         {
             report.GpuAbandoned = true;
-            report.Abandoned = $"{what}: left allocated: the file source (decoder, frame pool, decode thread), the generator" +
+            var capture = OperatingSystem.IsLinux() && _source is CapturePlaybackSource c
+                ? c.Source.DeviceReleased ? "the capture source's GPU buffers (the device itself was released)" : "the capture source and its device (its thread did not stop, so the device was left open until the process exits)"
+                : "the file source (decoder, frame pool, decode thread)";
+            report.Abandoned = $"{what}: left allocated: {capture}, the generator" +
                 ", the generator thread's events, the ring's CUDA import, the CUDA streams and kernels, the presenter, the window" +
                 " and the Vulkan device";
             if (_instance is not null)
@@ -963,8 +1075,8 @@ public sealed class PlaybackSession : IDisposable
             $"writer jobs {_writer?.Jobs.Count} copies {_writer?.Copies} generated {_writer?.Generated}; present jobs {_presentLoop?.Jobs.Count} pending {_presentLoop?.HasPending} " +
             $"in flight {_presentLoop?.InFlightCount} shown {_presentLoop?.Shown} refusals {_presentLoop?.Refusals}; bridge handed out {_bridge?.LastAcquiredWrite} outstanding {_bridge?.Outstanding}; " +
             $"ring written {ring?.ReadWrittenValue()} released {ring?.ReadReleasedValue()}; presenter last copied {_presenter?.LastPresentedWrite} released {_presenter?.LastReleasedWrite} " +
-            $"retained {_presenter?.RetainedWrite} presented {_presenter?.Stats.Presented} completed {_presenter?.Stats.Completed}; source queue {_source?.Source.QueueDepth} " +
-            $"decoded {_source?.Source.Statistics.FramesDecoded} free {_source?.Source.History.FreeSlots} eos {_source?.IsEndOfStream}"));
+            $"retained {_presenter?.RetainedWrite} presented {_presenter?.Stats.Presented} completed {_presenter?.Stats.Completed}; source queue {(_source as FilePlaybackSource)?.Source.QueueDepth} " +
+            $"decoded {(_source as FilePlaybackSource)?.Source.Statistics.FramesDecoded} free {(_source as FilePlaybackSource)?.Source.History.FreeSlots} eos {_source?.IsEndOfStream}"));
     }
 
     private static bool WaitIdle(CudaStream? stream)

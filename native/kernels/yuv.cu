@@ -115,3 +115,36 @@ FMP_KERNEL void fmp_yuv420_to_rgb(const fmp_u8* luma, fmp_u32 lumaPitch, const f
     const fmp_u32 b = fmp_round(luminance + p.cbB * qb, p.den, p.maxOut);
     fmp_row_mut(dst, dstPitch, y)[x] = p.out10 ? fmp_pack10(r, g, b, 3u) : fmp_pack8(r, g, b, 255u);
 }
+
+// Packed 4:2:2 YCbCr, 8-bit (V4L2 YUYV: Y0 Cb Y1 Cr per pair of pixels), to RGBA8 or RGB10A2, with the same parameter
+// block and arithmetic as above. Chroma is full height, so only the horizontal axis interpolates (by chromaX, as for
+// 4:2:0); the vertical weight is a whole 4, which keeps the interpolated chroma in 16ths as the coefficients expect.
+FMP_KERNEL void fmp_yuyv_to_rgb(const fmp_u8* src, fmp_u32 srcPitch, fmp_u8* dst, fmp_u32 dstPitch, int width, int height,
+                                struct fmp_yuv_params p)
+{
+    int x, y;
+    if (!fmp_pixel(width, height, &x, &y))
+    {
+        return;
+    }
+
+    const fmp_u8* row = src + (fmp_u64)srcPitch * (fmp_u64)y;
+    const fmp_i64 a = (fmp_i64)row[2 * x] - p.yOffset;
+
+    const int lastPair = ((width + 1) >> 1) - 1;
+    const int cx4 = 2 * x - (int)p.chromaX;
+    const int i0 = fmp_floor4(cx4);
+    const fmp_i64 fx = cx4 - 4 * i0;
+    const int ia = fmp_clamp(i0, lastPair);
+    const int ib = fmp_clamp(i0 + 1, lastPair);
+    const fmp_i64 cb = 4 * ((4 - fx) * (fmp_i64)row[4 * ia + 1] + fx * (fmp_i64)row[4 * ib + 1]);
+    const fmp_i64 cr = 4 * ((4 - fx) * (fmp_i64)row[4 * ia + 3] + fx * (fmp_i64)row[4 * ib + 3]);
+    const fmp_i64 qb = cb - p.cOffset16;
+    const fmp_i64 qr = cr - p.cOffset16;
+
+    const fmp_i64 luminance = p.cy * a;
+    const fmp_u32 r = fmp_round(luminance + p.crR * qr, p.den, p.maxOut);
+    const fmp_u32 g = fmp_round(luminance + p.crG * qr + p.cbG * qb, p.den, p.maxOut);
+    const fmp_u32 b = fmp_round(luminance + p.cbB * qb, p.den, p.maxOut);
+    fmp_row_mut(dst, dstPitch, y)[x] = p.out10 ? fmp_pack10(r, g, b, 3u) : fmp_pack8(r, g, b, 255u);
+}
