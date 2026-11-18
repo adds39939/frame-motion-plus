@@ -131,7 +131,20 @@ internal static class CaptureCommand
         try
         {
             PlaybackReport report;
-            using (var session = new PlaybackSession(playback, cuda, validationEcho: options.Validate ? error : null))
+            // A colour change while capturing (followed, or H/A in the window): one line as it happens, written from
+            // preformatted text so the control thread allocates nothing (the summary lists them all).
+            string[] notices =
+            [
+                "  colour      now SDR (BT.709): switched by hand",
+                "  colour      now HDR10 (PQ, BT.2020): switched by hand",
+                "  colour      now SDR (BT.709): the signal's samples now carry 8 bits",
+                "  colour      now HDR10 (PQ, BT.2020): the signal's samples now carry 10 bits",
+            ];
+            var hooks = new PlaybackHooks
+            {
+                OnColorSwitch = w => output.WriteLine(notices[(w.ToHdr ? 1 : 0) + (w.Cause == ColorSwitchCause.Manual ? 0 : 2)]),
+            };
+            using (var session = new PlaybackSession(playback, cuda, hooks, validationEcho: options.Validate ? error : null))
             {
                 Volatile.Write(ref live, session);
                 if (Volatile.Read(ref stopAsked))
@@ -163,6 +176,7 @@ internal static class CaptureCommand
                 CapturePrinter.PrintSetup(output, options, playback, setup, why, cuda);
                 audio.PrintSetup(output, options);
                 output.Flush();
+                using var switcher = SwitchEvery(session, error);
                 report = session.Run();
                 if (options.FramesCsvPath is { } path && session.PlaybackSource is CapturePlaybackSource capture)
                 {
@@ -194,6 +208,28 @@ internal static class CaptureCommand
                 cuda.Dispose();
             }
         }
+    }
+
+    /// <summary>
+    /// Diagnostics: FMP_CAPTURE_SWITCH_EVERY_S=<s> asks the capture to switch between SDR and HDR10 every s seconds, as
+    /// pressing H in the window does (to exercise the switch with no one at the keyboard). Null when not set.
+    /// </summary>
+    private static Timer? SwitchEvery(PlaybackSession session, TextWriter error)
+    {
+        var text = Environment.GetEnvironmentVariable("FMP_CAPTURE_SWITCH_EVERY_S");
+        if (text is null)
+        {
+            return null;
+        }
+
+        if (!double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds) || seconds < 0.2 || seconds > 3600)
+        {
+            error.WriteLine($"fmp: capture: FMP_CAPTURE_SWITCH_EVERY_S expects seconds (0.2 to 3600), got '{text}'; ignored");
+            return null;
+        }
+
+        var period = TimeSpan.FromSeconds(seconds);
+        return new Timer(_ => session.RequestCaptureColor(CaptureColorRequest.Toggle), null, period, period);
     }
 
     /// <summary>Room for the whole run at up to 240 fps (an hour when it has no duration), plus the start-up.</summary>

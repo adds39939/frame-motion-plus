@@ -61,6 +61,9 @@ public sealed class PlaybackHooks
     /// <summary>Copy every presented frame to host memory (offscreen), so <see cref="OnPresented"/> can read it back.</summary>
     public bool OffscreenReadback { get; init; }
 
+    /// <summary>Control thread: a capture changed between SDR and HDR10 (followed, or by hand); called once per change seen.</summary>
+    public Action<Sources.V4l2.ColorSwitch>? OnColorSwitch { get; init; }
+
     /// <summary>
     /// Tests: an offscreen session on the real clock presents as a window does, to this model of a compositor's FIFO (its
     /// latch, missed refreshes, discards), which reports the first-pixel times.
@@ -153,6 +156,12 @@ public sealed class PlaybackSetup
     public int PresentsInFlightCap { get; init; }
 
     public string? Transform { get; init; }
+
+    /// <summary>The output at the start: SDR or HDR10, the images' format and colour space, the HDR metadata sent.</summary>
+    public string? Output { get; init; }
+
+    /// <summary>Whether frames are shown pixel for pixel or resampled to the output (and how), at the start.</summary>
+    public string? Scaling { get; init; }
 
     public required string DeviceName { get; init; }
 
@@ -294,6 +303,15 @@ public sealed class PlaybackReport
 
     /// <summary>What teardown left allocated, and why (null when it freed everything).</summary>
     public string? Abandoned { get; set; }
+
+    /// <summary>The presenter's last rebuild of the output for a colour switch (default: none).</summary>
+    public OutputColorChange LastOutputColorChange { get; set; }
+
+    /// <summary>The output at the end (after a fullscreen change or colour switches); see <see cref="PlaybackSetup.Output"/>.</summary>
+    public string? OutputAtEnd { get; set; }
+
+    /// <summary>Whether frames were shown pixel for pixel or resampled at the end; see <see cref="PlaybackSetup.Scaling"/>.</summary>
+    public string? ScalingAtEnd { get; set; }
 
     /// <summary>Times the present lead went up (a present's content missed the compositor's latch).</summary>
     public long LeadRaises { get; set; }

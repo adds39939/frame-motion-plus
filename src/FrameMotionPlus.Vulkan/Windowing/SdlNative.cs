@@ -37,6 +37,10 @@ internal static unsafe partial class SdlNative
 
     public const uint KeycodeEscape = 0x1B;
 
+    /// <summary>SDLK_H and SDLK_A (SDL3 keycodes of letter keys are their lower-case characters).</summary>
+    public const uint KeycodeH = 0x68;
+    public const uint KeycodeA = 0x61;
+
     static SdlNative()
     {
         // The SONAME of the system library, so no -dev symlink is needed and nothing bundled is picked up instead.

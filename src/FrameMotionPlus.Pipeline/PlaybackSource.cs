@@ -199,6 +199,24 @@ public sealed record CaptureSummary
 
     public long SignalIntervalNs { get; init; }
 
+    /// <summary>The colour at the end (HDR10 or SDR) and whether it was following the signal.</summary>
+    public bool HdrAtEnd { get; init; }
+
+    public bool FollowingAtEnd { get; init; }
+
+    /// <summary>Changes between SDR and HDR10 during the run, and the first 64 of them.</summary>
+    public long ColorSwitches { get; init; }
+
+    public IReadOnlyList<ColorSwitch> SwitchLog { get; init; } = [];
+
+    /// <summary>The capture timestamp of the first frame (switch times are reported from it), ns; 0 for none.</summary>
+    public long FirstTimestampNs { get; init; }
+
+    /// <summary>P010 captures: frames whose samples carried 10 bits, 8 bits, or could not tell (black, flat).</summary>
+    public (long TenBit, long EightBit, long Inconclusive) Depths { get; init; }
+
+    public bool IsP010 { get; init; }
+
     [SupportedOSPlatform("linux")]
     public static CaptureSummary From(V4l2FrameSource s)
     {
@@ -219,6 +237,13 @@ public sealed record CaptureSummary
             RepeatMetric = DistributionSummary.From(s.RepeatMetric),
             UniqueIntervals = DistributionSummary.From(s.UniqueIntervals),
             SignalIntervalNs = s.Cadence.SignalIntervalNs,
+            HdrAtEnd = s.IsHdrNow,
+            FollowingAtEnd = s.IsFollowing,
+            ColorSwitches = s.ColorSwitches,
+            SwitchLog = s.SwitchLog.ToArray(),
+            FirstTimestampNs = s.FirstTimestampNs,
+            Depths = s.DepthCounts,
+            IsP010 = s.Format.Format == CapturePixelFormat.P010,
         };
     }
 }

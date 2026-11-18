@@ -193,7 +193,7 @@ public class NegotiationTests
         var o = CaptureOptions.Parse(["--mode", "4k30-hdr"]);
         Assert.Null(o.Device);
         Assert.Equal(new CaptureRequest { Width = 3840, Height = 2160, Fps = 30, Format = CapturePixelFormat.P010 }, o.Request);
-        Assert.Equal(HdrMode.On, o.Color.Hdr);
+        Assert.Equal(HdrMode.Follow, o.Color.Hdr);
 
         o = CaptureOptions.Parse(["/dev/video0", "--mode", "1440p60-hdr", "--multiplier", "2", "--duration-s", "5", "--offscreen"]);
         Assert.Equal("/dev/video0", o.Device);
@@ -207,10 +207,10 @@ public class NegotiationTests
         Assert.Equal(MatrixCoefficients.Bt709, o.Color.Matrix);
         Assert.False(o.Cadence);
 
-        // The default: the largest 10-bit mode, a 10-bit capture taken as HDR10.
+        // The default: the largest 10-bit mode, following the console between HDR10 and SDR.
         o = CaptureOptions.Parse([]);
         Assert.Equal(new CaptureRequest(), o.Request);
-        Assert.Equal(HdrMode.TenBit, o.Color.Hdr);
+        Assert.Equal(HdrMode.Follow, o.Color.Hdr);
         Assert.True(CaptureOptions.Parse(["--list"]).List);
     }
 
@@ -262,7 +262,11 @@ public class NegotiationTests
         Assert.Contains("fmp capture [device] [options]", help, StringComparison.Ordinal);
         Assert.Contains("4k30-hdr", help, StringComparison.Ordinal);
         Assert.Contains("1440p60-hdr", help, StringComparison.Ordinal);
-        Assert.Contains("--hdr <on|off|auto|10bit>", help, StringComparison.Ordinal);
+        Assert.Contains("--hdr <mode>", help, StringComparison.Ordinal);
+        Assert.Contains("follow (a P010", help, StringComparison.Ordinal);
+        Assert.Contains("H switches between SDR and HDR10 by hand", help, StringComparison.Ordinal);
+        Assert.Contains("--hdr-peak-nits <n>", help, StringComparison.Ordinal);
+        Assert.Contains("fmp hdr-pattern", help, StringComparison.Ordinal);
         Log.WriteLine(help);
     }
 }

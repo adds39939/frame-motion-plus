@@ -49,6 +49,7 @@ namespace FrameMotionPlus.Sources.V4l2;
 public sealed unsafe class V4l2FrameSource : IFrameSource
 {
     private const int StagingBuffers = 2;
+    private const int MaxSwitchLog = 64;
     private const int PendingTimings = 64;
     private const int AllocationWarmupFrames = 16;
     private const long PollTimeoutMs = 50;
@@ -78,10 +79,26 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
     private readonly SpscRing<SourceFrame> _queue;
     private readonly CadenceTracker _tracker;
     private readonly CadenceGrid _grid;
-    private readonly YuvConversion _conversion;
     private readonly int _eventFd = -1;
     private readonly bool _sourceChangeEvents;
-    private readonly bool _isPq;
+
+    // The two colours the capture can be in and their conversions; which one is in force is the dequeue thread's.
+    private readonly CaptureColor _hdrColor = null!;
+    private readonly CaptureColor _sdrColor = null!;
+    private readonly YuvConversion _hdrConversion;
+    private readonly YuvConversion _sdrConversion;
+    private readonly SampleDepthFollower _depth = null!;
+    private readonly ColorSwitch[] _switches = new ColorSwitch[MaxSwitchLog];
+    private YuvConversion _conversion;
+    private bool _isPq;
+    private bool _colorChangedNext;
+    private int _colorRequest;
+    private int _following;
+    private int _hdrNow;
+    private int _switchCount;
+    private long _colorSwitches;
+    private SampleDepthReading _lastDepth;
+    private long _firstTimestampNs;
     private readonly long _blackCellSum;
     private readonly PendingTiming[] _pending = new PendingTiming[PendingTimings];
     private readonly CaptureFrameRecord[] _log;
@@ -179,7 +196,11 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
             var mode = CaptureFormats.Choose(description.Modes, options.Request);
             Format = CaptureNegotiation.Apply(_device, mode);
             Color = CaptureColorMapping.Resolve(Format.Colorspace, Format.XferFunc, Format.YcbcrEnc, Format.Quantization, Format.Height, Format.BitDepth, options.Color);
+            (_hdrColor, _sdrColor) = CaptureColorMapping.ResolveBoth(Format.Colorspace, Format.XferFunc, Format.YcbcrEnc, Format.Quantization, Format.Height, Format.BitDepth, options.Color);
             _isPq = Color.FrameColor.Transfer == TransferFunction.Pq;
+            _hdrNow = _isPq ? 1 : 0;
+            _following = options.Color.Hdr == HdrMode.Follow && Format.Format == CapturePixelFormat.P010 ? 1 : 0;
+            _depth = new SampleDepthFollower(_isPq);
             InputDescription = description.Input;
 
             context.MakeCurrent();
@@ -211,6 +232,8 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
             _cadenceSpans = CudaSpanTimerRing.Create(context, PendingTimings);
             _convertSpans = CudaSpanTimerRing.Create(context, PendingTimings);
             _conversion = YuvConversion.Create(Color.Matrix, Color.Range, Format.BitDepth, Color.Siting, Format.OutputFormat);
+            _hdrConversion = YuvConversion.Create(_hdrColor.Matrix, _hdrColor.Range, Format.BitDepth, _hdrColor.Siting, Format.OutputFormat);
+            _sdrConversion = YuvConversion.Create(_sdrColor.Matrix, _sdrColor.Range, Format.BitDepth, _sdrColor.Siting, Format.OutputFormat);
             History = new FrameHistory(context, Format.Width, Format.Height, Format.OutputFormat, options.QueueDepth + options.HistoryDepth);
             var ring = 2;
             while (ring < History.Capacity)
@@ -260,7 +283,42 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
 
     public NegotiatedFormat Format { get; } = null!;
 
+    /// <summary>The colour the capture started in (see <see cref="CurrentColor"/> for the one in force now).</summary>
     public CaptureColor Color { get; } = null!;
+
+    /// <summary>The colour in force now: HDR10 or SDR, as followed or chosen (any thread; changes between frames).</summary>
+    public CaptureColor CurrentColor => IsHdrNow ? _hdrColor : _sdrColor;
+
+    /// <summary>Whether the frames are HDR10 (PQ) now.</summary>
+    public bool IsHdrNow => Volatile.Read(ref _hdrNow) != 0;
+
+    /// <summary>
+    /// Whether the capture follows the signal's sample depth (<see cref="HdrMode.Follow"/> on a P010 capture, until a
+    /// manual choice; <see cref="RequestColor"/> with <see cref="CaptureColorRequest.Follow"/> resumes it).
+    /// </summary>
+    public bool IsFollowing => Volatile.Read(ref _following) != 0;
+
+    /// <summary>Changes between SDR and HDR10 while capturing (followed or by hand).</summary>
+    public long ColorSwitches => Volatile.Read(ref _colorSwitches);
+
+    /// <summary>The changes so far (the first 64), oldest first. Read after the capture has stopped, or accept a torn tail.</summary>
+    public ReadOnlySpan<ColorSwitch> SwitchLog => _switches.AsSpan(0, Math.Min(Volatile.Read(ref _switchCount), MaxSwitchLog));
+
+    /// <summary>Frames judged 10-bit, 8-bit and inconclusive by <see cref="SampleDepthProbe"/> (P010 captures).</summary>
+    public (long TenBit, long EightBit, long Inconclusive) DepthCounts => (_depth.TenBitFrames, _depth.EightBitFrames, _depth.InconclusiveFrames);
+
+    /// <summary>The driver's timestamp of the first frame processed (0 before), ns on CLOCK_MONOTONIC.</summary>
+    public long FirstTimestampNs => Volatile.Read(ref _firstTimestampNs);
+
+    /// <summary>The last frame's sample-depth reading (P010 captures; dequeue thread's, read anywhere for display).</summary>
+    public SampleDepthReading LastDepthReading => _lastDepth;
+
+    /// <summary>
+    /// Asks for a colour change (any thread, allocation-free): applied by the dequeue thread before the next frame it
+    /// converts, which is then marked a discontinuity (never interpolated with the frame before) and carries the new
+    /// colour, so the presenter switches its output with it. A manual choice stops following.
+    /// </summary>
+    public void RequestColor(CaptureColorRequest request) => Volatile.Write(ref _colorRequest, (int)request);
 
     /// <summary>The device's current input and its status at open, when the driver reports them.</summary>
     public string? InputDescription { get; }
@@ -881,6 +939,19 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
 
         _metricReady.Record(copy);
         AddPending(new PendingTiming(Convert: false, Cadence: judged));
+
+        // While the GPU uploads: what the samples say about the signal's depth (P010), and any colour change asked for.
+        if (Format.Format == CapturePixelFormat.P010)
+        {
+            _lastDepth = SampleDepthProbe.Judge((byte*)_buffers.Host(index), Format.BytesPerLine, Format.Width, Format.Height, _hdrColor.Range == ColorRange.Limited ? 64 : 0);
+        }
+
+        if (_firstTimestampNs == 0)
+        {
+            Volatile.Write(ref _firstTimestampNs, timestamp);
+        }
+
+        UpdateColor(timestamp);
         if (!WaitFor(_metricReady))
         {
             return false;
@@ -1017,11 +1088,13 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
 
         _convertSpans.End(compute);
         var id = _nextFrameId++;
-        var frame = History.CompleteWrite(slot, compute, id, content, Color.FrameColor);
+        var frame = History.CompleteWrite(slot, compute, id, content, _isPq ? _hdrColor.FrameColor : _sdrColor.FrameColor);
         _convertDone[s].Record(compute);
         AddPending(new PendingTiming(Convert: true, Cadence: false, Upload: false));
-        var marks = _discontinuityNext ? SourceFrameMarks.Discontinuity : SourceFrameMarks.None;
+        var marks = (_discontinuityNext ? SourceFrameMarks.Discontinuity : SourceFrameMarks.None)
+            | (_colorChangedNext ? SourceFrameMarks.FormatChanged : SourceFrameMarks.None);
         _discontinuityNext = false;
+        _colorChangedNext = false;
         PerFrameHook?.Invoke();
         var arrival = Monotonic.NowNs;
         if (!_queue.TryEnqueue(new SourceFrame { FrameId = id, Frame = frame, ArrivalTimeNs = arrival, Marks = marks }))
@@ -1036,6 +1109,71 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
         _lastPublishedAtNs = dequeuedAt;
         Volatile.Write(ref _published, _published + 1);
         return true;
+    }
+
+    /// <summary>
+    /// Dequeue thread, before a frame is judged and converted: a manual request, else the sample-depth follower, may
+    /// change the colour; the change applies to this frame (its conversion, its cadence thresholds) and marks the next
+    /// published frame. Allocation-free.
+    /// </summary>
+    private void UpdateColor(long timestampNs)
+    {
+        var hdr = _isPq;
+        var cause = ColorSwitchCause.Followed;
+        var request = (CaptureColorRequest)Interlocked.Exchange(ref _colorRequest, (int)CaptureColorRequest.None);
+        switch (request)
+        {
+            case CaptureColorRequest.Toggle:
+                hdr = !hdr;
+                cause = ColorSwitchCause.Manual;
+                Volatile.Write(ref _following, 0);
+                break;
+            case CaptureColorRequest.Hdr:
+            case CaptureColorRequest.Sdr:
+                hdr = request == CaptureColorRequest.Hdr;
+                cause = ColorSwitchCause.Manual;
+                Volatile.Write(ref _following, 0);
+                break;
+            case CaptureColorRequest.Follow when Format.Format == CapturePixelFormat.P010:
+                _depth.Reset(_isPq);
+                Volatile.Write(ref _following, 1);
+                break;
+            default:
+                break;
+        }
+
+        if (Format.Format == CapturePixelFormat.P010)
+        {
+            // Counted whether or not it is followed (the summary reports the signal's depth either way).
+            if (_depth.Feed(_lastDepth.Depth) && Volatile.Read(ref _following) != 0 && request == CaptureColorRequest.None)
+            {
+                hdr = _depth.IsHdr;
+            }
+            else if (Volatile.Read(ref _following) == 0)
+            {
+                _depth.Reset(hdr);
+            }
+        }
+
+        if (hdr == _isPq)
+        {
+            return;
+        }
+
+        _isPq = hdr;
+        _conversion = hdr ? _hdrConversion : _sdrConversion;
+        _depth.Reset(hdr);
+        _discontinuityNext |= _published > 0;
+        _colorChangedNext = true;
+        Volatile.Write(ref _hdrNow, hdr ? 1 : 0);
+        var n = _switchCount;
+        if (n < MaxSwitchLog)
+        {
+            _switches[n] = new ColorSwitch(timestampNs, hdr, cause, _lastDepth);
+        }
+
+        Volatile.Write(ref _switchCount, n + 1);
+        Volatile.Write(ref _colorSwitches, _colorSwitches + 1);
     }
 
     private void Log(in V4l2Buffer b, long dequeuedAt, long judgedAt, double metric, double cellMean, CaptureFrameEvents flags)

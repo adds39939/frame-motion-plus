@@ -95,8 +95,21 @@ internal static class CapturePrinter
         o.WriteLine($"fmp capture: {c.Device.Path} - {c.Device.Card} ({c.Device.Driver}, {c.Device.BusInfo})");
         o.WriteLine($"  asked       {(options.Preset is { } preset ? $"--mode {preset.Name}: {preset.Note}" : options.Request.ToString())}");
         o.WriteLine($"  negotiated  {f.Describe()}{(f.Changes.Count == 0 ? " (as asked)" : "; the driver changed: " + string.Join("; ", f.Changes))}");
-        o.WriteLine($"  colour      the device reports {c.Color.Reported} → {c.Color.Origin}; frames {s.Source.Format} " +
-            $"{s.Source.Color.Transfer}/{s.Source.Color.Primaries} (identity matrix, full range, code values passed through)");
+        o.WriteLine($"  colour      the device reports {c.Color.Reported} → {c.Color.Origin}");
+        var bits = f.Format == CapturePixelFormat.P010 ? 10 : 8;
+        o.WriteLine($"  signal      taken as {CaptureColorMapping.SignalDescription(c.Color, bits, f.Format != CapturePixelFormat.Yuyv)}, chroma {c.Color.Siting}-sited; " +
+            $"frames {s.Source.Format} {(s.Source.Color.IsPq ? "PQ / BT.2020" : "SDR / BT.709")} (full range, the code values passed through: " +
+            $"{(bits == 10 ? "10 bits kept from capture to the swapchain" : "8 bits")})");
+        if (options.Color.Hdr == HdrMode.Follow && f.Format == CapturePixelFormat.P010)
+        {
+            o.WriteLine("              following the console: samples with 10 significant bits are HDR10, with 8 (how a PS5 sends SDR) SDR " +
+                "(BT.709, the same range); in the window H switches by hand, A follows again");
+        }
+        else
+        {
+            o.WriteLine($"              fixed for the run (--hdr {options.Color.Hdr.ToString().ToLowerInvariant()}); in the window H switches between SDR and HDR10 by hand" +
+                $"{(f.Format == CapturePixelFormat.P010 ? ", A follows the signal's depth" : "")}");
+        }
         o.WriteLine(string.Create(Ic,
             $"  buffers     {CaptureFormatsText(c)}; source-change events {(c.SourceChangeEvents ? "subscribed" : "not offered by the driver")}" +
             $"{(c.Input is { } input ? $"; input {input}" : "")}"));
@@ -121,6 +134,8 @@ internal static class CapturePrinter
 
         o.WriteLine($"  device      {s.DeviceName}, Vulkan driver {s.VulkanDriver}; CUDA context scheduling {options.CudaSync}");
         o.WriteLine($"  display     {s.Display}; transform {s.Transform}");
+        o.WriteLine($"  output      {s.Output}");
+        o.WriteLine($"  scaling     {s.Scaling}");
         o.WriteLine(string.Create(Ic,
             $"  feedback    {s.FeedbackMode}; presents in flight capped at {(s.PresentsInFlightCap == 0 ? "nothing (cannot cap)" : s.PresentsInFlightCap.ToString(Ic))}"));
         o.WriteLine(string.Create(Ic,
@@ -165,6 +180,40 @@ internal static class CapturePrinter
         if (c.ThreadReport is { } thread)
         {
             o.WriteLine($"  capture th  {thread}");
+        }
+
+        PrintColor(o, r, c);
+    }
+
+    /// <summary>The colour lines of the summary: what the frames were at the end, the switches, the output.</summary>
+    public static void PrintColor(TextWriter o, PlaybackReport r, CaptureSummary c)
+    {
+        var depths = c.IsP010
+            ? string.Create(Ic, $"; sample depth of the frames: 10-bit {c.Depths.TenBit}, 8-bit {c.Depths.EightBit}, could not tell (black or flat) {c.Depths.Inconclusive}")
+            : "";
+        o.WriteLine(string.Create(Ic,
+            $"  colour      {(c.HdrAtEnd ? "HDR10" : "SDR")} at the end ({(c.FollowingAtEnd ? "following the signal" : "fixed or chosen by hand")}); " +
+            $"{c.ColorSwitches} switch{(c.ColorSwitches == 1 ? "" : "es")}{depths}"));
+        if (c.SwitchLog.Count > 0)
+        {
+            var list = string.Join(", ", c.SwitchLog.Select(w => string.Create(Ic,
+                $"{(c.FirstTimestampNs > 0 ? (w.TimestampNs - c.FirstTimestampNs) / 1e9 : 0):0.00} s → {(w.ToHdr ? "HDR10" : "SDR")} " +
+                $"({(w.Cause == ColorSwitchCause.Manual ? "by hand" : $"followed: {w.Depth.LowBitSamples} of {w.Depth.Samples} samples with low bits, {w.Depth.DistinctCodes} codes")})")));
+            var change = r.LastOutputColorChange;
+            o.WriteLine(string.Create(Ic,
+                $"              {list}{(c.ColorSwitches > c.SwitchLog.Count ? " ..." : "")}; the output rebuilt {r.PresenterStats.OutputColorChanges}x, each at its first frame in the new " +
+                $"colour once the frames in flight were done: waits at most {Ms(r.PresenterStats.WorstOutputChangeWaitNs)} ms ({r.PresenterStats.OutputChangeRefusals} request(s) " +
+                $"refused meanwhile in all), rebuilds at most {Ms(r.PresenterStats.WorstOutputChangeRebuildNs)} ms (the last: {Ms(change.WaitNs)} and {Ms(change.RebuildNs)} ms)"));
+        }
+
+        if (r.OutputAtEnd is { } output)
+        {
+            o.WriteLine($"  output      at the end: {output}");
+        }
+
+        if (r.ScalingAtEnd is { } scaling)
+        {
+            o.WriteLine($"  scaling     at the end: {scaling}");
         }
     }
 

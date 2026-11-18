@@ -136,16 +136,38 @@ public sealed unsafe class OffscreenTarget : PresentTarget
 
     internal override bool NeedsRecreate() => _desiredWidth != Width || _desiredHeight != Height;
 
+    internal override VkFormat FormatFor(in OutputRequest request) =>
+        (request.PreferHdr10 && _options.Hdr10Capable) || _options.SdrFormat == PixelFormat.Rgb10A2 ? VkFormat.A2B10G10R10UnormPack32 : VkFormat.R8G8B8A8Unorm;
+
+    /// <summary>Offscreen there is no swapchain: the metadata is recorded as it would be passed (<see cref="PresentTarget.HdrMetadataSent"/>).</summary>
+    internal override void UpdateHdrMetadata(in HdrMetadata metadata)
+    {
+        if (ColorSpace != TargetColorSpace.Hdr10St2084)
+        {
+            return;
+        }
+
+        _request = _request with { Metadata = metadata };
+        var vk = metadata.ToVulkan();
+        HdrMetadataSent = HdrMetadata.FromVulkan(vk);
+        HdrMetadataCalls++;
+    }
+
     internal override void Recreate()
     {
         DestroyImages();
         var hdr = _request.PreferHdr10 && _options.Hdr10Capable;
         ColorSpace = hdr ? TargetColorSpace.Hdr10St2084 : TargetColorSpace.Sdr;
-        Format = hdr || _options.SdrFormat == PixelFormat.Rgb10A2 ? VkFormat.A2B10G10R10UnormPack32 : VkFormat.R8G8B8A8Unorm;
+        Format = FormatFor(_request);
         Width = _desiredWidth;
         Height = _desiredHeight;
         CreateImages();
         Version++;
+        HdrMetadataSent = null;
+        if (hdr)
+        {
+            UpdateHdrMetadata(_request.Metadata);
+        }
     }
 
     internal override AcquireOutcome TryAcquire(ulong frame, int frameSlot, VkSemaphore acquireSemaphore, out int imageIndex)

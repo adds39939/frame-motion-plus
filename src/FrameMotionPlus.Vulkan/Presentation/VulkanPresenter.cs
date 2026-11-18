@@ -29,6 +29,31 @@ public sealed record VulkanPresenterOptions
 
     /// <summary>Timestamp queries around the copy and the pass, reported in <see cref="VulkanPresenter.Stats"/>.</summary>
     public bool MeasureGpuTime { get; init; } = true;
+
+    /// <summary>
+    /// Follow each presented frame's colour (<see cref="GpuFrame.Color"/> of the request, when its transfer is stated): a
+    /// frame whose content switches between SDR and PQ rebuilds the output in the other colour space before it is shown
+    /// (deferred until the frames in flight finish, as a resize is: requests are refused meanwhile, never waited for), and
+    /// one whose HDR metadata changes hands the new metadata to the output. Off: the colour given to
+    /// <see cref="VulkanPresenter.Configure"/> holds until the next Configure.
+    /// </summary>
+    public bool FollowFrameColor { get; init; }
+}
+
+/// <summary>One change of the output's colour space (SDR to HDR10 or back) while presenting, and what it cost.</summary>
+public readonly record struct OutputColorChange
+{
+    /// <summary>True for a change to HDR10 (PQ), false for one to SDR.</summary>
+    public bool ToHdr { get; init; }
+
+    /// <summary>From the first request in the new colour to the rebuild (frames in flight finishing; requests refused meanwhile).</summary>
+    public long WaitNs { get; init; }
+
+    /// <summary>The rebuild itself on the present thread (the new swapchain or images, the pipeline).</summary>
+    public long RebuildNs { get; init; }
+
+    /// <summary>Requests refused while it waited.</summary>
+    public int Refused { get; init; }
 }
 
 public readonly record struct PresenterStats
@@ -96,6 +121,21 @@ public readonly record struct PresenterStats
 
     /// <summary>GPU time of the last measured scale/transform pass, ns.</summary>
     public long LastPassGpuNs { get; init; }
+
+    /// <summary>Output rebuilds for a change of the content's colour between SDR and PQ (<see cref="VulkanPresenterOptions.FollowFrameColor"/>).</summary>
+    public long OutputColorChanges { get; init; }
+
+    /// <summary>HDR metadata handed to the output again because the content's changed (no rebuild).</summary>
+    public long MetadataUpdates { get; init; }
+
+    /// <summary>Of the output colour changes: the longest wait for frames in flight, ns.</summary>
+    public long WorstOutputChangeWaitNs { get; init; }
+
+    /// <summary>Of the output colour changes: the longest rebuild, ns.</summary>
+    public long WorstOutputChangeRebuildNs { get; init; }
+
+    /// <summary>Requests refused while an output colour change waited for frames in flight (all changes).</summary>
+    public long OutputChangeRefusals { get; init; }
 }
 
 /// <summary>
@@ -180,6 +220,19 @@ public sealed unsafe class VulkanPresenter : IPresenter
     private OutputRequest _request;
     private bool _configured;
     private VkPipeline _pipeline;
+
+    // The colour of what is shown (Configure's, then each frame's when following) and a change waiting to be applied.
+    private ColorMetadata _content;
+    private ColorMetadata _pendingContent;
+    private bool _outputPending;
+    private long _pendingSince;
+    private int _pendingRefused;
+    private long _outputChanges;
+    private long _metadataUpdates;
+    private long _worstChangeWait;
+    private long _worstChangeRebuild;
+    private long _changeRefusals;
+    private OutputColorChange _lastOutputChange;
 
     private ulong _frame;
     private ulong _completedPresent;
@@ -290,6 +343,19 @@ public sealed unsafe class VulkanPresenter : IPresenter
 
     public OutputTransform ActiveTransform { get; private set; }
 
+    /// <summary>The colour of the content being shown: Configure's, then the frames' with <see cref="VulkanPresenterOptions.FollowFrameColor"/>.</summary>
+    public ColorMetadata ContentColor => _content;
+
+    /// <summary>The last change of the output's colour space while presenting (default before the first).</summary>
+    public OutputColorChange LastOutputColorChange => _lastOutputChange;
+
+    /// <summary>
+    /// True when the ring's frames are shown pixel for pixel (the content rectangle is the frame's own size: no resampling);
+    /// false when they are scaled to the output (PQ in linear light, SDR on its code values).
+    /// </summary>
+    public bool IsScalingExact => _ring is { } r && ContentRect.Fit(r.Width, r.Height, _target.Width, _target.Height) is var rect
+        && rect.Width == r.Width && rect.Height == r.Height;
+
     /// <summary>The write most recently copied for display (0 = none); it can be presented again as a repeat.</summary>
     public ulong LastPresentedWrite => _lastCopied;
 
@@ -326,6 +392,11 @@ public sealed unsafe class VulkanPresenter : IPresenter
         ReportsWithoutTime = _reportsWithoutTime,
         LastCopyGpuNs = _lastCopyNs,
         LastPassGpuNs = _lastPassNs,
+        OutputColorChanges = _outputChanges,
+        MetadataUpdates = _metadataUpdates,
+        WorstOutputChangeWaitNs = _worstChangeWait,
+        WorstOutputChangeRebuildNs = _worstChangeRebuild,
+        OutputChangeRefusals = _changeRefusals,
     };
 
     /// <summary>Test hook: when set, every copy batch also waits for this timeline value (see the release-ordering test).</summary>
@@ -335,10 +406,11 @@ public sealed unsafe class VulkanPresenter : IPresenter
 
     /// <summary>
     /// Sets the ring shape (<see cref="PresenterConfig.Width"/>, <see cref="PresenterConfig.Height"/>,
-    /// <see cref="PresenterConfig.Format"/>: what will be presented) and the wanted output colour. A changed shape
+    /// <see cref="PresenterConfig.Format"/>: what will be presented) and the content's colour. A changed shape
     /// releases the retained write, drains in-flight work (bounded by <see cref="VulkanPresenterOptions.DrainTimeoutNs"/>),
-    /// replaces the ring and bumps <see cref="RingGeneration"/>. A 10-bit ring asks the target for HDR10 unless
-    /// <see cref="PresenterConfig.OutputColor"/> names an SDR transfer. Not for the hot path.
+    /// replaces the ring and bumps <see cref="RingGeneration"/>. PQ content (<see cref="PresenterConfig.OutputColor"/>;
+    /// unstated: a 10-bit ring) asks the target for HDR10 with the content's HDR metadata, anything else for SDR. Not for
+    /// the hot path.
     /// </summary>
     public void Configure(in PresenterConfig config)
     {
@@ -363,12 +435,22 @@ public sealed unsafe class VulkanPresenter : IPresenter
             PitchAlignment = _options.PitchAlignment,
         });
         var tenBit = config.Format.Family() == PixelFormatFamily.TenBit;
-        var sdrRequested = config.OutputColor.Transfer is TransferFunction.Bt709 or TransferFunction.Srgb or TransferFunction.Linear;
-        var request = new OutputRequest(PreferHdr10: tenBit && !sdrRequested, TenBitContent: tenBit);
+        var content = ContentColorFor(config.OutputColor, config.Format);
+        var request = RequestFor(content, tenBit);
         var shapeChanged = _ring is null || _ring.Width != config.Width || _ring.Height != config.Height || _ring.Format != config.Format;
-        var requestChanged = !_configured || request != _request;
+        var requestChanged = !_configured || request.NeedsNewImages(_request);
+        _outputPending = false;
         if (!shapeChanged && !requestChanged)
         {
+            _content = content;
+            if (request.Metadata != _request.Metadata)
+            {
+                _request = request;
+                _target.UpdateHdrMetadata(request.Metadata);
+                _metadataUpdates++;
+            }
+
+            RefreshPipeline();
             return;
         }
 
@@ -395,6 +477,7 @@ public sealed unsafe class VulkanPresenter : IPresenter
             Volatile.Write(ref _ringGeneration, _ringGeneration + 1);
         }
 
+        _content = content;
         if (requestChanged)
         {
             _target.WaitForPresents(_options.DrainTimeoutNs);
@@ -402,9 +485,116 @@ public sealed unsafe class VulkanPresenter : IPresenter
             _request = request;
             _target.Configure(request);
         }
+        else if (request.Metadata != _request.Metadata)
+        {
+            _request = request;
+            _target.UpdateHdrMetadata(request.Metadata);
+            _metadataUpdates++;
+        }
 
         _configured = true;
         RefreshPipeline();
+        if (_options.FollowFrameColor)
+        {
+            PreparePipelines(tenBit);
+        }
+    }
+
+    /// <summary>The content's colour: as stated, else what the ring's format implies (10-bit PQ, 8-bit SDR).</summary>
+    private static ColorMetadata ContentColorFor(in ColorMetadata stated, PixelFormat format) =>
+        stated.Transfer != TransferFunction.Unspecified ? stated
+            : format.Family() == PixelFormatFamily.TenBit ? ColorMetadata.Hdr10 : ColorMetadata.SdrBt709;
+
+    private static OutputRequest RequestFor(in ColorMetadata content, bool tenBit) =>
+        new(PreferHdr10: content.IsPq, TenBitContent: tenBit, Metadata: content.IsPq ? HdrMetadata.For(content) : default);
+
+    /// <summary>
+    /// With <see cref="VulkanPresenterOptions.FollowFrameColor"/>: notes a request's colour. A switch between SDR and PQ is
+    /// left pending for <see cref="ApplyPendingOutput"/>; new HDR metadata for the same transfer is handed over at once.
+    /// Allocation-free.
+    /// </summary>
+    private void NoteFrameColor(in ColorMetadata color)
+    {
+        if (color.Transfer == TransferFunction.Unspecified)
+        {
+            return;
+        }
+
+        if (color.IsPq != _content.IsPq)
+        {
+            if (!_outputPending || color.IsPq != _pendingContent.IsPq)
+            {
+                _pendingSince = Stopwatch.GetTimestamp();
+                _pendingRefused = 0;
+            }
+
+            _pendingContent = color;
+            _outputPending = true;
+            return;
+        }
+
+        // Back to the colour on show before a pending switch was applied: nothing to switch.
+        _outputPending = false;
+        if (color.IsPq && (color.Mastering != _content.Mastering || color.LightLevel != _content.LightLevel))
+        {
+            _content = color;
+            var metadata = HdrMetadata.For(color);
+            if (metadata != _request.Metadata)
+            {
+                _request = _request with { Metadata = metadata };
+                _target.UpdateHdrMetadata(metadata);
+                _metadataUpdates++;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds the output for the pending content colour. Only when <see cref="CanRecreateTarget"/> (every frame finished
+    /// on the GPU, every present released), so nothing waits; the caller refuses requests until then.
+    /// </summary>
+    private void ApplyPendingOutput()
+    {
+        var start = Stopwatch.GetTimestamp();
+        _target.WaitForPresents(_options.DrainTimeoutNs);
+        CompleteAllPending();
+        _content = _pendingContent;
+        _request = RequestFor(_content, _request.TenBitContent);
+        _outputPending = false;
+        _target.Configure(_request);
+        _recreations++;
+        _outputChanges++;
+        RefreshPipeline();
+        var end = Stopwatch.GetTimestamp();
+        _lastOutputChange = new OutputColorChange
+        {
+            ToHdr = _content.IsPq,
+            WaitNs = TicksToNs(start - _pendingSince),
+            RebuildNs = TicksToNs(end - start),
+            Refused = _pendingRefused,
+        };
+        _worstChangeWait = Math.Max(_worstChangeWait, _lastOutputChange.WaitNs);
+        _worstChangeRebuild = Math.Max(_worstChangeRebuild, _lastOutputChange.RebuildNs);
+        _changeRefusals += _pendingRefused;
+    }
+
+    private static long TicksToNs(long ticks) => (long)(ticks * (1e9 / Stopwatch.Frequency));
+
+    /// <summary>
+    /// Following frame colours: creates the pass for both outputs (SDR and HDR10 formats) now, so a switch while
+    /// presenting compiles and allocates nothing.
+    /// </summary>
+    private void PreparePipelines(bool tenBit)
+    {
+        if (_target.SupportsHdr10)
+        {
+            _ = _pass.Pipeline(_target.FormatFor(new OutputRequest(true, tenBit)), OutputTransform.Passthrough, _options.Scaler, linearPq: true);
+        }
+        else
+        {
+            _ = _pass.Pipeline(_target.FormatFor(new OutputRequest(false, tenBit)), OutputTransform.PqToSdrPlaceholder, _options.Scaler, linearPq: true);
+        }
+
+        _ = _pass.Pipeline(_target.FormatFor(new OutputRequest(false, tenBit)), OutputTransform.Passthrough, _options.Scaler, linearPq: false);
     }
 
     /// <summary>
@@ -426,7 +616,7 @@ public sealed unsafe class VulkanPresenter : IPresenter
 
         var done = FrameDoneValue();
         PollCompletions(done);
-        if (_target.NeedsRecreate())
+        if (_target.NeedsRecreate() || _outputPending)
         {
             return !_target.WantsZeroSize && !_target.IsOccluded && CanRecreateTarget(done);
         }
@@ -462,10 +652,28 @@ public sealed unsafe class VulkanPresenter : IPresenter
             return false;
         }
 
+        if (_options.FollowFrameColor && !repeat)
+        {
+            NoteFrameColor(request.Frame.Color);
+        }
+
         // One read of the frame counter for both the completions and the gates below, so they agree.
         var done = FrameDoneValue();
         PollCompletions(done);
-        if (_target.NeedsRecreate())
+        if (_outputPending)
+        {
+            // A frame in the other colour space: the output is rebuilt for it once the frames in flight are done (the
+            // rebuild includes any resize); the frame is retained and shown on the new output. A repeat of the image on
+            // show (the old colour) is refused meanwhile: shown on the new output it would be in the wrong colour space.
+            if (repeat || _target.WantsZeroSize || !CanRecreateTarget(done))
+            {
+                _pendingRefused++;
+                return Drop(ring, n, repeat);
+            }
+
+            ApplyPendingOutput();
+        }
+        else if (_target.NeedsRecreate())
         {
             if (_target.WantsZeroSize || !CanRecreateTarget(done))
             {
@@ -1324,8 +1532,8 @@ public sealed unsafe class VulkanPresenter : IPresenter
             return;
         }
 
-        ActiveTransform = PresentPass.SelectTransform(_ring.Format, _target.ColorSpace);
-        _pipeline = _pass.Pipeline(_target.Format, ActiveTransform, _options.Scaler);
+        ActiveTransform = PresentPass.SelectTransform(_content, _target.ColorSpace);
+        _pipeline = _pass.Pipeline(_target.Format, ActiveTransform, _options.Scaler, linearPq: _content.IsPq);
     }
 
     private void CreateFrameResources()

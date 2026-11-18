@@ -30,6 +30,9 @@ internal static class PlayPrinter
 
         o.WriteLine($"  device      {s.DeviceName}, Vulkan driver {s.VulkanDriver}; CUDA context scheduling {options.CudaSync}");
         o.WriteLine($"  display     {s.Display}; transform {s.Transform}");
+        o.WriteLine($"  signal      {DescribeFileSignal(info)}");
+        o.WriteLine($"  output      {s.Output}");
+        o.WriteLine($"  scaling     {s.Scaling}");
         o.WriteLine(string.Create(Ic,
             $"  feedback    {s.FeedbackMode}; presents in flight capped at {(s.PresentsInFlightCap == 0 ? "nothing (cannot cap)" : s.PresentsInFlightCap.ToString(Ic))}"));
         o.WriteLine(string.Create(Ic,
@@ -39,6 +42,25 @@ internal static class PlayPrinter
             $"  rates       source {(info.NominalRate.IsValid ? info.NominalRate.Hz.ToString("0.###", Ic) + " fps" : "unknown")}, multiplier {cap}; " +
             $"warm-up {playback.WarmupNs / 1e9:0.#} s{(playback.DurationNs > 0 ? $", duration {playback.DurationNs / 1e9:0.###} s" : "")}" +
             $"{(playback.MaxSlots > 0 ? $", {playback.MaxSlots} slots" : "")}"));
+    }
+
+    /// <summary>"PQ (SMPTE ST 2084), BT.2020 primaries, limited range, 10-bit, BT.2020 matrix; mastering ...": the file's signal.</summary>
+    private static string DescribeFileSignal(Sources.File.FileStreamInfo info)
+    {
+        var c = info.Color;
+        var transfer = c.Transfer switch
+        {
+            Core.Frames.TransferFunction.Pq => "PQ (SMPTE ST 2084)",
+            Core.Frames.TransferFunction.Hlg => "HLG (shown on an SDR output, HLG's backward-compatible picture: converting it to PQ is not built)",
+            Core.Frames.TransferFunction.Unspecified => "transfer unstated (SDR gamma assumed)",
+            _ => "SDR gamma (" + c.Transfer + ")",
+        };
+        var metadata = c.IsPq
+            ? c.Mastering.IsSpecified
+                ? string.Create(Ic, $"; stream metadata: mastering {c.Mastering.MinLuminanceNits:0.####} to {c.Mastering.MaxLuminanceNits:0} nits, MaxCLL {c.LightLevel.MaxCll}, MaxFALL {c.LightLevel.MaxFall} (frames' side data, if any, replaces it)")
+                : "; no mastering metadata in the stream (frames' side data used if any, else BT.2020/D65 1000-nit defaults)"
+            : "";
+        return string.Create(Ic, $"{transfer}, {c.Primaries} primaries, {info.BitDepth}-bit, decoded to {info.OutputFormat} with the stream's own matrix and range{metadata}");
     }
 
     /// <summary>Prints the summary; returns the verdict (true: pass).</summary>
@@ -216,6 +238,15 @@ internal static class PlayPrinter
             o.WriteLine(string.Create(Ic,
                 $"  source      {src.FramesDecoded} decoded, {src.FramesDelivered} delivered, {r.FramesRead} read; loops {src.Loops}, discontinuities {r.Discontinuities} " +
                 $"(scheduler {r.Counters.Discontinuities}); frame-pool growth {src.PoolGrowth}; decode thread waited for the pipeline {src.BackPressureWaits}x"));
+            if (r.OutputAtEnd is { } output)
+            {
+                o.WriteLine($"  output      at the end: {output}{(r.PresenterStats.MetadataUpdates > 0 ? string.Create(Ic, $" (metadata updated {r.PresenterStats.MetadataUpdates}x from the frames' side data)") : "")}");
+            }
+
+            if (r.ScalingAtEnd is { } scaling)
+            {
+                o.WriteLine($"  scaling     at the end: {scaling}");
+            }
         }
         foreach (var (name, cost) in r.Threads)
         {

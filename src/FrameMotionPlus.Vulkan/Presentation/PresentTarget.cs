@@ -31,8 +31,15 @@ internal enum PresentOutcome
     OutOfDate = 2,
 }
 
-/// <summary>What the presenter wants from a target when it (re)configures it.</summary>
-internal readonly record struct OutputRequest(bool PreferHdr10, bool TenBitContent);
+/// <summary>
+/// What the presenter wants from a target when it (re)configures it: an HDR10 ST 2084 output for PQ content (with the
+/// metadata to send for it), an SDR one otherwise; a 10-bit format for 10-bit content where the colour space offers one.
+/// </summary>
+internal readonly record struct OutputRequest(bool PreferHdr10, bool TenBitContent, HdrMetadata Metadata = default)
+{
+    /// <summary>Whether the target's images must be rebuilt to go from this request to <paramref name="other"/> (not for metadata alone).</summary>
+    public bool NeedsNewImages(in OutputRequest other) => PreferHdr10 != other.PreferHdr10 || TenBitContent != other.TenBitContent;
+}
 
 /// <summary>
 /// Where the presenter's pass writes: a window's swapchain (<see cref="SwapchainTarget"/>) or offscreen images read
@@ -66,6 +73,19 @@ public abstract class PresentTarget : IDisposable
 
     /// <summary>True when the target can show HDR10 (PQ, BT.2020) if asked to.</summary>
     public abstract bool SupportsHdr10 { get; }
+
+    /// <summary>
+    /// The HDR metadata last handed to Vulkan for the current images, read back from the structure that was passed
+    /// (<c>vkSetHdrMetadataEXT</c> on a swapchain; offscreen, what would have been passed); null when none was: an SDR
+    /// output, or a device without VK_EXT_hdr_metadata.
+    /// </summary>
+    public HdrMetadata? HdrMetadataSent { get; private protected set; }
+
+    /// <summary>How many times HDR metadata has been handed to Vulkan (once per HDR10 swapchain, again when it changes).</summary>
+    public int HdrMetadataCalls { get; private protected set; }
+
+    /// <summary>Why no metadata is sent although the output is HDR10 (null when it is, or the output is SDR).</summary>
+    public string? HdrMetadataUnavailableReason { get; private protected set; }
 
     internal VulkanDevice Device { get; }
 
@@ -131,6 +151,15 @@ public abstract class PresentTarget : IDisposable
 
     /// <summary>(Re)creates the images for <paramref name="request"/>. The presenter has drained its GPU work.</summary>
     internal abstract void Configure(in OutputRequest request);
+
+    /// <summary>The image format the target would use for <paramref name="request"/> (to prepare pipelines before a switch).</summary>
+    internal abstract VkFormat FormatFor(in OutputRequest request);
+
+    /// <summary>
+    /// Hands new HDR metadata to the current images without rebuilding them (the content's metadata changed, its transfer
+    /// did not). No-op for an SDR output.
+    /// </summary>
+    internal abstract void UpdateHdrMetadata(in HdrMetadata metadata);
 
     /// <summary>Cheap per-frame check: does the target need recreating (size change, out of date)?</summary>
     internal abstract bool NeedsRecreate();

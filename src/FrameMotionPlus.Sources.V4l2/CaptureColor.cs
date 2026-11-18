@@ -17,9 +17,17 @@ public enum HdrMode
     /// <summary>SDR whatever the device says.</summary>
     Off = 2,
 
-    /// <summary>HDR10 when the device signals it or the capture is 10-bit (P010); otherwise as <see cref="Auto"/>. A PS5 sends
-    /// 10-bit only in HDR, and the Elgato 4K X does not signal HDR, so this is <c>fmp capture</c>'s default.</summary>
+    /// <summary>HDR10 when the device signals it or the capture is 10-bit (P010); otherwise as <see cref="Auto"/>: fixed for
+    /// the run.</summary>
     TenBit = 3,
+
+    /// <summary>
+    /// A 10-bit (P010) capture follows the signal: HDR10 while its samples carry 10 significant bits, SDR while they carry
+    /// only 8 (<see cref="SampleDepthProbe"/>). A PS5 sends SDR in 8 bits and HDR10 in 10 or more, and the Elgato 4K X puts
+    /// an 8-bit signal into P010 with the two low bits zero, so this tells the console's switches apart without the card
+    /// signalling them. Starts as HDR10. Other captures: as <see cref="Auto"/>. <c>fmp capture</c>'s default.
+    /// </summary>
+    Follow = 4,
 }
 
 /// <summary>Manual colour overrides (null: from the V4L2 format fields).</summary>
@@ -32,6 +40,15 @@ public sealed record CaptureColorOverrides
     public MatrixCoefficients? Matrix { get; init; }
 
     public ChromaSiting? Siting { get; init; }
+
+    /// <summary>The HDR10 mastering peak sent when the frames are HDR10 (the card carries no metadata), in nits.</summary>
+    public int PeakNits { get; init; } = ColorMetadata.DefaultPeakNits;
+
+    /// <summary>MaxCLL sent with HDR10 frames (null: the peak).</summary>
+    public int? MaxCll { get; init; }
+
+    /// <summary>MaxFALL sent with HDR10 frames (0: not stated).</summary>
+    public int MaxFall { get; init; }
 }
 
 /// <summary>The colour a capture resolved to, and where each part came from.</summary>
@@ -65,6 +82,14 @@ public static class CaptureColorMapping
     public static CaptureColor Resolve(uint colorspace, uint xferFunc, uint ycbcrEnc, uint quantization, int height, int bitDepth, CaptureColorOverrides? overrides = null)
     {
         overrides ??= new CaptureColorOverrides();
+        if (overrides.Hdr == HdrMode.Follow)
+        {
+            var resolved = Resolve(colorspace, xferFunc, ycbcrEnc, quantization, height, bitDepth, overrides with { Hdr = bitDepth > 8 ? HdrMode.On : HdrMode.Auto });
+            return bitDepth > 8 && xferFunc != V4l2Defs.XferFuncSmpte2084
+                ? resolved with { Origin = resolved.Origin.Replace("HDR10 (forced: the device reports SDR)", "HDR10 to start, then following the signal: 10 significant bits are HDR10, 8 are SDR (the device reports SDR; --hdr on|off fixes it)", StringComparison.Ordinal) }
+                : resolved;
+        }
+
         if (overrides.Hdr == HdrMode.TenBit)
         {
             overrides = overrides with { Hdr = bitDepth > 8 ? HdrMode.On : HdrMode.Auto };
@@ -129,7 +154,7 @@ public static class CaptureColorMapping
         ColorMetadata color;
         if (hdr)
         {
-            color = ColorMetadata.Hdr10;
+            color = ColorMetadata.Hdr10WithPeak(overrides.PeakNits, overrides.MaxCll ?? overrides.PeakNits, overrides.MaxFall);
         }
         else
         {
@@ -168,6 +193,34 @@ public static class CaptureColorMapping
             Origin = origin,
         };
     }
+
+    /// <summary>
+    /// The two colours a capture can switch between while it runs (<see cref="HdrMode.Follow"/>, or by hand): the HDR10 one
+    /// (PQ, BT.2020, the BT.2020 matrix unless forced) and the SDR one (as the device reports it, BT.709 for this card),
+    /// with the same range, siting and metadata overrides.
+    /// </summary>
+    public static (CaptureColor Hdr, CaptureColor Sdr) ResolveBoth(uint colorspace, uint xferFunc, uint ycbcrEnc, uint quantization, int height, int bitDepth, CaptureColorOverrides? overrides = null)
+    {
+        overrides ??= new CaptureColorOverrides();
+        return (
+            Resolve(colorspace, xferFunc, ycbcrEnc, quantization, height, bitDepth, overrides with { Hdr = HdrMode.On }),
+            Resolve(colorspace, xferFunc, ycbcrEnc, quantization, height, bitDepth, overrides with { Hdr = HdrMode.Off }));
+    }
+
+    /// <summary>"PQ (SMPTE ST 2084), BT.2020 primaries, limited range, 10-bit, BT.2020 matrix": what a capture's frames are taken to be.</summary>
+    public static string SignalDescription(CaptureColor color, int bitDepth, bool subsampled420 = true) => string.Create(System.Globalization.CultureInfo.InvariantCulture,
+        $"{(color.FrameColor.IsPq ? "PQ (SMPTE ST 2084)" : "SDR gamma (BT.709)")}, {PrimariesName(color.FrameColor.Primaries)} primaries, " +
+        $"{(color.Range == ColorRange.Full ? "full" : "limited")} range, {bitDepth}-bit YCbCr {(subsampled420 ? "4:2:0" : "4:2:2")} with the {MatrixName(color.Matrix)} matrix");
+
+    private static string PrimariesName(ColorPrimaries p) => p switch
+    {
+        ColorPrimaries.Bt2020 => "BT.2020",
+        ColorPrimaries.Bt709 => "BT.709",
+        ColorPrimaries.Bt601Line525 => "BT.601 525-line",
+        ColorPrimaries.Bt601Line625 => "BT.601 625-line",
+        ColorPrimaries.DciP3 => "DCI-P3",
+        _ => p.ToString(),
+    };
 
     /// <summary>V4L2_MAP_XFER_FUNC_DEFAULT.</summary>
     internal static uint DefaultXfer(uint colorspace) => colorspace switch

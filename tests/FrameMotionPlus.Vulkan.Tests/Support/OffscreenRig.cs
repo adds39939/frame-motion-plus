@@ -82,6 +82,23 @@ public sealed class OffscreenRig : IDisposable
         TargetTimeNs = 0,
     };
 
+    /// <summary>A request whose frame says its content is in <paramref name="color"/> (for a presenter that follows frame colours).</summary>
+    public PresentRequest Request(ulong write, in ColorMetadata color) => new()
+    {
+        SlotIndex = _outputSlot++,
+        Frame = Ring.ConsumerFrame(write) with { Color = color },
+        TargetTimeNs = 0,
+    };
+
+    /// <summary>Writes ring-layout pixels and presents them as content in <paramref name="color"/>.</summary>
+    public ulong PresentPixels(ReadOnlySpan<byte> ringLayoutPixels, in ColorMetadata color)
+    {
+        WaitReady();
+        var n = Producer.WritePixels(ringLayoutPixels);
+        Assert.True(Presenter.TryPresent(Request(n, color)), $"write {n} was not presented");
+        return n;
+    }
+
     /// <summary>Spins until the presenter has a free frame slot. Allocation-free unless it times out.</summary>
     public void WaitReady(long timeoutMs = 5000)
     {

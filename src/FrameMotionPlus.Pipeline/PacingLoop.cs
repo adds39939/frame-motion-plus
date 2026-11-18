@@ -563,7 +563,9 @@ internal sealed class PacingLoop
         _ = EnqueuePresent(
             decision,
             PresentKind.Write,
-            new PresentRequest { SlotIndex = decision.SlotIndex, Frame = slot.ConsumerView, TargetTimeNs = decision.TargetTimeNs + _presentLeadNs },
+            // The slot carries the colour of the newer real frame (the content's, for the presenter to follow: a source
+            // that switches between SDR and HDR10 marks the switch a discontinuity, so a generated frame never spans it).
+            new PresentRequest { SlotIndex = decision.SlotIndex, Frame = slot.ConsumerView with { Color = b.Frame.Frame.Color }, TargetTimeNs = decision.TargetTimeNs + _presentLeadNs },
             slot.Write,
             a.ContentNs,
             b.ContentNs,

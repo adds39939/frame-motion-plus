@@ -116,6 +116,21 @@ public sealed class PlaybackSession : IDisposable
     public void RequestStop(StopReason reason = StopReason.User) =>
         Interlocked.CompareExchange(ref _stopReason, (int)reason, (int)StopReason.None);
 
+    /// <summary>
+    /// Asks a capture to change between SDR and HDR10, or to follow the signal again (any thread; what H and A do in the
+    /// window): applied at the capture's next frame, and the output follows with that frame. False for a file.
+    /// </summary>
+    public bool RequestCaptureColor(CaptureColorRequest request)
+    {
+        if (!OperatingSystem.IsLinux() || _source is not CapturePlaybackSource capture)
+        {
+            return false;
+        }
+
+        capture.Source.RequestColor(request);
+        return true;
+    }
+
     /// <summary>Continues the file from <paramref name="mediaTimeNs"/> (any thread): a discontinuity, never interpolated across.</summary>
     public void Seek(long mediaTimeNs)
     {
@@ -255,7 +270,9 @@ public sealed class PlaybackSession : IDisposable
             }
         }
 
-        _presenter = new VulkanPresenter(_device, _target, new VulkanPresenterOptions { MeasureGpuTime = true });
+        // Following the frames' colour: a source that switches between SDR and HDR10 (a capture following the console, or
+        // switched by hand) gets its output rebuilt in the other colour space at the first frame in the new colour.
+        _presenter = new VulkanPresenter(_device, _target, new VulkanPresenterOptions { MeasureGpuTime = true, FollowFrameColor = true });
 
         // The generator first: VFG's load and warm-up synchronise the context, so they belong here, before anything runs.
         var config = new FrameGenConfig { Width = width, Height = height, Format = format, Quality = _o.Quality, Color = info.Color };
@@ -380,6 +397,8 @@ public sealed class PlaybackSession : IDisposable
             MaxLead = _bridge.MaxOutstanding,
             PresentsInFlightCap = _presenter.Capabilities.MaxFramesInFlight,
             Transform = _presenter.ActiveTransform.ToString(),
+            Output = DescribeOutput(),
+            Scaling = DescribeScaling(),
             DeviceName = cudaDevice.Name,
             VulkanDriver = _device.PhysicalDevice.DriverVersionText,
         };
@@ -627,7 +646,7 @@ public sealed class PlaybackSession : IDisposable
             {
                 SlotIndex = index,
                 Kind = PresentKind.PreRoll,
-                Request = new PresentRequest { SlotIndex = index, Frame = slot.ConsumerView, TargetTimeNs = Monotonic.NowNs },
+                Request = new PresentRequest { SlotIndex = index, Frame = slot.ConsumerView with { Color = _source!.Frames.Info.Color }, TargetTimeNs = Monotonic.NowNs },
                 Write = slot.Write,
                 TargetNs = Monotonic.NowNs,
                 SlotKind = SlotKind.Real,
@@ -831,6 +850,7 @@ public sealed class PlaybackSession : IDisposable
         var fullscreenDone = !_o.Fullscreen || _fullscreenDone;
         var measuring = false;
         var audioVersion = 0L;
+        var colorSwitches = 0L;
         while (true)
         {
             meter.Tick();
@@ -842,6 +862,17 @@ public sealed class PlaybackSession : IDisposable
                     RequestStop(StopReason.User);
                 }
 
+                // H: SDR or HDR10 by hand (the capture's next frame, then the output with it); A: follow the signal again.
+                if ((events & WindowEvents.HdrTogglePressed) != 0)
+                {
+                    _ = RequestCaptureColor(CaptureColorRequest.Toggle);
+                }
+
+                if ((events & WindowEvents.FollowPressed) != 0)
+                {
+                    _ = RequestCaptureColor(CaptureColorRequest.Follow);
+                }
+
                 if (!fullscreenDone && _presenter!.IsTimingKnown)
                 {
                     fullscreenDone = true;
@@ -851,6 +882,18 @@ public sealed class PlaybackSession : IDisposable
 
             collector.Drain(_pacing!, _writer!, _presentLoop!);
             DrainCsv(collector, csv, report);
+            if (OperatingSystem.IsLinux() && _hooks.OnColorSwitch is { } onSwitch && _source is CapturePlaybackSource switched
+                && switched.Source.ColorSwitches != colorSwitches)
+            {
+                // A colour change of the capture (rare: no per-frame cost); the presenter follows it with the frames.
+                colorSwitches = switched.Source.ColorSwitches;
+                var log = switched.Source.SwitchLog;
+                if (log.Length > 0)
+                {
+                    onSwitch(log[^1]);
+                }
+            }
+
             if (_o.Audio is { } audio && collector.Latency.Version != audioVersion)
             {
                 // The sound follows the picture's measured latency (a volatile store on the audio side: no wait, no allocation).
@@ -1065,6 +1108,12 @@ public sealed class PlaybackSession : IDisposable
         }
 
         report.Capture = CaptureSummaryOf(_source);
+        if (_presenter is not null && _target is not null)
+        {
+            report.OutputAtEnd = DescribeOutput();
+            report.LastOutputColorChange = _presenter.LastOutputColorChange;
+            report.ScalingAtEnd = DescribeScaling();
+        }
 
         report.OutOfOrderSignals = _bridge?.OutOfOrderSignals ?? 0;
         if (_watchdog is not null && _presentLoop is not null)
@@ -1074,6 +1123,42 @@ public sealed class PlaybackSession : IDisposable
     }
 
     private static ThreadCost Cost(ThreadMeter meter) => new(meter.AllocatedBytes, meter.CpuNs, meter.Ticks);
+
+    /// <summary>"HDR10 swapchain A2B10G10R10UnormPack32 / Hdr10St2084EXT; metadata sent: ...": what the output is now.</summary>
+    private string DescribeOutput()
+    {
+        var presenter = _presenter!;
+        var target = _target!;
+        var hdr = target.ColorSpace == TargetColorSpace.Hdr10St2084;
+        var images = target is SwapchainTarget swapchain
+            ? $"swapchain {swapchain.SwapchainFormatName} / {swapchain.SwapchainColorSpaceName}"
+            : $"offscreen {((OffscreenTarget)target).PixelFormat} images ({(hdr ? "HDR10 ST 2084" : "sRGB")})";
+        var content = presenter.ContentColor.IsPq ? "PQ" : "SDR";
+        var metadata = !hdr ? "no HDR metadata (SDR)"
+            : target.HdrMetadataSent is { } sent ? $"HDR metadata sent (vkSetHdrMetadataEXT): {sent}"
+            : $"no HDR metadata sent: {target.HdrMetadataUnavailableReason ?? "none"}";
+        return $"{(hdr ? "HDR10" : "SDR")} output for {content} content: {images}; transform {presenter.ActiveTransform}; {metadata}";
+    }
+
+    /// <summary>Whether the frames are shown pixel for pixel or resampled, and how.</summary>
+    private string DescribeScaling()
+    {
+        var presenter = _presenter!;
+        var target = _target!;
+        var ring = presenter.Ring;
+        if (ring is null || target.Width == 0 || target.Height == 0)
+        {
+            return "not known yet (no output size)";
+        }
+
+        var rect = ContentRect.Fit(ring.Width, ring.Height, target.Width, target.Height);
+        var bars = rect.Width < target.Width || rect.Height < target.Height ? $", bars at code 0 (true black in {(presenter.ContentColor.IsPq ? "PQ" : "SDR")})" : "";
+        return presenter.IsScalingExact
+            ? string.Create(CultureInfo.InvariantCulture, $"exact: {ring.Width}x{ring.Height} frames shown pixel for pixel on {target.Width}x{target.Height}, no resampling{bars}")
+            : string.Create(CultureInfo.InvariantCulture,
+                $"resampled: {ring.Width}x{ring.Height} frames to {rect.Width}x{rect.Height} on {target.Width}x{target.Height} by bilinear filtering " +
+                $"{(presenter.ContentColor.IsPq ? "in linear light (PQ decoded, filtered, encoded again)" : "of the SDR code values")}{bars}");
+    }
 
     /// <summary>
     /// Frees everything in the order the components require: the source is stopped (its decode thread may wait inside

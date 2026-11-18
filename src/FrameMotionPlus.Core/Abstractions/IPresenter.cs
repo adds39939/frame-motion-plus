@@ -52,7 +52,9 @@ public readonly record struct DisplayTiming
 /// <summary>
 /// How the presenter is set up. <see cref="Width"/>, <see cref="Height"/> and <see cref="Format"/> describe the frames
 /// that will be presented (the ring slots' shape), not the output: the presenter scales them to whatever size its
-/// window or display has, and <see cref="OutputColor"/> says what the output should be.
+/// window or display has, and <see cref="OutputColor"/> says what colour the frames are (the content's transfer,
+/// primaries and HDR metadata): a presenter shows them as they are, PQ on an HDR10 output and SDR on an SDR output, and
+/// converts only when the display cannot show them (unspecified: PQ for a 10-bit format, SDR otherwise).
 /// </summary>
 public readonly record struct PresenterConfig
 {

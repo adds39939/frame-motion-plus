@@ -15,8 +15,8 @@ internal sealed record CapturePreset(string Name, int Width, int Height, double 
     /// <summary>The presets, the owner's target first (4K HDR, 30 to 60).</summary>
     public static readonly IReadOnlyList<CapturePreset> All =
     [
-        new("4k30-hdr", 3840, 2160, 30, CapturePixelFormat.P010, HdrMode.On, "3840x2160 P010 at 30 fps, HDR10 (the Elgato 4K X's 10-bit 4K mode; generate to 60)"),
-        new("1440p60-hdr", 2560, 1440, 60, CapturePixelFormat.P010, HdrMode.On, "2560x1440 P010 at 60 fps, HDR10 (for 60 fps games; generate to 120)"),
+        new("4k30-hdr", 3840, 2160, 30, CapturePixelFormat.P010, HdrMode.Follow, "3840x2160 P010 at 30 fps, HDR10 or SDR as the console sends (the Elgato 4K X's 10-bit 4K mode; generate to 60)"),
+        new("1440p60-hdr", 2560, 1440, 60, CapturePixelFormat.P010, HdrMode.Follow, "2560x1440 P010 at 60 fps, HDR10 or SDR as the console sends (for 60 fps games; generate to 120)"),
         new("4k60-sdr", 3840, 2160, 60, CapturePixelFormat.Nv12, HdrMode.Off, "3840x2160 NV12 at 60 fps, SDR (8-bit)"),
         new("1440p60-sdr", 2560, 1440, 60, CapturePixelFormat.Nv12, HdrMode.Off, "2560x1440 NV12 at 60 fps, SDR"),
         new("1440p120-sdr", 2560, 1440, 120, CapturePixelFormat.Nv12, HdrMode.Off, "2560x1440 NV12 at 120 fps, SDR"),
@@ -146,7 +146,10 @@ internal sealed record CaptureOptions
             ? new CaptureRequest { Width = preset.Width, Height = preset.Height, Fps = preset.Fps, Format = preset.Format }
             : new CaptureRequest { Width = width, Height = height, Fps = fps, Format = format };
         var hdrText = r.String("hdr");
-        var hdr = hdrText is null ? preset?.Hdr ?? HdrMode.TenBit : ParseHdr(hdrText);
+        var hdr = hdrText is null ? preset?.Hdr ?? HdrMode.Follow : ParseHdr(hdrText);
+        var peak = (int)r.Int64("hdr-peak-nits", ColorMetadata.DefaultPeakNits, 100, 10_000);
+        var maxCll = r.Has("hdr-max-cll") ? (int)r.Int64("hdr-max-cll", peak, 1, 10_000) : (int?)null;
+        var maxFall = (int)r.Int64("hdr-max-fall", 0, 0, 10_000);
         var offscreen = r.Flag("offscreen");
         var fullscreen = r.Flag("fullscreen");
         var windowed = r.Flag("windowed") || r.Has("window");
@@ -193,6 +196,9 @@ internal sealed record CaptureOptions
                 Hdr = hdr,
                 Range = ParseRange(r.String("range")),
                 Matrix = ParseMatrix(r.String("matrix")),
+                PeakNits = peak,
+                MaxCll = maxCll,
+                MaxFall = maxFall,
             },
             BufferMode = ParseBufferMode(r.String("buffer-mode")),
             Buffers = (int)r.Int64("buffers", 4, 2, 16),
@@ -283,7 +289,8 @@ internal sealed record CaptureOptions
         "off" => HdrMode.Off,
         "auto" => HdrMode.Auto,
         "10bit" => HdrMode.TenBit,
-        _ => throw new UsageException($"Option '--hdr' expects on, off, auto (as the device reports) or 10bit (on for 10-bit captures), got '{text}'."),
+        "follow" => HdrMode.Follow,
+        _ => throw new UsageException($"Option '--hdr' expects follow (HDR10 or SDR as the signal's depth says), on, off, auto (as the device reports) or 10bit (on for 10-bit captures), got '{text}'."),
     };
 
     private static ColorRange? ParseRange(string? text) => text?.ToLowerInvariant() switch

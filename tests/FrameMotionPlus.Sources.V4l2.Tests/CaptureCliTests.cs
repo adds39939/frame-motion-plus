@@ -264,7 +264,9 @@ public sealed class CaptureCliTests
         var (exit, output, err) = Run("capture", path, "--audio", "off", "--mode", "4k30-hdr", "--offscreen", "--duration-s", "4", "--warmup-s", "1");
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
         Assert.Contains("negotiated  3840x2160 P010 @ 30 fps", output, StringComparison.Ordinal);
-        Assert.Contains("frames Rgb10A2 Pq/Bt2020", output, StringComparison.Ordinal);
+        Assert.Contains("frames Rgb10A2 PQ / BT.2020", output, StringComparison.Ordinal);
+        Assert.Contains("following the console", output, StringComparison.Ordinal);
+        Assert.Contains("HDR10 output for PQ content", output, StringComparison.Ordinal);
         Assert.Contains("verdict     PASS", output, StringComparison.Ordinal);
     }
 

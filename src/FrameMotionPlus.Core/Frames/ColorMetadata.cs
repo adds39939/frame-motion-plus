@@ -71,7 +71,7 @@ public readonly record struct MasteringDisplay
 
     public bool IsSpecified => MaxLuminanceNits > 0;
 
-    /// <summary>A common HDR10 default when the source carries none: P3-D65 primaries, 1000 nits.</summary>
+    /// <summary>A common HDR10 default for mastered video that carries none: P3-D65 primaries, 1000 nits.</summary>
     public static MasteringDisplay P3D65Default => new()
     {
         Red = new Chromaticity(0.680f, 0.320f),
@@ -79,6 +79,21 @@ public readonly record struct MasteringDisplay
         Blue = new Chromaticity(0.150f, 0.060f),
         WhitePoint = new Chromaticity(0.3127f, 0.3290f),
         MaxLuminanceNits = 1000f,
+        MinLuminanceNits = 0.0001f,
+    };
+
+    /// <summary>
+    /// The default for a source that sends no mastering metadata, such as a games console over a capture card: BT.2020
+    /// primaries (the HDR10 container, which a game renders into), D65 white, <paramref name="maxNits"/> peak (a console's
+    /// HDR calibration targets the display it sees, so this is best set to that display's peak) and 0.0001 nits black.
+    /// </summary>
+    public static MasteringDisplay Bt2020D65(float maxNits) => new()
+    {
+        Red = new Chromaticity(0.708f, 0.292f),
+        Green = new Chromaticity(0.170f, 0.797f),
+        Blue = new Chromaticity(0.131f, 0.046f),
+        WhitePoint = new Chromaticity(0.3127f, 0.3290f),
+        MaxLuminanceNits = maxNits,
         MinLuminanceNits = 0.0001f,
     };
 }
@@ -123,13 +138,26 @@ public readonly record struct ColorMetadata
         Range = ColorRange.Full,
     };
 
-    public static ColorMetadata Hdr10 => new()
+    /// <summary>
+    /// HDR10 RGB frames with the defaults for a source that sends no metadata (<see cref="MasteringDisplay.Bt2020D65"/> at
+    /// <see cref="DefaultPeakNits"/>, MaxCLL the same, MaxFALL not stated).
+    /// </summary>
+    public static ColorMetadata Hdr10 => Hdr10WithPeak(DefaultPeakNits, DefaultPeakNits, 0);
+
+    /// <summary>The mastering peak (and MaxCLL) assumed for a source that states none, in nits.</summary>
+    public const int DefaultPeakNits = 1000;
+
+    /// <summary>HDR10 RGB frames from a source with no metadata of its own, with the given peak, MaxCLL and MaxFALL (0: not stated).</summary>
+    public static ColorMetadata Hdr10WithPeak(int peakNits, int maxCll, int maxFall) => new()
     {
         Primaries = ColorPrimaries.Bt2020,
         Transfer = TransferFunction.Pq,
         Matrix = MatrixCoefficients.Identity,
         Range = ColorRange.Full,
-        Mastering = MasteringDisplay.P3D65Default,
-        LightLevel = new ContentLightLevel(1000, 400),
+        Mastering = MasteringDisplay.Bt2020D65(peakNits),
+        LightLevel = new ContentLightLevel((ushort)Math.Clamp(maxCll, 0, ushort.MaxValue), (ushort)Math.Clamp(maxFall, 0, ushort.MaxValue)),
     };
+
+    /// <summary>True for content in the SMPTE ST 2084 transfer: what an HDR10 swapchain shows as it is.</summary>
+    public bool IsPq => Transfer == TransferFunction.Pq;
 }

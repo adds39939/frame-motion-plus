@@ -31,6 +31,12 @@ public enum WindowEvents
 
     /// <summary>The window became occluded (e.g. the compositor suspended it) or visible again.</summary>
     OcclusionChanged = 1 << 6,
+
+    /// <summary>H: switch between SDR and HDR10 by hand.</summary>
+    HdrTogglePressed = 1 << 7,
+
+    /// <summary>A: follow the signal's SDR/HDR10 state again.</summary>
+    FollowPressed = 1 << 8,
 }
 
 /// <summary>
@@ -177,6 +183,12 @@ public sealed unsafe class SdlWindow : IDisposable
                     break;
                 case SdlNative.EventKeyDown when e.Key == SdlNative.KeycodeEscape && e.Repeat == 0:
                     result |= WindowEvents.EscapePressed;
+                    break;
+                case SdlNative.EventKeyDown when e.Key == SdlNative.KeycodeH && e.Repeat == 0:
+                    result |= WindowEvents.HdrTogglePressed;
+                    break;
+                case SdlNative.EventKeyDown when e.Key == SdlNative.KeycodeA && e.Repeat == 0:
+                    result |= WindowEvents.FollowPressed;
                     break;
             }
         }

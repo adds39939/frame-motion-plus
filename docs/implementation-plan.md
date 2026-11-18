@@ -535,7 +535,8 @@ pass-through right and builds no conversions between SDR and HDR (those are unde
 - **Following the console:** the PS5 switches between SDR and HDR (menus, games). This card does not
   signal the change, so find what can be detected (a format or resolution change, picture
   statistics) and otherwise provide a manual switch that takes effect without restarting; both VFG
-  instances (RGBA8 and RGB10A2) stay loaded so a switch is quick.
+  instances (RGBA8 and RGB10A2) stay loaded so a switch is quick. (Not needed in the end: the
+  generator's pixel format does not change on a switch, so nothing reloads.)
 - **Found in Phase 2:** the Wayland surface here offers `A2B10G10R10` with `HDR10_ST2084` natively
   (also HLG and FP16 linear spaces), so `VK_hdr_layer` is not needed on this driver. The Phase 2
   presenter passes PQ through to an HDR10 swapchain, scales on PQ code values (not linear light)
@@ -544,6 +545,35 @@ pass-through right and builds no conversions between SDR and HDR (those are unde
 - **Automated gate:** HDR test patterns numerically correct on the offscreen target (code values
   preserved; linear-light scaling within tolerance; metadata as intended); no added d versus SDR.
 - **Manual gate:** a PS5 HDR game looks right on the owner's HDR display.
+- **Outcome (2026-11-18, `docs/benchmarks/phase7-hdr.md`):**
+  - The capture conversion was already exact (0 of 2,073,600 pixels off a CPU reference on four
+    HDR patterns) and 10 bits survive to the screen image; a VFG frame between identical HDR frames
+    keeps transfer and range.
+  - Fixed: the swapchain follows the content (HDR10 for PQ, SDR for SDR; before, any 10-bit picture
+    got HDR10); PQ is scaled in linear light (before, a bright edge filtered on code values showed
+    0.6 nits where 1,250 was right) and shown pixel for pixel when sizes match; HDR metadata is
+    sent (a file's own; for the card BT.2020/D65 at 1,000 nits, settable with `--hdr-peak-nits`,
+    `--hdr-max-cll`, `--hdr-max-fall`). `fmp hdr-pattern --check` proves these offscreen in 27
+    numeric checks; `fmp hdr-pattern ramp|peak|bars|black` puts patterns on screen.
+  - Latency unchanged: 4K HDR 54.0 ms before, 54.3 after (windowed); 46.6 ms fullscreen.
+  - Following the console: the card signals nothing. `--hdr follow|on|off` and the H and A keys
+    switch the output without restarting (rebuild at most 0.66 ms, no missed slots). Follow judges
+    by the samples' bit depth and **has never seen a real SDR signal**: the owner needs to try it
+    once with the PS5 set to SDR.
+  - **The compositor shapes HDR brightness, and the metadata now sent moves its curve.** KWin anchors
+    a PQ window's 203-nit reference white to the output's "SDR brightness" setting (440 nits on
+    DP-3, 500 on HDMI-A-1) and then tone-maps the whole range with a curve keyed on the stated peak
+    (MaxCLL, else the mastering peak, else 10,000 nits), clamping above it. With the 1,000-nit
+    default now sent, the picture is brighter than before this phase (white about 297 nits against
+    226 on DP-3; 1,000-nit content at 1,000 against 414) and highlights above 1,000 nits clip; the
+    game on the card peaked at 2,100 to 2,400. `--hdr-peak-nits` moves the curve (10,000 gives the
+    look from before this phase). Settled by running the PS5's "Adjust HDR" screens through the
+    app, or by setting the peak to the console's. From KWin's source, not measured with a meter.
+  - A colour switch costs no missed slot windowed, and can cost a late present in fullscreen
+    variable refresh (5 late slots over 19 switches).
+  - The `ffmpeg` CLI cannot capture this card's P010 and silently takes NV12, for which the card
+    itself turns HDR into SDR: do not use it to judge the card's signal.
+  - Not done: the items in that document's "Known issues / not done".
 
 ### Phase 8: Audio (capture card)
 

@@ -147,6 +147,7 @@ public sealed unsafe class SwapchainTarget : PresentTarget
     private VkFence[] _presentFences;
     private bool[] _fenceInUse;
     private VkColorSpaceKHR _colorSpace;
+    private OutputRequest _request;
     private bool _outOfDate;
     private bool _disposed;
     private int _builtForWidth = -1;
@@ -367,9 +368,46 @@ public sealed unsafe class SwapchainTarget : PresentTarget
 
     internal override void Configure(in OutputRequest request)
     {
+        _request = request;
         (Format, _colorSpace) = ChooseFormat(request);
         ColorSpace = _colorSpace == VkColorSpaceKHR.Hdr10St2084EXT ? TargetColorSpace.Hdr10St2084 : TargetColorSpace.Sdr;
         Recreate();
+    }
+
+    internal override VkFormat FormatFor(in OutputRequest request) => ChooseFormat(request).Format;
+
+    internal override void UpdateHdrMetadata(in HdrMetadata metadata)
+    {
+        _request = _request with { Metadata = metadata };
+        if (!_swapchain.IsNull)
+        {
+            SendHdrMetadata(_swapchain);
+        }
+    }
+
+    /// <summary>
+    /// VK_EXT_hdr_metadata for an HDR10 swapchain: the request's mastering display and light levels. Called for every new
+    /// HDR10 swapchain (the metadata belongs to the swapchain) and when the content's metadata changes.
+    /// </summary>
+    private void SendHdrMetadata(VkSwapchainKHR swapchain)
+    {
+        HdrMetadataSent = null;
+        HdrMetadataUnavailableReason = null;
+        if (_colorSpace != VkColorSpaceKHR.Hdr10St2084EXT)
+        {
+            return;
+        }
+
+        if (!Device.Capabilities.HdrMetadata)
+        {
+            HdrMetadataUnavailableReason = "the device has no VK_EXT_hdr_metadata: the compositor assumes the PQ range's defaults";
+            return;
+        }
+
+        var metadata = _request.Metadata.ToVulkan();
+        Device.Api.vkSetHdrMetadataEXT(1, &swapchain, &metadata);
+        HdrMetadataSent = HdrMetadata.FromVulkan(metadata);
+        HdrMetadataCalls++;
     }
 
     // Compared with the window size the swapchain was last built for (not its extent, which the surface may clamp),
@@ -519,6 +557,7 @@ public sealed unsafe class SwapchainTarget : PresentTarget
         Height = (int)h;
         Version++;
         SetUpPresentTiming(swapchain);
+        SendHdrMetadata(swapchain);
     }
 
     /// <summary>
@@ -1026,12 +1065,19 @@ public sealed unsafe class SwapchainTarget : PresentTarget
     private static VkCompositeAlphaFlagsKHR FirstBit(VkCompositeAlphaFlagsKHR flags) =>
         (VkCompositeAlphaFlagsKHR)((uint)flags & (uint)-(int)flags);
 
-    private (VkFormat, VkColorSpaceKHR) ChooseFormat(in OutputRequest request)
+    private static readonly VkFormat[] Hdr10Formats = [VkFormat.A2B10G10R10UnormPack32, VkFormat.A2R10G10B10UnormPack32];
+
+    // SDR: UNORM (not _SRGB) formats, so encoded values are written as they are. A 10-bit format for 10-bit content keeps
+    // its precision (10-bit SDR from a P010 capture, or the placeholder's output).
+    private static readonly VkFormat[] SdrTenBitFormats = [VkFormat.A2B10G10R10UnormPack32, VkFormat.A2R10G10B10UnormPack32, VkFormat.B8G8R8A8Unorm, VkFormat.R8G8B8A8Unorm];
+    private static readonly VkFormat[] SdrEightBitFormats = [VkFormat.B8G8R8A8Unorm, VkFormat.R8G8B8A8Unorm, VkFormat.A2B10G10R10UnormPack32];
+
+    /// <summary>Allocation-free (a switch between SDR and HDR chooses again on the present thread).</summary>
+    private (VkFormat Format, VkColorSpaceKHR ColorSpace) ChooseFormat(in OutputRequest request)
     {
-        bool Has(VkFormat f, VkColorSpaceKHR c) => _formats.Contains((f, c));
         if (request.PreferHdr10)
         {
-            foreach (var f in (VkFormat[])[VkFormat.A2B10G10R10UnormPack32, VkFormat.A2R10G10B10UnormPack32])
+            foreach (var f in Hdr10Formats)
             {
                 if (Has(f, VkColorSpaceKHR.Hdr10St2084EXT))
                 {
@@ -1040,12 +1086,7 @@ public sealed unsafe class SwapchainTarget : PresentTarget
             }
         }
 
-        // SDR: UNORM (not _SRGB) formats, so encoded values are written as they are. A 10-bit format for 10-bit
-        // content keeps the placeholder transform's extra precision.
-        VkFormat[] sdr = request.TenBitContent
-            ? [VkFormat.A2B10G10R10UnormPack32, VkFormat.A2R10G10B10UnormPack32, VkFormat.B8G8R8A8Unorm, VkFormat.R8G8B8A8Unorm]
-            : [VkFormat.B8G8R8A8Unorm, VkFormat.R8G8B8A8Unorm, VkFormat.A2B10G10R10UnormPack32];
-        foreach (var f in sdr)
+        foreach (var f in request.TenBitContent ? SdrTenBitFormats : SdrEightBitFormats)
         {
             if (Has(f, VkColorSpaceKHR.SrgbNonLinear))
             {
@@ -1054,6 +1095,19 @@ public sealed unsafe class SwapchainTarget : PresentTarget
         }
 
         throw new NotSupportedException("The surface offers no UNORM format in the sRGB colour space.");
+    }
+
+    private bool Has(VkFormat format, VkColorSpaceKHR colorSpace)
+    {
+        foreach (var f in _formats)
+        {
+            if (f.Format == format && f.ColorSpace == colorSpace)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private VkSurfaceCapabilitiesKHR SurfaceCapabilities()

@@ -8,12 +8,13 @@ namespace FrameMotionPlus.Vulkan;
 /// <summary>The output colour transform the presenter pass applies (shader specialization constant TRANSFORM).</summary>
 public enum OutputTransform
 {
-    /// <summary>Values pass through: 8-bit SDR to an SDR target, or 10-bit PQ to an HDR10 ST 2084 target.</summary>
+    /// <summary>Values pass through: SDR content to an SDR target, PQ content to an HDR10 ST 2084 target (any bit depth).</summary>
     Passthrough = 0,
 
     /// <summary>
-    /// PLACEHOLDER for a 10-bit PQ ring on an SDR-only target: PQ decoded, 203 nits mapped to SDR white, hard clip,
-    /// sRGB encode, no gamut mapping. Watchable, not correct; Phase 7 replaces it with tone mapping.
+    /// PLACEHOLDER for PQ content on a display that cannot show HDR10: PQ decoded, 203 nits mapped to SDR white, hard
+    /// clip, sRGB encode, no gamut mapping. Watchable, not correct; tone mapping is deferred (conversions between SDR and
+    /// HDR are not built).
     /// </summary>
     PqToSdrPlaceholder = 1,
 }
@@ -21,7 +22,10 @@ public enum OutputTransform
 /// <summary>The scaler stage (shader specialization constant SCALER). Better filters slot in as new values.</summary>
 public enum PresentScaler
 {
-    /// <summary>Hardware bilinear; texel-exact fetch when the content rectangle equals the source size.</summary>
+    /// <summary>
+    /// Bilinear; texel-exact fetch when the content rectangle equals the source size. PQ content is filtered in linear
+    /// light (decoded, weighted, encoded again), SDR content on its code values by the hardware filter.
+    /// </summary>
     Bilinear = 0,
 }
 
@@ -85,7 +89,7 @@ internal struct PresentPushConstants
 internal sealed unsafe class PresentPass : IDisposable
 {
     private readonly VulkanDevice _device;
-    private readonly List<(VkFormat Format, OutputTransform Transform, PresentScaler Scaler, VkPipeline Pipeline)> _pipelines = [];
+    private readonly List<(VkFormat Format, OutputTransform Transform, PresentScaler Scaler, bool LinearPq, VkPipeline Pipeline)> _pipelines = [];
     private VkShaderModule _vert;
     private VkShaderModule _frag;
     private VkShaderModule _copy;
@@ -122,17 +126,17 @@ internal sealed unsafe class PresentPass : IDisposable
     public VkDescriptorSet CopySet(int slot) => _copySets[slot];
 
     /// <summary>
-    /// Transform for a ring of <paramref name="ringFormat"/> on a target in <paramref name="target"/>. The ring
-    /// format stands for the content's colour in this phase: 8-bit is SDR, 10-bit is PQ (Phase 7 reads the frame's
-    /// colour metadata instead).
+    /// Transform for content in <paramref name="content"/>'s colour on a target in <paramref name="target"/>, whatever the
+    /// ring's bit depth: PQ on an HDR10 target and SDR on an SDR target pass through; PQ on an SDR target (a display that
+    /// cannot show HDR10) gets the placeholder. SDR content is never put on an HDR10 target (the presenter asks for SDR).
     /// </summary>
-    public static OutputTransform SelectTransform(PixelFormat ringFormat, TargetColorSpace target) =>
-        (ringFormat.Family(), target) switch
+    public static OutputTransform SelectTransform(in ColorMetadata content, TargetColorSpace target) =>
+        (content.IsPq, target) switch
         {
-            (PixelFormatFamily.EightBit, TargetColorSpace.Sdr) => OutputTransform.Passthrough,
-            (PixelFormatFamily.TenBit, TargetColorSpace.Hdr10St2084) => OutputTransform.Passthrough,
-            (PixelFormatFamily.TenBit, TargetColorSpace.Sdr) => OutputTransform.PqToSdrPlaceholder,
-            _ => throw new NotSupportedException($"{ringFormat} content on a {target} target is Phase 7 (SDR in HDR)."),
+            (false, TargetColorSpace.Sdr) => OutputTransform.Passthrough,
+            (true, TargetColorSpace.Hdr10St2084) => OutputTransform.Passthrough,
+            (true, TargetColorSpace.Sdr) => OutputTransform.PqToSdrPlaceholder,
+            _ => throw new NotSupportedException($"{content.Transfer} content on a {target} target would need SDR placed in HDR, which is not built."),
         };
 
     public void BindSource(VkImageView view)
@@ -185,18 +189,19 @@ internal sealed unsafe class PresentPass : IDisposable
         }
     }
 
-    public VkPipeline Pipeline(VkFormat format, OutputTransform transform, PresentScaler scaler)
+    /// <summary>The pass for <paramref name="format"/> targets; <paramref name="linearPq"/>: the content is PQ, scaled in linear light.</summary>
+    public VkPipeline Pipeline(VkFormat format, OutputTransform transform, PresentScaler scaler, bool linearPq)
     {
         foreach (var p in _pipelines)
         {
-            if (p.Format == format && p.Transform == transform && p.Scaler == scaler)
+            if (p.Format == format && p.Transform == transform && p.Scaler == scaler && p.LinearPq == linearPq)
             {
                 return p.Pipeline;
             }
         }
 
-        var pipeline = CreatePipeline(format, transform, scaler);
-        _pipelines.Add((format, transform, scaler, pipeline));
+        var pipeline = CreatePipeline(format, transform, scaler, linearPq);
+        _pipelines.Add((format, transform, scaler, linearPq, pipeline));
         return pipeline;
     }
 
@@ -401,14 +406,15 @@ internal sealed unsafe class PresentPass : IDisposable
         }
     }
 
-    private VkPipeline CreatePipeline(VkFormat format, OutputTransform transform, PresentScaler scaler)
+    private VkPipeline CreatePipeline(VkFormat format, OutputTransform transform, PresentScaler scaler, bool linearPq)
     {
         using var entry = new Utf8StringList(["main"]);
-        var specData = stackalloc int[2] { (int)scaler, (int)transform };
-        var specEntries = stackalloc VkSpecializationMapEntry[2];
+        var specData = stackalloc int[3] { (int)scaler, (int)transform, linearPq ? 1 : 0 };
+        var specEntries = stackalloc VkSpecializationMapEntry[3];
         specEntries[0] = new VkSpecializationMapEntry { constantID = 0, offset = 0, size = sizeof(int) };
         specEntries[1] = new VkSpecializationMapEntry { constantID = 1, offset = sizeof(int), size = sizeof(int) };
-        var spec = new VkSpecializationInfo { mapEntryCount = 2, pMapEntries = specEntries, dataSize = 2 * sizeof(int), pData = specData };
+        specEntries[2] = new VkSpecializationMapEntry { constantID = 2, offset = 2 * sizeof(int), size = sizeof(int) };
+        var spec = new VkSpecializationInfo { mapEntryCount = 3, pMapEntries = specEntries, dataSize = 3 * sizeof(int), pData = specData };
 
         var stages = stackalloc VkPipelineShaderStageCreateInfo[2];
         stages[0] = new VkPipelineShaderStageCreateInfo { stage = VkShaderStageFlags.Vertex, module = _vert, pName = entry.Pointer[0] };

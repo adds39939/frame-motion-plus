@@ -53,6 +53,15 @@ telemetry: 0 missed on DP-3; 4 on HDMI-A-1, in one host stall (a handful is acce
 Results, the compositor's measured behaviour, and what is not done:
 [`docs/benchmarks/phase6-pacing.md`](docs/benchmarks/phase6-pacing.md).
 
+Phase 7 (HDR, pass-through) makes the HDR path right from capture to swapchain and shows an SDR signal as SDR (no
+conversions between the two are built). The output follows the frames' colour: PQ content gets an HDR10 swapchain with
+`VK_EXT_hdr_metadata` (the file's metadata, or BT.2020/D65 defaults with a settable peak for the capture card), SDR
+content an SDR one; scaling to the output filters PQ in linear light (pixel for pixel when the sizes match); a P010 capture
+follows the console between HDR10 and SDR by the bit depth of its samples, and `H` in the window switches by hand at
+once (the output is rebuilt at the next frame, no missed slot in the runs). `fmp hdr-pattern` puts HDR test patterns on
+screen and `fmp hdr-pattern --check` proves the path by numbers. Results, what KWin does with the surface as far as could
+be established, and how to check HDR by eye: [`docs/benchmarks/phase7-hdr.md`](docs/benchmarks/phase7-hdr.md).
+
 Phase 8, first part (capture-card audio) adds `FrameMotionPlus.Audio`: `fmp capture` now plays the card's sound,
 delayed so it is heard when its picture is seen. The card's PipeWire audio source is captured and played to the default
 sink through a delay line whose total delay (from a sample's capture to the time it is heard, both from PipeWire's
@@ -283,8 +292,10 @@ cost of upload, cadence and conversion) and the latency the generation adds agai
 
 ```sh
 fmp capture --list                                   # the capture devices and what each offers
-fmp capture --mode 4k30-hdr                          # the owner's target, lowest latency: 3840x2160 P010 at 30, HDR10, VFG
-                                                     # to 60, fullscreen (the default) with variable refresh (on DP-3, 240 Hz)
+fmp capture --mode 4k30-hdr                          # the owner's target, lowest latency: 3840x2160 P010 at 30, HDR10 (or SDR
+                                                     # as the console sends), VFG to 60, fullscreen (the default) with
+                                                     # variable refresh (on DP-3, 240 Hz)
+fmp capture --mode 4k30-hdr --hdr-peak-nits 1000     # the HDR10 metadata sent: set the peak the PS5's HDR calibration was for
 fmp capture --mode 4k30-hdr --windowed               # the same in a window (fixed refresh, the measured present lead)
 fmp capture --mode 1440p60-hdr                       # 2560x1440 P010 at 60, HDR10, VFG to 120 (60 fps games), variable refresh
 fmp capture --mode 1440p60-hdr --multiplier 4        # a 30 fps game in that signal to 120
@@ -293,10 +304,37 @@ fmp capture --mode 4k30-hdr --duration-s 180 --csv capture.csv --frames-csv fram
 ```
 
 The Elgato 4K X offers 10-bit P010 only up to 1440p60 and 2160p30 (it takes 30 of the console's 60 Hz itself in that
-mode), and reports Rec. 709 for a PQ signal: `fmp capture` therefore takes a 10-bit capture as HDR10 (PQ, BT.2020) by
-default; `--hdr off` for a console in SDR, `--range` and `--matrix` to override the rest. MJPEG is never used. Window
-close, Escape, Ctrl+C and SIGTERM stop it cleanly; the device is released on every way out. Set `$FMP_VFX_SDK` for a
-binary outside the checkout, as for `fmp play`.
+mode), and reports Rec. 709 whatever the console sends. A P010 capture therefore starts as HDR10 (PQ, BT.2020 primaries,
+limited range, the BT.2020 matrix) and **follows the console** (`--hdr follow`, the default): samples that carry 10
+significant bits are HDR10, samples that carry only 8 (how a PS5 sends SDR, padded into P010 by the card) SDR (BT.709).
+The HDR side of that rule is measured; the SDR side is not yet (the console stayed in HDR while this was built): if a
+console in SDR is still shown as HDR10, press **H** in the window, which switches between SDR and HDR10 by hand at the
+next frame (the output is rebuilt with it, within a frame or two); **A** follows the signal again. `--hdr on|off` fixes it
+for the run. The NV12 modes (`-sdr`) are SDR: the card fits an HDR signal into SDR itself for its 8-bit formats.
+`--hdr-peak-nits` (and `--hdr-max-cll`, `--hdr-max-fall`) set the HDR metadata sent with the picture, since the card
+carries none: best the peak the PS5's own HDR calibration was done for. At the start `fmp capture` says what the signal is
+taken to be, what the output is (format, colour space, the metadata sent) and whether the picture is scaled (PQ in linear
+light) or shown pixel for pixel. `--range` and `--matrix` override the rest. MJPEG is never used. Window close, Escape,
+Ctrl+C and SIGTERM stop it cleanly; the device is released on every way out. Set `$FMP_VFX_SDK` for a binary outside the
+checkout, as for `fmp play`.
+
+### HDR test patterns
+
+```sh
+fmp hdr-pattern ramp                 # every PQ code left to right, labelled in nits (10 s, in a window; Escape ends it)
+fmp hdr-pattern peak                 # patches at 100 ... 10,000 nits, each with an inner square 25% brighter
+fmp hdr-pattern bars                 # BT.2020 colour bars at 203 nits (HDR reference white) and at 1,000 nits
+fmp hdr-pattern black --fullscreen   # near-black steps; keep fullscreen runs of the bright patterns short
+fmp hdr-pattern --check              # no window: the HDR path proved by numbers (exit 1 if any check fails)
+```
+
+The patterns go through the same presenter and HDR metadata as a capture. What a correct display shows, and how to
+compare with the PS5 plugged straight into the monitor, is in [`docs/benchmarks/phase7-hdr.md`](docs/benchmarks/phase7-hdr.md).
+On this desktop the NVIDIA driver describes the HDR10 window to KWin as PQ with the default 203-nit reference white
+(and the metadata sent), and the Wayland colour-management protocol has the compositor anchor reference whites: so a PQ
+window's 203 nits are shown at the output's "SDR brightness" (440 and 500 nits here), everything scaled with it and
+compressed above the output's peak. PQ levels are shown as coded only with that setting at 203 nits (the owner's choice:
+it dims the desktop's SDR content too). This follows from what KWin and the driver report; it was not measured with a meter.
 
 ### Sound
 

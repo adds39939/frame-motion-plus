@@ -34,6 +34,7 @@ internal static class CommandDispatcher
                 "settings" => SettingsCommand.Run(rest, output),
                 "bench" => BenchCommand.Run(rest, output, error),
                 "pattern" => PatternCommand.Run(rest, output, error),
+                "hdr-pattern" => HdrPatternCommand.Run(rest, output, error),
                 "decode" => DecodeCommand.Run(rest, output, error),
                 "play" => PlayCommand.Run(rest, output, error),
                 "capture" => CaptureCommand.Run(rest, output, error),
@@ -76,6 +77,9 @@ internal static class CommandDispatcher
                                     What the desktop compositor does with presents, from first-pixel times: its latch,
                                     the output's regularity, whether variable refresh is active (Phase 6)
           fmp pattern [options]     CUDA test pattern through the presentation ring to a window or offscreen (Phase 2)
+          fmp hdr-pattern [ramp|peak|bars|black] [options]
+                                    An HDR test pattern on an HDR10 swapchain, to check the display by eye; with --check the
+                                    HDR path (capture conversion, VFG, presenter, metadata, scaling) proved by numbers (Phase 7)
           fmp decode <file> [options]
                                     Decode a video file with NVDEC into CUDA, convert it to RGB and check it (Phase 4)
           fmp play <file> [options] Play a video file with frame generation in real time: decoded, interpolated (VFG,
@@ -223,6 +227,25 @@ internal static class CommandDispatcher
                                     makes the loop fail between acquiring that slot's write and signalling it (the run
                                     then fails with that cause and must still tear down cleanly).
 
+        hdr-pattern [ramp|peak|bars|black] options (an HDR test pattern on an HDR10 swapchain, as captured HDR10 is shown):
+          ramp                      Every PQ code 0..1023 left to right, ticks labelled in nits; R, G, B ramps   (default)
+          peak                      Patches at 100, 203, 400, 600, 1000, 2000, 4000 and 10000 nits, each with an inner square
+                                    25% brighter: where the inner square vanishes the display (or KWin) has reached its limit
+          bars                      BT.2020 colour bars at 203 nits (HDR reference white) and at 1000 nits
+          black                     Near-black steps, PQ codes 0 to 128 on code 0, labelled in nits
+          --duration-s <s>          How long                                                  (10)
+          --window <WxH>            Window size; the pattern is drawn at its pixel size                     (1280x720)
+          --fullscreen              Borderless fullscreen (keep it short: a 10,000-nit patch is unpleasant)
+          --hdr-peak-nits, --hdr-max-cll, --hdr-max-fall   The HDR metadata sent, as for capture
+          --check                   No window: the HDR path proved by numbers, offscreen: each pattern encoded as a console
+                                    sends it (P010, limited range, BT.2020, 4:2:0), converted by the capture's kernel, written
+                                    into the ring as a real frame and as a VFG frame between two identical frames, presented
+                                    and read back; also scaling against a linear-light reference, the HDR metadata handed to
+                                    Vulkan, SDR staying SDR (10- and 8-bit) and the switch back. Exits 1 if any check fails
+          --size <WxH>              With --check: the frame size                              (1920x1080)
+          --no-vfg                  With --check: without the VFX SDK
+          --quality <mode>, --vfx-sdk <dir>   With --check: VFG's quality and SDK directory
+
         decode options:
           --frames <n>              Frames to read                          (the whole file; with --loop three laps)
           --duration-s <s>          Read for this long instead
@@ -299,15 +322,26 @@ internal static class CommandDispatcher
 
         capture options (device: /dev/videoN; default: the first capture device with a 10-bit mode, else the first one):
           --list                    List the capture devices: formats, sizes, rates, the presets each one can do
-          --mode <preset>           4k30-hdr (3840x2160 P010 at 30, HDR10: the Elgato 4K X's 10-bit 4K mode; generate to
-                                    60), 1440p60-hdr (2560x1440 P010 at 60, HDR10: for 60 fps games; to 120), 4k60-sdr,
-                                    1440p60-sdr, 1440p120-sdr, 1080p60-sdr, 1080p120-sdr (NV12, SDR)
+          --mode <preset>           4k30-hdr (3840x2160 P010 at 30: the Elgato 4K X's 10-bit 4K mode; generate to 60),
+                                    1440p60-hdr (2560x1440 P010 at 60: for 60 fps games; to 120), both HDR10 or SDR as
+                                    the console sends (--hdr follow); 4k60-sdr, 1440p60-sdr, 1440p120-sdr, 1080p60-sdr,
+                                    1080p120-sdr (NV12, SDR)
                                     Without --mode or the three below: the largest 10-bit mode, at its highest rate
           --size <WxH>              Capture size (must be one the device offers)
           --fps <rate>              Capture rate: 30, 60, 59.94 ... (59.94 and 60 differ)        (the highest offered)
           --format <nv12|p010|yuyv> Pixel format (MJPEG is never used: its decode adds latency)  (P010 first)
-          --hdr <on|off|auto|10bit> HDR10 (PQ, BT.2020): on, off, auto (as the device reports it), or 10bit (on for a
-                                    10-bit capture: the Elgato 4K X reports Rec. 709 even for a PQ signal)  (10bit)
+          --hdr <mode>              HDR10 (PQ, BT.2020, limited range, BT.2020 matrix) or SDR (BT.709): follow (a P010
+                                    capture follows the console: HDR10 while the samples carry 10 bits, SDR while they
+                                    carry 8, as a PS5 sends SDR; the Elgato 4K X reports Rec. 709 whatever it gets), on,
+                                    off, auto (as the device reports it), 10bit (on for any 10-bit capture)  (follow)
+                                    In the window: H switches between SDR and HDR10 by hand (stops following; the output
+                                    follows within a few frames), A follows the signal again
+          --hdr-peak-nits <n>       HDR10 metadata sent with the picture (the card carries none): mastering peak, and
+                                    MaxCLL unless given. Best set to the peak the PS5's HDR calibration was done for
+                                    (the display's). KWin shows a PQ window's 203 nits at the output's SDR brightness
+                                    and compresses above its peak (docs/benchmarks/phase7-hdr.md)        (1000)
+          --hdr-max-cll <n>         MaxCLL sent                                                  (the peak)
+          --hdr-max-fall <n>        MaxFALL sent (0: not stated)                                 (0)
           --range <limited|full|auto>  YCbCr range override (a PS5 sends limited)                (auto: the device's)
           --matrix <bt709|bt2020|bt601|auto>  YCbCr matrix override               (auto: the device's; BT.2020 with HDR)
           --no-cadence              Every captured frame is new (no repeat detection)
@@ -335,7 +369,8 @@ internal static class CommandDispatcher
           --audio-offset-ms <n>     Trim on top of the measured latency, -200 to 500 ms: positive plays the sound later,
                                     for what the timestamps cannot see (the TV's processing, the card itself)     (0)
                                     Diagnostics: FMP_AUDIO_LOG=<s> prints the delay, its target, the ratio and the learned
-                                    clock drift every s seconds on stderr.
+                                    clock drift every s seconds on stderr; FMP_CAPTURE_SWITCH_EVERY_S=<s> switches between
+                                    SDR and HDR10 every s seconds as H does (to exercise the switch).
                                     Prints what it negotiated (and what the driver changed), the colour it resolved and
                                     why, the buffer mode, then the play summary plus capture statistics: frames dequeued,
                                     skipped as stale (newest wins), dropped by the driver, unique, repeats dropped, dropped

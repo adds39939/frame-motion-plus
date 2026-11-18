@@ -73,7 +73,10 @@ public class OffscreenPresentTests
         var rect = ContentRect.Fit(ringWidth, ringHeight, targetWidth, targetHeight);
         Gpu.WriteLine($"content rect {rect}");
         var max = format == PixelFormat.Rgb10A2 ? 1023 : 255;
-        var tolerance = format == PixelFormat.Rgb10A2 ? 4 : 2;
+
+        // 10-bit is PQ: filtered in linear light (the reference does the same in double precision); 8-bit SDR by the
+        // hardware filter on code values (its 8-bit weights: 2 codes).
+        var tolerance = format == PixelFormat.Rgb10A2 ? 1 : 2;
         var worst = 0.0;
         for (var y = 0; y < targetHeight; y++)
         {
@@ -362,10 +365,11 @@ public class OffscreenPresentTests
         rig.WriteAndPresent(TestPattern.Ramp, 2);
         Assert.Equal(TestPatterns.Pixel(TestPattern.Ramp, PixelFormat.Rgb10A2, 1279, 719, 1280, 720, 2), rig.ReadPixels()[^1]);
 
-        // An SDR output colour for 10-bit content selects the placeholder on an SDR image.
+        // 10-bit content in an SDR colour (a P010 capture of an SDR signal) goes to an SDR image as it is.
         rig.Configure(1280, 720, PixelFormat.Rgb10A2, ColorMetadata.SdrBt709);
         Assert.Equal(2, rig.Presenter.RingGeneration);
-        Assert.Equal(OutputTransform.PqToSdrPlaceholder, rig.Presenter.ActiveTransform);
+        Assert.Equal(TargetColorSpace.Sdr, rig.Target.ColorSpace);
+        Assert.Equal(OutputTransform.Passthrough, rig.Presenter.ActiveTransform);
         rig.WriteAndPresent(TestPattern.Ramp, 3);
 
         rig.Configure(640, 360, PixelFormat.Rgb10A2);
@@ -413,7 +417,14 @@ public class OffscreenPresentTests
         return (int)Math.Round(Math.Pow((c1 + (c2 * y)) / (1 + (c3 * y)), m2) * 1023);
     }
 
-    private static double PqToNits(double e)
+    internal static double NitsToPq(double nits)
+    {
+        const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
+        var y = Math.Pow(Math.Max(nits, 0) / 10000, m1);
+        return Math.Pow((c1 + (c2 * y)) / (1 + (c3 * y)), m2);
+    }
+
+    internal static double PqToNits(double e)
     {
         const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
         var p = Math.Pow(e, 1 / m2);
@@ -422,9 +433,13 @@ public class OffscreenPresentTests
 
     private static double SrgbEncode(double l) => l <= 0.0031308 ? l * 12.92 : (1.055 * Math.Pow(l, 1 / 2.4)) - 0.055;
 
-    /// <summary>The Smooth pattern sampled bilinearly at target pixel (x, y), as the presenter's mapping defines it.</summary>
+    /// <summary>
+    /// The Smooth pattern sampled bilinearly at target pixel (x, y), as the presenter's mapping defines it: on the code
+    /// values for 8-bit SDR, in linear light for 10-bit PQ (decoded, weighted, encoded).
+    /// </summary>
     private static (double R, double G, double B) Bilinear(PixelFormat format, int w, int h, ContentRect rect, int x, int y)
     {
+        var pq = format == PixelFormat.Rgb10A2;
         var sx = ((x + 0.5 - rect.X) / rect.Width * w) - 0.5;
         var sy = ((y + 0.5 - rect.Y) / rect.Height * h) - 0.5;
         var x0 = (int)Math.Floor(sx);
@@ -441,7 +456,13 @@ public class OffscreenPresentTests
         var p10 = At(x0 + 1, y0);
         var p01 = At(x0, y0 + 1);
         var p11 = At(x0 + 1, y0 + 1);
-        double Mix(double a, double b, double c, double d) => ((a * (1 - fx)) + (b * fx)) * (1 - fy) + (((c * (1 - fx)) + (d * fx)) * fy);
+        double Lin(double code) => pq ? PqToNits(code / 1023.0) : code;
+        double Mix(double a, double b, double c, double d)
+        {
+            var l = ((Lin(a) * (1 - fx)) + (Lin(b) * fx)) * (1 - fy) + (((Lin(c) * (1 - fx)) + (Lin(d) * fx)) * fy);
+            return pq ? NitsToPq(l) * 1023 : l;
+        }
+
         return (Mix(p00.Item1, p10.Item1, p01.Item1, p11.Item1), Mix(p00.Item2, p10.Item2, p01.Item2, p11.Item2), Mix(p00.Item3, p10.Item3, p01.Item3, p11.Item3));
     }
 }
