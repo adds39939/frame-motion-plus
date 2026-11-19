@@ -146,7 +146,7 @@ internal static class CommandDispatcher
           fmp settings path         The file's path
           fmp settings set <key> <value>   Check and save one value (creates the file; other keys are kept; atomic)
           fmp settings unset <key>  Remove one value (the default applies again)
-          keys: capture.device (/dev/videoN), capture.mode (--mode), generator.backend (--generator), generator.quality
+          keys: capture.device (/dev/videoN), capture.mode (--mode), capture.fps (--capture-fps), generator.backend (--generator), generator.quality
           (--quality), generator.multiplier (--multiplier), generator.qualitySwitch (true: --quality-switch, false:
           --no-quality-switch), display.clock (--clock), display.fullscreen (true: --fullscreen,
           false: a window), display.window (WxH: the window's size when windowed; unlike --window it does not choose a window),
@@ -357,11 +357,16 @@ internal static class CommandDispatcher
         capture options (device: /dev/videoN; default: the saved capture.device, else the first capture device with a 10-bit
         mode, else the first one):
           --list                    List the capture devices: formats, sizes, rates, the presets each one can do
-          --mode <preset>           4k30-hdr (3840x2160 P010 at 30: the Elgato 4K X's 10-bit 4K mode; generate to 60),
-                                    1440p60-hdr (2560x1440 P010 at 60: for 60 fps games; to 120), both HDR10 or SDR as
-                                    the console sends (--hdr follow); 4k60-sdr, 1440p60-sdr, 1440p120-sdr, 1080p60-sdr,
-                                    1080p120-sdr (NV12, SDR)
+          --mode <preset>           4k30-hdr (3840x2160 P010 at 29.97: the Elgato 4K X's 10-bit 4K mode; generate to 59.94),
+                                    1440p60-hdr (2560x1440 P010 at 59.94: for 60 fps games; to 119.88), both HDR10 or SDR
+                                    as the console sends (--hdr follow); 4k60-sdr, 1440p60-sdr, 1080p60-sdr (NV12, SDR, at
+                                    59.94); 1440p120-sdr, 1080p120-sdr (NV12, SDR, at 120: the card offers no 119.88)
                                     Without --mode or the three below: the largest 10-bit mode, at its highest rate
+          --capture-fps <rate>      The rate asked of the card, exactly: 29.97, 30, 59.94, 60 or a fraction (30000/1001)
+                                    (the preset's: the console's 29.97 or 59.94, as a PS5 sends 59.94 Hz; a card at 30.000
+                                    repeats a frame every 33 s, which shows as a hitch). 30 or 60 for a source that sends
+                                    60.000 Hz (a PC). The summary says when the repeats show a periodic beat and which rate
+                                    the source looks like
           --size <WxH>              Capture size (must be one the device offers)
           --fps <rate>              Capture rate: 30, 60, 59.94 ... (59.94 and 60 differ)        (the highest offered)
           --format <nv12|p010|yuyv> Pixel format (MJPEG is never used: its decode adds latency)  (P010 first)

@@ -125,6 +125,7 @@ internal static class PlayCommand
                 WrapGenerator = fault,
                 OnQualitySwitch = PlayPrinter.QualityNotices(output),
                 OnQualityNotice = PlayPrinter.QualityIgnored(output),
+                OnVrrFollow = PlayPrinter.VrrFollowNotices(error),
             };
             using (var session = new PlaybackSession(playback, cuda, hooks, validationEcho: options.Validate ? error : null))
             {

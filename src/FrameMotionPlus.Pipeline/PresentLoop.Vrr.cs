@@ -216,6 +216,9 @@ internal sealed partial class PresentLoop
                         miss = MissKind.Early;
                         Volatile.Write(ref _earlyShows, _earlyShows + 1);
                     }
+
+                    // Whether the display still follows the presents (episodes where it showed on its grid instead).
+                    _vrrFollow?.OnShown(handover, shownNs, _grid.PeriodNs, deviation > half);
                 }
 
                 if (shownNs > handover)

@@ -676,6 +676,22 @@ playback audio is left for later and Remote Play is left out entirely (both are 
 - **Still open in Phase 9:** direct display mode and its two gates (needs the owner at a text
   console), a graphical settings window, and the items listed as not done in the results document.
 
+- **Capture at the console's rate (2026-11-19, `docs/benchmarks/phase6-pacing.md`, last sections):**
+  the app asked the card for exactly 30 or 60 fps while a PS5 sends 59.94 Hz, so the card repeated a
+  frame every 33 s (17 s at 60): a 58 ms gap between new images, a late show and two skipped
+  generated slots each time, and about two thirds of the skips in the two-hour session. The 30 and
+  60 presets now ask for 30000/1001 and 60000/1001 (falling back to the whole rate where a device
+  has none); `--capture-fps` and `capture.fps` override, and a detector reports a periodic repeat
+  with the rate to use. Measured on the TV: no repeats, none late, largest interval 34 ms, latency
+  unchanged. The card does not lock to its input (its clock runs about 15 ppm fast), so a repeat
+  about every 35 minutes should remain (predicted).
+- **Variable refresh lost mid-run is detected and reported** (summary, stderr, `fmp verify --vrr`).
+  The owner's two 120 s runs with and without a Discord share were the same, so the share is not
+  what made 7.6% of the two-hour session's slots late. One loss was reproduced by accident (a file
+  fullscreen on DP-3: lost 2.6 s in, never back, 2,242 of 2,278 slots late), which is that session's
+  signature; what triggers it is not established. Falling back to fixed-refresh timing during a
+  loss is designed, not built.
+
 ### Phase 10: Windows portability
 
 *Design doc: milestone 7.* **Left for now by the owner on 2026-11-18** (listed under "Deferred"). The

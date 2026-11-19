@@ -58,6 +58,7 @@ internal static class UserSettings
     [
         new("capture.device", "(device)", SettingKind.Text, true, "the first capture device with a 10-bit mode", s => s.Capture.Device),
         new("capture.mode", "--mode", SettingKind.Text, true, "the device's largest 10-bit mode", s => s.Capture.Mode),
+        new("capture.fps", "--capture-fps", SettingKind.Text, true, "the mode's: 29.97 or 59.94 for the 30 and 60 fps presets", s => s.Capture.Fps),
         new("generator.backend", "--generator", SettingKind.Text, false, "auto", s => s.Generator.Backend),
         new("generator.quality", "--quality", SettingKind.Text, false, "medium", s => s.Generator.Quality.ToString().ToLowerInvariant()),
         new("generator.multiplier", "--multiplier", SettingKind.Integer, false, "2", s => s.Generator.Multiplier?.ToString(Ic)),
@@ -306,6 +307,18 @@ internal static class UserSettings
             else
             {
                 Use("capture.mode", "--mode", mode);
+            }
+        }
+
+        if (capture && Value("capture.fps") is { } fps)
+        {
+            if (Any("capture-fps", "fps"))
+            {
+                Skip("capture.fps", "--capture-fps/--fps given");
+            }
+            else
+            {
+                Use("capture.fps", "--capture-fps", fps);
             }
         }
 

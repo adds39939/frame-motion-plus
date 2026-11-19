@@ -2,6 +2,7 @@ using System.Globalization;
 using FrameMotionPlus.App.Play;
 using FrameMotionPlus.Audio;
 using FrameMotionPlus.Core.Scheduling;
+using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Cuda;
 using FrameMotionPlus.Cuda.Kernels;
 using FrameMotionPlus.Pipeline;
@@ -151,7 +152,7 @@ internal static class CapturePrinter
             $"warm-up {playback.WarmupNs / 1e9:0.#} s{(playback.DurationNs > 0 ? $", duration {playback.DurationNs / 1e9:0.###} s" : ", until stopped")}"));
         if (f.Format == CapturePixelFormat.P010 && f.Height >= 2160 && f.Interval.Fps < 31)
         {
-            o.WriteLine("  note        2160p P010 at 30: the card itself takes 30 of the console's 60 Hz; a game running at 60 loses every other frame " +
+            o.WriteLine("  note        2160p P010 at 29.97 or 30: the card itself takes every other frame of the console's 59.94 Hz; a game running at 60 loses every other frame " +
                 "before the app sees it. For 60 fps games use --mode 1440p60-hdr.");
         }
 
@@ -184,7 +185,62 @@ internal static class CapturePrinter
             o.WriteLine($"  capture th  {thread}");
         }
 
+        o.WriteLine(RateLine(c));
         PrintColor(o, r, c);
+    }
+
+    /// <summary>
+    /// The summary's capture-rate line: the rate asked for and set (exact), the repeats one longer than the content's steady
+    /// cadence and the frames left out, their period when periodic, and what that says about the source.
+    /// </summary>
+    public static string RateLine(CaptureSummary c)
+    {
+        var b = c.Beat;
+        var rates = string.Create(Ic, $"  capture fps asked {Exact(c.AskedRate)}, set {Exact(c.NegotiatedRate)}; ");
+        var events = string.Create(Ic, $"extra repeats (one more than the content's steady cadence) {b.ExtraRepeats}, frames left out {b.Skips}");
+        if (!b.IsPeriodic)
+        {
+            return rates + events + "; no periodic beat (the card's rate and the source's agree, or the content hides it)";
+        }
+
+        var what = b.Kind == BeatKind.Repeats ? "a repeat" : "a frame left out";
+        var line = rates + events + string.Create(Ic, $"; periodic: {what} every {b.PeriodNs / 1e9:0.00} s ({b.PeriodicEvents} in a row agree), the source about {b.ImpliedSourceHz:0.000} Hz");
+        return line + "; " + Advice(b, c.OfferedRates);
+    }
+
+    /// <summary>What to do about a periodic beat: the --capture-fps that matches the source, if the device offers it.</summary>
+    public static string Advice(RepeatBeat b, IReadOnlyList<FrameRate> offered)
+    {
+        if (!b.Suggested.IsValid)
+        {
+            return "it matches no whole or NTSC rate next to the capture's (something in the content, not the clocks?)";
+        }
+
+        var text = RepeatBeat.RateText(b.Suggested);
+        return offered.Contains(b.Suggested)
+            ? $"the source looks like {text} Hz: use --capture-fps {text}"
+            : $"the source looks like {text} Hz, which the card does not offer at this size and format: the beat stays";
+    }
+
+    private static string Exact(FrameRate rate) => !rate.IsValid ? "the highest offered"
+        : rate.Denominator == 1 ? string.Create(Ic, $"{rate.Numerator} fps")
+        : string.Create(Ic, $"{rate.Hz:0.###} fps ({rate.Numerator}/{rate.Denominator}, {1e3 / rate.Hz:0.0000} ms)");
+
+    /// <summary>
+    /// fmp capture: one stderr line when the capture's repeats show a periodic beat, from text made at start (the control
+    /// thread allocates nothing).
+    /// </summary>
+    public static Action<RepeatBeat> BeatNotices(TextWriter error, FrameRate asked, IReadOnlyList<FrameRate> offered, bool forced)
+    {
+        var sibling = asked.Denominator == 1 ? new FrameRate(asked.Numerator * 1000, 1001)
+            : asked.Denominator == 1001 && asked.Numerator % 1000 == 0 ? new FrameRate(asked.Numerator / 1000, 1) : default;
+        var askedText = asked.IsValid ? RepeatBeat.RateText(asked) : "?";
+        var match = sibling.IsValid
+            ? $"fmp: capture: the card {(sibling.Hz < asked.Hz ? "repeats a frame" : "leaves a frame out")} periodically at {askedText} fps: " +
+              Advice(new RepeatBeat { Suggested = sibling }, offered) + (forced ? " (--capture-fps chose " + askedText + ")" : "")
+            : "";
+        var other = $"fmp: capture: a periodic repeat at {askedText} fps that matches no rate next to it (the summary has its period)";
+        return b => error.WriteLine(b.Suggested.IsValid && b.Suggested == sibling ? match : other);
     }
 
     /// <summary>The colour lines of the summary: what the frames were at the end, the switches, the output.</summary>

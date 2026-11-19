@@ -55,6 +55,7 @@ public sealed class FmpSettings
         {
             SettingsRules.NotBlank(errors, "capture.device", Capture.Device);
             SettingsRules.NotBlank(errors, "capture.mode", Capture.Mode);
+            SettingsRules.NotBlank(errors, "capture.fps", Capture.Fps);
             SettingsRules.NotBlank(errors, "audio.mode", Audio.Mode);
             SettingsRules.NotBlank(errors, "audio.sink", Audio.Sink);
             SettingsRules.NotBlank(errors, "audio.source", Audio.Source);
@@ -396,6 +397,9 @@ public sealed class CaptureSettings
 
     /// <summary>A <c>--mode</c> preset such as 4k30-hdr.</summary>
     public string? Mode { get; set; }
+
+    /// <summary><c>--capture-fps</c>: the rate asked of the card (30, 29.97, 60, 59.94; exact).</summary>
+    public string? Fps { get; set; }
 }
 
 /// <summary><c>fmp capture</c>'s sound. Null: not set. Values are checked as the command line checks them.</summary>

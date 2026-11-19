@@ -885,6 +885,9 @@ public sealed class PlaybackSession : IDisposable
     /// <summary>The most the latch sweep before playback may take.</summary>
     private const long LatchSweepNs = 1_500 * Nanoseconds.PerMillisecond;
 
+    /// <summary>Variable refresh lost: at most one "lost" line this often (the summary counts every episode).</summary>
+    private const long FollowNoticeIntervalNs = 10 * Nanoseconds.PerSecond;
+
     /// <summary>The most the variable-refresh probe before playback may take (about 24 presents).</summary>
     private const long VrrProbeNs = 600 * Nanoseconds.PerMillisecond;
 
@@ -1015,6 +1018,12 @@ public sealed class PlaybackSession : IDisposable
         var measuring = false;
         var audioVersion = 0L;
         var colorSwitches = 0L;
+        var followVersion = 0L;
+        var followNoticeAt = long.MinValue / 2;
+        var lostSaid = false;
+        var beatVersion = 0L;
+        var beatSaid = BeatKind.None;
+        var beatSuggested = default(FrameRate);
         while (true)
         {
             meter.Tick();
@@ -1063,6 +1072,38 @@ public sealed class PlaybackSession : IDisposable
                 if (log.Length > 0)
                 {
                     onSwitch(log[^1]);
+                }
+            }
+
+            if (_hooks.OnVrrFollow is { } onFollow && _presentLoop!.VrrFollow is { } follow && follow.Version != followVersion)
+            {
+                // Variable refresh lost or back (rare): one line each way, at most one "lost" every 10 s while it flaps.
+                followVersion = follow.Version;
+                var now = Monotonic.NowNs;
+                if (follow.IsLost && !lostSaid && now - followNoticeAt >= FollowNoticeIntervalNs)
+                {
+                    lostSaid = true;
+                    followNoticeAt = now;
+                    onFollow(new VrrFollowNotice(true, follow.Episodes, 0));
+                }
+                else if (!follow.IsLost && lostSaid)
+                {
+                    lostSaid = false;
+                    onFollow(new VrrFollowNotice(false, follow.Episodes, follow.LastDurationNs));
+                }
+            }
+
+            if (OperatingSystem.IsLinux() && _hooks.OnCaptureBeat is { } onBeat && _source is CapturePlaybackSource beaten
+                && beaten.Source.Beat.Version != beatVersion)
+            {
+                // A periodic beat between the card's rate and the source's (seen once or twice a run).
+                beatVersion = beaten.Source.Beat.Version;
+                var beat = beaten.Source.Beat.Snapshot;
+                if (beat.IsPeriodic && (beat.Kind != beatSaid || beat.Suggested != beatSuggested))
+                {
+                    beatSaid = beat.Kind;
+                    beatSuggested = beat.Suggested;
+                    onBeat(beat);
                 }
             }
 
@@ -1273,6 +1314,8 @@ public sealed class PlaybackSession : IDisposable
             report.PresentRefusals = pl.Refusals;
             report.LateShows = pl.LateShows;
             report.CompositorCatchUps = pl.CompositorCatchUps;
+            report.VrrFollow = pl.VrrFollow?.Finish(Monotonic.NowNs);
+            report.PlaybackStartNs = _pacing?.PlaybackStartNs is { } started && started != long.MinValue ? started : 0;
             pl.CopyLeadChanges(report.LeadChanges);
             report.OwnCatchUps = pl.OwnCatchUps;
             report.MaxPresentsInFlight = Math.Max(pl.MaxInFlight, s.MaxPresentsInFlight);

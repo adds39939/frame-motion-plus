@@ -70,6 +70,11 @@ internal static class VerifyCommand
             $"  refreshes   {result.Gaps.Count} interval(s) of two refreshes or more ({result.Gaps.Sum(g => g.Refreshes)} refresh(es) without a new present), {result.UnexplainedRefreshes} unexplained"));
         output.WriteLine($"  live        {result.Disagreements} slot(s) where the live accounting disagrees");
         output.WriteLine(Lateness(rows, result, from));
+        if (vrr)
+        {
+            output.WriteLine(Play.PlayPrinter.VrrFollowLine(Follow(rows, period, from), first));
+        }
+
         if (result.Slots.Count > 0)
         {
             output.WriteLine($"  findings    {result.Describe(24)}");
@@ -90,6 +95,26 @@ internal static class VerifyCommand
 
         output.WriteLine(result.Clean ? "  verdict     PASS" : "  verdict     FAIL");
         return result.Clean ? CommandDispatcher.ExitOk : CommandDispatcher.ExitCheckFailed;
+    }
+
+    /// <summary>
+    /// Under variable refresh: the episodes where the display stopped following the presents, from the CSV alone (each
+    /// slot's hand-over and first pixel, as the live detector judges them). The delay it followed with is the 10th
+    /// percentile of hand-over to first pixel over the run (kept within 0.3 to 2 ms).
+    /// </summary>
+    internal static VrrFollowSummary Follow(IReadOnlyList<VerifierRow> rows, long periodNs, long from)
+    {
+        var shows = rows.Where(r => r.Slot >= 0 && r.Kind is VerifierKind.Real or VerifierKind.Generated && r.TargetNs >= from && r.ActualNs > 0 && r.SubmitNs > 0)
+            .OrderBy(r => r.Slot).ToList();
+        var delays = shows.Select(r => r.ActualNs - r.SubmitNs).Where(d => d > 0).Order().ToList();
+        var follow = delays.Count == 0 ? 750_000 : Math.Clamp(delays[delays.Count / 10], 300_000, 2_000_000);
+        var detector = new VrrFollowDetector(follow);
+        foreach (var r in shows)
+        {
+            detector.OnShown(r.SubmitNs, r.ActualNs, periodNs, r.ActualNs - r.TargetNs > periodNs / 2);
+        }
+
+        return detector.Finish(shows.Count > 0 ? shows[^1].ActualNs : 0);
     }
 
     /// <summary>

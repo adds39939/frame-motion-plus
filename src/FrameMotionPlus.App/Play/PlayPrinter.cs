@@ -150,6 +150,11 @@ internal static class PlayPrinter
             $"{s.MissCount(MissKind.Discarded)}; during a refresh-rate change {s.RateChangeMisses}; unjudged {s.UnjudgedSlots}; refreshes without a new present " +
             $"{s.RefreshesWithoutPresent}; late shows {r.LateShows}: the refresh given back by the compositor {r.CompositorCatchUps}x, by the present thread {r.OwnCatchUps}x" +
             $"{(r.RefreshModeUsed == RefreshMode.Vrr ? $"; generated slots skipped (variable refresh: the next real frame came too late for them) {s.VrrSkippedSlots}" : "")}"));
+        if (r.VrrFollow is { } follow)
+        {
+            o.WriteLine(VrrFollowLine(follow, r.PlaybackStartNs));
+        }
+
         if (r.Verification is { } v)
         {
             o.WriteLine(string.Create(Ic,
@@ -470,6 +475,51 @@ internal static class PlayPrinter
             "  quality     >>> Q: NOT SWITCHED <<<  the generator's other instance is unusable; it stays where it was",
         ];
         return n => o.WriteLine(lines[!n.Switched ? 3 : n.Commit.To switch { FrameGenQuality.Low => 0, FrameGenQuality.High => 2, _ => 1 }]);
+    }
+
+    /// <summary>
+    /// The summary's line on the display following the presents under variable refresh: the episodes where it did not
+    /// (first pixels on the refresh grid, sustained), the late shows inside and outside them, and the first few episodes.
+    /// </summary>
+    public static string VrrFollowLine(Pipeline.VrrFollowSummary f, long startNs)
+    {
+        var episodes = f.Log.Count == 0 ? "" : "; " + string.Join(", ", f.Log.Take(6).Select(e => string.Create(Ic,
+            $"at {(startNs > 0 ? (e.StartNs - startNs) / 1e9 : e.StartNs / 1e9):0.0} s for {e.DurationNs / 1e9:0.0} s"))) + (f.Log.Count > 6 ? ", ..." : "");
+        return string.Create(Ic,
+            $"  follow      variable refresh {f.Describe()} (the display showing on its refresh grid instead of following the presents, " +
+            $"over {VrrFollowDetectorWindow} shows); late shows inside those {f.LateInside}, outside {f.LateOutside} (whole run){episodes}");
+    }
+
+    private const int VrrFollowDetectorWindow = Pipeline.VrrFollowDetector.Window;
+
+    /// <summary>
+    /// Under variable refresh, one stderr line when the display stops following the presents and one when it follows again,
+    /// from preformatted text and a reused buffer (the control thread allocates nothing).
+    /// </summary>
+    public static Action<Pipeline.VrrFollowNotice> VrrFollowNotices(TextWriter error)
+    {
+        const string Lost = "fmp: variable refresh lost: the display shows on its refresh grid, not when the presents come (an overlay, a notification or another window on that output?); slots may come late until it follows again";
+        const string Back = "fmp: variable refresh back after ";
+        var buffer = new char[160];
+        return n =>
+        {
+            if (n.Lost)
+            {
+                error.WriteLine(Lost);
+                return;
+            }
+
+            Back.AsSpan().CopyTo(buffer);
+            var at = Back.Length;
+            _ = (n.DurationNs / 1e9).TryFormat(buffer.AsSpan(at), out var written, "0.0", Ic);
+            at += written;
+            " s (episode ".AsSpan().CopyTo(buffer.AsSpan(at));
+            at += 12;
+            _ = n.Episodes.TryFormat(buffer.AsSpan(at), out written, default, Ic);
+            at += written;
+            buffer[at++] = ')';
+            error.WriteLine(buffer.AsSpan(0, at));
+        };
     }
 
     /// <summary>One "Q ignored" line (the session's text is made once at start).</summary>

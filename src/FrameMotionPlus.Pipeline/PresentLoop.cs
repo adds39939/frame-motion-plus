@@ -147,6 +147,7 @@ internal sealed partial class PresentLoop : IDisposable
     private bool _vrrRequested;
     private bool _vrr;
     private long _vrrLeadNs;
+    private VrrFollowDetector? _vrrFollow;
     private readonly long[] _vrrDelays = new long[256];
     private int _vrrDelayCount;
     private int _vrrDelayHead;
@@ -319,12 +320,17 @@ internal sealed partial class PresentLoop : IDisposable
     public void EnterVrr(long expectedDelayNs)
     {
         Volatile.Write(ref _vrrLeadNs, Math.Clamp(expectedDelayNs, 300 * Nanoseconds.PerMicrosecond, 2 * Nanoseconds.PerMillisecond));
+        Volatile.Write(ref _vrrFollow, new VrrFollowDetector(expectedDelayNs));
         Volatile.Write(ref _vrrRequested, true);
         _wake.Set();
     }
 
     /// <summary>Presenting for variable refresh (<see cref="EnterVrr"/> applied).</summary>
     public bool IsVrr => Volatile.Read(ref _vrr);
+
+    /// <summary>Under variable refresh: whether the display follows the presents, episodes where it did not (read the
+    /// volatile members from any thread; <see cref="VrrFollowDetector.Finish"/> once the present thread has stopped).</summary>
+    public VrrFollowDetector? VrrFollow => Volatile.Read(ref _vrrFollow);
 
     /// <summary>Late shows after which the compositor gave the refresh back itself (it discarded a queued present).</summary>
     public long CompositorCatchUps => Volatile.Read(ref _compositorCatchUps);

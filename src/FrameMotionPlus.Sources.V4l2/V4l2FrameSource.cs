@@ -78,6 +78,7 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
     private readonly CudaSpanTimerRing _convertSpans;
     private readonly SpscRing<SourceFrame> _queue;
     private readonly CadenceTracker _tracker;
+    private readonly RepeatBeatDetector _beat = null!;
     private readonly CadenceGrid _grid;
     private readonly int _eventFd = -1;
     private readonly bool _sourceChangeEvents;
@@ -195,6 +196,7 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
 
             var mode = CaptureFormats.Choose(description.Modes, options.Request);
             Format = CaptureNegotiation.Apply(_device, mode);
+            OfferedRates = CaptureFormats.RatesAt(description.Modes, mode.Format, mode.Width, mode.Height);
             Color = CaptureColorMapping.Resolve(Format.Colorspace, Format.XferFunc, Format.YcbcrEnc, Format.Quantization, Format.Height, Format.BitDepth, options.Color);
             (_hdrColor, _sdrColor) = CaptureColorMapping.ResolveBoth(Format.Colorspace, Format.XferFunc, Format.YcbcrEnc, Format.Quantization, Format.Height, Format.BitDepth, options.Color);
             _isPq = Color.FrameColor.Transfer == TransferFunction.Pq;
@@ -245,6 +247,7 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
             _tracker = new CadenceTracker(ReferenceEquals(options.CadenceOptions, CaptureSourceOptions.CaptureCadence)
                 ? CaptureSourceOptions.CadenceFor(Format)
                 : options.CadenceOptions);
+            _beat = new RepeatBeatDetector(Format.Rate);
 
             // Black: the brightest 4x4 cell no brighter than the black level plus two 8-bit codes (limited range: 16 or 64).
             var scale = 1L << (Format.BitDepth - 8);
@@ -327,6 +330,9 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
 
     /// <summary>Why the buffer modes tried before the one in use were refused.</summary>
     public IReadOnlyList<string> RefusedBufferModes => _buffers.Refused;
+
+    /// <summary>The rates the device offers at the negotiated format and size, exactly (29.97 as 30000/1001).</summary>
+    public IReadOnlyList<FrameRate> OfferedRates { get; } = [];
 
     public int BufferCount => _buffers.Count;
 
@@ -414,6 +420,9 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
 
     /// <summary>The cadence tracker (read it once the source has stopped).</summary>
     public CadenceTracker Cadence => _tracker;
+
+    /// <summary>The beat between the card's rate and the source's, from the repeats (any thread: <see cref="RepeatBeatDetector.Snapshot"/>).</summary>
+    public RepeatBeatDetector Beat => _beat;
 
     /// <summary>Test hook, dequeue thread: once per processed frame, inside the allocation-measured part.</summary>
     internal Action? PerFrameHook { get; set; }
@@ -991,6 +1000,7 @@ public sealed unsafe class V4l2FrameSource : IFrameSource
 
             var verdict = _tracker.Process(timestamp, metric, _isPq);
             MetricHook?.Invoke(timestamp, metric, verdict.IsUnique);
+            _beat.Add(timestamp, verdict.IsUnique);
             Volatile.Write(ref _detectedIntervalNs, _tracker.EstimatedIntervalNs);
             flags |= verdict.Ambiguous ? CaptureFrameEvents.Ambiguous : CaptureFrameEvents.None;
             if (!verdict.IsUnique)

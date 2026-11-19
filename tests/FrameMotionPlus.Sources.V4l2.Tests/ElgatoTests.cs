@@ -19,6 +19,8 @@ public class ElgatoTests
     [InlineData(3840, 2160, 30, CapturePixelFormat.P010)] // 4k30-hdr: the owner's target mode
     [InlineData(2560, 1440, 60, CapturePixelFormat.P010)] // 1440p60-hdr
     [InlineData(3840, 2160, 60, CapturePixelFormat.Nv12)] // 4k60-sdr
+    [InlineData(3840, 2160, 29.97, CapturePixelFormat.P010)] // 4k30-hdr since 2026-11-19: the console's rate
+    [InlineData(2560, 1440, 59.94, CapturePixelFormat.P010)] // 1440p60-hdr since 2026-11-19
     public void Each_target_mode_captures_the_console(int width, int height, double fps, CapturePixelFormat format)
     {
         var path = CaptureHardware.RequireElgato();
@@ -26,6 +28,11 @@ public class ElgatoTests
         using var source = new V4l2FrameSource(context, Capture.Options(path, width, height, fps, format));
         Assert.Equal((width, height, format), (source.Format.Width, source.Format.Height, source.Format.Format));
         Assert.Equal(fps, source.Format.Rate.Hz, 3);
+        if (fps != Math.Round(fps))
+        {
+            // The driver's interval in 100 ns units (333667/10000000) taken as the exact NTSC rate.
+            Assert.Equal(new Core.Time.FrameRate((long)Math.Round(fps * 1.001) * 1000, 1001), source.Format.Rate);
+        }
         Assert.Empty(source.Format.Changes);
         Assert.Equal(CaptureBufferMode.UserPtrPinned, source.BufferMode); // the card takes CUDA pinned memory as USERPTR
         source.Start();
@@ -66,5 +73,6 @@ public class ElgatoTests
         Assert.All(frames.Zip(frames.Skip(1)), p => Assert.True(p.Second.ContentTimeNs > p.First.ContentTimeNs));
         Assert.Equal(0, s.DequeueThreadAllocatedBytes);
         Assert.InRange(source.UploadGpu.Percentile(0.5), 1, 5_000_000);
+        Assert.Equal(BeatKind.None, source.Beat.Snapshot.Kind); // 4 s: too short for a beat (33 s at 30.000 with a PS5)
     }
 }

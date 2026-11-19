@@ -164,11 +164,14 @@ internal static class CaptureCommand
                 "  colour      now SDR (BT.709): the signal's samples now carry 8 bits",
                 "  colour      now HDR10 (PQ, BT.2020): the signal's samples now carry 10 bits",
             ];
+            Action<RepeatBeat>? beatNotice = null;
             var hooks = new PlaybackHooks
             {
                 OnColorSwitch = w => output.WriteLine(notices[(w.ToHdr ? 1 : 0) + (w.Cause == ColorSwitchCause.Manual ? 0 : 2)]),
                 OnQualitySwitch = PlayPrinter.QualityNotices(output),
                 OnQualityNotice = PlayPrinter.QualityIgnored(output),
+                OnVrrFollow = PlayPrinter.VrrFollowNotices(error),
+                OnCaptureBeat = beat => beatNotice?.Invoke(beat),
             };
             using (var session = new PlaybackSession(playback, cuda, hooks, validationEcho: options.Validate ? error : null))
             {
@@ -200,6 +203,11 @@ internal static class CaptureCommand
                     error.WriteLine($"fmp: capture: {e.Message}");
                     Blame();
                     return CommandDispatcher.ExitCheckFailed;
+                }
+
+                if (session.PlaybackSource is CapturePlaybackSource opened)
+                {
+                    beatNotice = CapturePrinter.BeatNotices(error, opened.Source.Format.Rate, opened.Source.OfferedRates, options.CaptureRateForced);
                 }
 
                 CapturePrinter.PrintSetup(output, options, playback, setup, why, cuda);

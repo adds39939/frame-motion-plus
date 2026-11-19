@@ -254,7 +254,7 @@ public sealed class CaptureCliTests
         }
     }
 
-    /// <summary>The card, offscreen: 4K HDR 30 to 60 with the default generator (VFG when the SDK is there), a few seconds.</summary>
+    /// <summary>The card, offscreen: 4K HDR 29.97 to 59.94 with the default generator (VFG when the SDK is there), a few seconds.</summary>
     [Fact]
     [Trait(Category.Name, Category.Elgato)]
     public void An_offscreen_4k30_hdr_capture_of_the_console_runs_clean()
@@ -263,7 +263,8 @@ public sealed class CaptureCliTests
         CaptureHardware.RequireCuda();
         var (exit, output, err) = Run("capture", path, "--audio", "off", "--mode", "4k30-hdr", "--offscreen", "--duration-s", "4", "--warmup-s", "1");
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
-        Assert.Contains("negotiated  3840x2160 P010 @ 30 fps", output, StringComparison.Ordinal);
+        Assert.Contains("negotiated  3840x2160 P010 @ 29.97 fps", output, StringComparison.Ordinal); // the console's rate (2026-11-19)
+        Assert.Contains("capture fps asked 29.97 fps (30000/1001, 33.3667 ms), set 29.97 fps (30000/1001, 33.3667 ms)", output, StringComparison.Ordinal);
         Assert.Contains("frames Rgb10A2 PQ / BT.2020", output, StringComparison.Ordinal);
         Assert.Contains("following the console", output, StringComparison.Ordinal);
         Assert.Contains("HDR10 output for PQ content", output, StringComparison.Ordinal);
@@ -284,7 +285,7 @@ public sealed class CaptureCliTests
 
         var (exit, output, err) = Run("capture", path, "--audio", "off", "--mode", "1440p60-hdr", "--window", "640x360", "--duration-s", "3", "--warmup-s", "1");
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
-        Assert.Contains("negotiated  2560x1440 P010 @ 60 fps", output, StringComparison.Ordinal);
+        Assert.Contains("negotiated  2560x1440 P010 @ 59.94 fps", output, StringComparison.Ordinal); // the console's rate (2026-11-19)
         Assert.Contains("verdict     PASS", output, StringComparison.Ordinal);
     }
 

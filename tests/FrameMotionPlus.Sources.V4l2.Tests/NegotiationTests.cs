@@ -38,6 +38,21 @@ public class NegotiationTests
     }
 
     [Fact]
+    public void A_presets_console_rate_falls_back_to_the_whole_rate_where_the_device_has_no_ntsc_rate()
+    {
+        // 1920x1080 YUYV offers 60 and 30 only (as vivid and many cards do): a preset's 59.94 takes 60 there,
+        // a rate the user typed does not, and a size that has 59.94 keeps it.
+        var preset = new CaptureRequest { Width = 1920, Height = 1080, Fps = 60000.0 / 1001, FallbackFps = 60, Format = CapturePixelFormat.Yuyv };
+        Assert.Equal(Fps60, CaptureFormats.Choose(Elgato(), preset).Interval);
+
+        var typed = preset with { FallbackFps = 0 };
+        Assert.Contains("does not offer 59.94 fps", Assert.Throws<CaptureFormatException>(() => CaptureFormats.Choose(Elgato(), typed)).Message, StringComparison.Ordinal);
+
+        var offered = new CaptureRequest { Width = 2560, Height = 1440, Fps = 60000.0 / 1001, FallbackFps = 60, Format = CapturePixelFormat.P010 };
+        Assert.Equal(Fps5994, CaptureFormats.Choose(Elgato(), offered).Interval);
+    }
+
+    [Fact]
     public void Nothing_asked_for_takes_the_largest_10_bit_mode_at_its_highest_rate()
     {
         var mode = CaptureFormats.Choose(Elgato(), new CaptureRequest());
@@ -192,12 +207,12 @@ public class NegotiationTests
     {
         var o = CaptureOptions.Parse(["--mode", "4k30-hdr"]);
         Assert.Null(o.Device);
-        Assert.Equal(new CaptureRequest { Width = 3840, Height = 2160, Fps = 30, Format = CapturePixelFormat.P010 }, o.Request);
+        Assert.Equal(new CaptureRequest { Width = 3840, Height = 2160, Fps = 30000.0 / 1001, FallbackFps = 30, Format = CapturePixelFormat.P010 }, o.Request); // the console's 29.97, else 30
         Assert.Equal(HdrMode.Follow, o.Color.Hdr);
 
         o = CaptureOptions.Parse(["/dev/video0", "--mode", "1440p60-hdr", "--multiplier", "2", "--duration-s", "5", "--offscreen"]);
         Assert.Equal("/dev/video0", o.Device);
-        Assert.Equal(60, o.Request.Fps);
+        Assert.Equal(60000.0 / 1001, o.Request.Fps);
         Assert.True(o.Offscreen);
 
         o = CaptureOptions.Parse(["--size", "2560x1440", "--fps", "120", "--format", "nv12", "--hdr", "off", "--range", "full", "--matrix", "bt709", "--no-cadence"]);

@@ -306,16 +306,28 @@ cost of upload, cadence and conversion) and the latency the generation adds agai
 
 ```sh
 fmp capture --list                                   # the capture devices and what each offers
-fmp capture --mode 4k30-hdr                          # the owner's target, lowest latency: 3840x2160 P010 at 30, HDR10 (or SDR
+fmp capture --mode 4k30-hdr                          # the owner's target, lowest latency: 3840x2160 P010 at 29.97, HDR10 (or SDR
                                                      # as the console sends), VFG to 60, fullscreen (the default) with
                                                      # variable refresh (on DP-3, 240 Hz)
 fmp capture --mode 4k30-hdr --hdr-peak-nits 1000     # the HDR10 metadata sent: set the peak the PS5's HDR calibration was for
 fmp capture --mode 4k30-hdr --windowed               # the same in a window (fixed refresh, the measured present lead)
-fmp capture --mode 1440p60-hdr                       # 2560x1440 P010 at 60, HDR10, VFG to 120 (60 fps games), variable refresh
+fmp capture --mode 1440p60-hdr                       # 2560x1440 P010 at 59.94, HDR10, VFG to 119.88 (60 fps games), variable refresh
+fmp capture --mode 4k30-hdr --capture-fps 30         # ask the card for 30.000 (a source that sends 60.000 Hz, a PC)
 fmp capture --mode 1440p60-hdr --multiplier 4        # a 30 fps game in that signal to 120
 fmp capture /dev/video0 --size 1920x1080 --fps 120 --format nv12 --hdr off   # any offered mode, SDR
 fmp capture --mode 4k30-hdr --duration-s 180 --csv capture.csv --frames-csv frames.csv   # timelines for fmp verify
 ```
+
+The presets ask the card for the console's own rates: 29.97 and 59.94 (exactly 30000/1001 and 60000/1001), as a PS5
+sends 59.94 Hz. A card set to 30.000 runs out of new frames once every 33 s and repeats one, which shows as a 58 ms hitch
+(at 60.000: every 17 s). `--capture-fps 30` or `60` (or `fmp settings set capture.fps 60`) asks for the whole rate, for
+a source that really sends 60.000 Hz. The summary's `capture fps` line says what was asked and set, the repeats one more
+than the content's steady cadence and the frames left out, and, when they come at a regular period, which rate the
+source looks like and the `--capture-fps` to use (also said once on stderr as soon as it is seen). The 120 fps presets
+stay at 120: the card offers no 119.88. Under variable refresh the summary's `follow` line says whether the display
+stopped following the presents mid-run (first pixels on its refresh grid for a second or more: an overlay, another
+window), for how long, and how many late shows fell inside those stretches; one stderr line marks each start and end, and
+`fmp verify <csv> --vrr` shows the same from the telemetry.
 
 The Elgato 4K X offers 10-bit P010 only up to 1440p60 and 2160p30 (it takes 30 of the console's 60 Hz itself in that
 mode), and reports Rec. 709 whatever the console sends. A P010 capture therefore starts as HDR10 (PQ, BT.2020 primaries,
@@ -355,7 +367,7 @@ Precedence: built-in defaults < the file < the command line: an option you type 
 such as `--size` against a saved mode, or `--audio off` against a saved sink) wins for that run. At the start both commands
 print one `settings` line naming the file and every value taken from it, and what was not used and why. A malformed file
 stops the command with one error naming the file and the line; a key this fmp does not know is reported and skipped. The
-keys are `capture.device`, `capture.mode`, `generator.backend`, `generator.quality`, `generator.multiplier`,
+keys are `capture.device`, `capture.mode`, `capture.fps` (`--capture-fps`), `generator.backend`, `generator.quality`, `generator.multiplier`,
 `generator.qualitySwitch` (true or false: `--quality-switch` / `--no-quality-switch`),
 `display.clock`, `display.fullscreen` (true or false), `display.window` (the window's size when windowed), `audio.mode`,
 `audio.sink`, `audio.source`, `audio.offsetMs`, `hdr.mode`, `hdr.peakNits`, `hdr.maxCll`, `hdr.maxFall` and

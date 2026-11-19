@@ -34,6 +34,12 @@ public sealed record CaptureRequest
     /// <summary>Frames per second (59.94 and 60 are different rates); 0: the highest offered at the chosen size.</summary>
     public double Fps { get; init; }
 
+    /// <summary>
+    /// The rate to take when the device does not offer <see cref="Fps"/> at the chosen size and format; 0: none (the request
+    /// fails). A preset asks for a console's 29.97 or 59.94 and falls back to 30 or 60 on a device that has only whole rates.
+    /// </summary>
+    public double FallbackFps { get; init; }
+
     /// <summary><see cref="CapturePixelFormat.Unknown"/>: P010 when offered (10-bit), else NV12, else YUYV.</summary>
     public CapturePixelFormat Format { get; init; }
 
@@ -88,9 +94,9 @@ public sealed record NegotiatedFormat
     /// <summary>Where the driver departed from the request, one line each (empty: as asked).</summary>
     public IReadOnlyList<string> Changes { get; init; } = [];
 
-    public FrameRate Rate => Interval.Numerator == 0 || Interval.Denominator == 0
-        ? default
-        : new FrameRate(Interval.Denominator, Interval.Numerator);
+    /// <summary>The rate set, exactly: a whole or NTSC rate (30000/1001) when the driver's interval is one rounded (see
+    /// <see cref="CaptureFormats.ExactRate"/>).</summary>
+    public FrameRate Rate => CaptureFormats.ExactRate(Interval);
 
     public int BitDepth => Format == CapturePixelFormat.P010 ? 10 : 8;
 
@@ -146,6 +152,44 @@ public static class CaptureFormats
     public static bool IsCompressed(uint fourCc) => fourCc is V4l2Defs.PixFmtMjpeg or V4l2Defs.PixFmtJpeg;
 
     /// <summary>
+    /// A frame interval as an exact rate. UVC states intervals in 100 ns units, so 29.97 fps arrives as 333667/10000000
+    /// and 30 as 333333/10000000: the whole rate, or the NTSC rate (n·1000/1001), whose period is within 100 ns of the
+    /// interval is the rate meant, taken exactly (the scheduler, the cadence and the summary then use 33.3667 ms, not a
+    /// rounded one). Any other interval is taken as it is. Invalid for a zero interval.
+    /// </summary>
+    public static FrameRate ExactRate(V4l2Interval interval)
+    {
+        if (interval.Numerator == 0 || interval.Denominator == 0)
+        {
+            return default;
+        }
+
+        var stated = new FrameRate(interval.Denominator, interval.Numerator);
+        var periodNs = stated.PeriodNs;
+        var whole = Math.Round(stated.Hz);
+        if (whole >= 1 && Math.Abs(FrameRate.FromHz((long)whole).PeriodNs - periodNs) <= 100)
+        {
+            return FrameRate.FromHz((long)whole);
+        }
+
+        var ntsc = Math.Round(stated.Hz * 1.001);
+        if (ntsc >= 1)
+        {
+            var rate = new FrameRate((long)ntsc * 1000, 1001);
+            if (Math.Abs(rate.PeriodNs - periodNs) <= 100)
+            {
+                return rate;
+            }
+        }
+
+        return stated;
+    }
+
+    /// <summary>The rates <paramref name="offered"/> has for one format and size, exactly (see <see cref="ExactRate"/>).</summary>
+    public static IReadOnlyList<FrameRate> RatesAt(IReadOnlyList<CaptureMode> offered, CapturePixelFormat format, int width, int height) =>
+        [.. offered.Where(m => m.Format == format && m.Width == width && m.Height == height).Select(m => ExactRate(m.Interval)).Distinct()];
+
+    /// <summary>
     /// Chooses the mode for <paramref name="request"/> from <paramref name="offered"/> (every uncompressed mode a device
     /// offers in a supported format). With nothing asked for: 10-bit first, then the largest size, then the highest rate.
     /// A size asked for must be offered exactly; a rate must be within 0.02% of one offered (so 59.94 and 60 stay apart).
@@ -182,6 +226,11 @@ public static class CaptureFormats
         {
             // 0.02%: a typed 59.94 matches 60000/1001, and 59.94 and 60 (0.1% apart) stay apart.
             var timed = candidates.Where(m => Math.Abs(m.Fps - request.Fps) <= request.Fps * 0.0002).ToList();
+            if (timed.Count == 0 && request.FallbackFps > 0)
+            {
+                timed = candidates.Where(m => Math.Abs(m.Fps - request.FallbackFps) <= request.FallbackFps * 0.0002).ToList();
+            }
+
             if (timed.Count == 0)
             {
                 throw new CaptureFormatException(string.Create(CultureInfo.InvariantCulture,

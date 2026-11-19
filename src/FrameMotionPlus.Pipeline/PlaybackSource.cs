@@ -217,6 +217,16 @@ public sealed record CaptureSummary
 
     public bool IsP010 { get; init; }
 
+    /// <summary>The rate the card was asked for and the one it set (exact), and the beat seen in its repeats.</summary>
+    public FrameRate AskedRate { get; init; }
+
+    public FrameRate NegotiatedRate { get; init; }
+
+    public RepeatBeat Beat { get; init; }
+
+    /// <summary>The rates the device offers at the negotiated format and size (exact).</summary>
+    public IReadOnlyList<FrameRate> OfferedRates { get; init; } = [];
+
     [SupportedOSPlatform("linux")]
     public static CaptureSummary From(V4l2FrameSource s)
     {
@@ -244,6 +254,10 @@ public sealed record CaptureSummary
             FirstTimestampNs = s.FirstTimestampNs,
             Depths = s.DepthCounts,
             IsP010 = s.Format.Format == CapturePixelFormat.P010,
+            AskedRate = CaptureFormats.ExactRate(s.Format.Requested.Interval),
+            NegotiatedRate = s.Format.Rate,
+            Beat = s.Beat.Snapshot,
+            OfferedRates = s.OfferedRates,
         };
     }
 }

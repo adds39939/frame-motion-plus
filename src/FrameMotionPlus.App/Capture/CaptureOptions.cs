@@ -10,19 +10,33 @@ using FrameMotionPlus.Sources.V4l2;
 namespace FrameMotionPlus.App.Capture;
 
 /// <summary>A named capture mode: what to ask the device for and the HDR decision that goes with it.</summary>
-internal sealed record CapturePreset(string Name, int Width, int Height, double Fps, CapturePixelFormat Format, HdrMode Hdr, string Note)
+/// <remarks>
+/// The 30 and 60 fps presets ask for the console's own rates, 29.97 and 59.94 (30000/1001 and 60000/1001): a PS5 sends
+/// 59.94 Hz, and a card set to 30.000 has no new frame once every 33.4 s (60.000: every 16.7 s) and sends a repeat, which
+/// the app drops and the picture holds for a frame (measured, docs/benchmarks/phase6-pacing.md, 2026-11-19).
+/// <c>--capture-fps 30</c> (or 60) asks for the whole rate, for a source that really sends 60.000 Hz (a PC). The 120 fps
+/// presets stay at 120: the card offers no 119.88.
+/// </remarks>
+internal sealed record CapturePreset(string Name, int Width, int Height, FrameRate Rate, CapturePixelFormat Format, HdrMode Hdr, string Note)
 {
+    /// <summary>The NTSC rates a console sends.</summary>
+    public static readonly FrameRate Ntsc30 = new(30000, 1001);
+
+    public static readonly FrameRate Ntsc60 = new(60000, 1001);
+
     /// <summary>The presets, the owner's target first (4K HDR, 30 to 60).</summary>
     public static readonly IReadOnlyList<CapturePreset> All =
     [
-        new("4k30-hdr", 3840, 2160, 30, CapturePixelFormat.P010, HdrMode.Follow, "3840x2160 P010 at 30 fps, HDR10 or SDR as the console sends (the Elgato 4K X's 10-bit 4K mode; generate to 60)"),
-        new("1440p60-hdr", 2560, 1440, 60, CapturePixelFormat.P010, HdrMode.Follow, "2560x1440 P010 at 60 fps, HDR10 or SDR as the console sends (for 60 fps games; generate to 120)"),
-        new("4k60-sdr", 3840, 2160, 60, CapturePixelFormat.Nv12, HdrMode.Off, "3840x2160 NV12 at 60 fps, SDR (8-bit)"),
-        new("1440p60-sdr", 2560, 1440, 60, CapturePixelFormat.Nv12, HdrMode.Off, "2560x1440 NV12 at 60 fps, SDR"),
-        new("1440p120-sdr", 2560, 1440, 120, CapturePixelFormat.Nv12, HdrMode.Off, "2560x1440 NV12 at 120 fps, SDR"),
-        new("1080p60-sdr", 1920, 1080, 60, CapturePixelFormat.Nv12, HdrMode.Off, "1920x1080 NV12 at 60 fps, SDR"),
-        new("1080p120-sdr", 1920, 1080, 120, CapturePixelFormat.Nv12, HdrMode.Off, "1920x1080 NV12 at 120 fps, SDR"),
+        new("4k30-hdr", 3840, 2160, Ntsc30, CapturePixelFormat.P010, HdrMode.Follow, "3840x2160 P010 at 29.97 fps, HDR10 or SDR as the console sends (the Elgato 4K X's 10-bit 4K mode; generate to 59.94)"),
+        new("1440p60-hdr", 2560, 1440, Ntsc60, CapturePixelFormat.P010, HdrMode.Follow, "2560x1440 P010 at 59.94 fps, HDR10 or SDR as the console sends (for 60 fps games; generate to 119.88)"),
+        new("4k60-sdr", 3840, 2160, Ntsc60, CapturePixelFormat.Nv12, HdrMode.Off, "3840x2160 NV12 at 59.94 fps, SDR (8-bit)"),
+        new("1440p60-sdr", 2560, 1440, Ntsc60, CapturePixelFormat.Nv12, HdrMode.Off, "2560x1440 NV12 at 59.94 fps, SDR"),
+        new("1440p120-sdr", 2560, 1440, FrameRate.FromHz(120), CapturePixelFormat.Nv12, HdrMode.Off, "2560x1440 NV12 at 120 fps, SDR (the card offers no 119.88: a console's 119.88 Hz repeats a frame every 8.3 s)"),
+        new("1080p60-sdr", 1920, 1080, Ntsc60, CapturePixelFormat.Nv12, HdrMode.Off, "1920x1080 NV12 at 59.94 fps, SDR"),
+        new("1080p120-sdr", 1920, 1080, FrameRate.FromHz(120), CapturePixelFormat.Nv12, HdrMode.Off, "1920x1080 NV12 at 120 fps, SDR (no 119.88 offered, as 1440p120)"),
     ];
+
+    public double Fps => Rate.Hz;
 
     public static CapturePreset Parse(string name) =>
         All.FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase))
@@ -52,6 +66,12 @@ internal sealed record CaptureOptions
     public CapturePreset? Preset { get; init; }
 
     public CaptureRequest Request { get; init; } = new();
+
+    /// <summary>The rate asked for, exactly (the preset's, --capture-fps or --fps); invalid: the device's highest.</summary>
+    public FrameRate CaptureRate { get; init; }
+
+    /// <summary>True when <c>--capture-fps</c> chose the rate (the beat's advice then says so).</summary>
+    public bool CaptureRateForced { get; init; }
 
     public CaptureColorOverrides Color { get; init; } = new();
 
@@ -138,16 +158,32 @@ internal sealed record CaptureOptions
         var list = r.Flag("list");
         var preset = r.String("mode") is { } mode ? CapturePreset.Parse(mode) : null;
         var (width, height) = Size(r, "size", 0, 0, 16, 16384);
-        var fps = r.Double("fps", 0, 1, 1000);
+        var fps = r.Has("fps") ? ParseCaptureFps(r, "fps") : default;
+        var captureFps = r.Has("capture-fps") ? ParseCaptureFps(r, "capture-fps") : default;
         var format = ParseFormat(r.String("format"));
-        if (preset is not null && (width > 0 || fps > 0 || format != CapturePixelFormat.Unknown))
+        if (preset is not null && (width > 0 || fps.IsValid || format != CapturePixelFormat.Unknown))
         {
             throw new UsageException("Give --mode, or --size/--fps/--format, not both.");
         }
 
+        if (fps.IsValid && captureFps.IsValid)
+        {
+            throw new UsageException("Give --fps or --capture-fps, not both (the same rate).");
+        }
+
+        // --capture-fps sets the rate of a preset (or, without --mode, is --fps): exact, 29.97 is 30000/1001.
+        var rate = captureFps.IsValid ? captureFps : preset?.Rate ?? fps;
         var request = preset is not null
-            ? new CaptureRequest { Width = preset.Width, Height = preset.Height, Fps = preset.Fps, Format = preset.Format }
-            : new CaptureRequest { Width = width, Height = height, Fps = fps, Format = format };
+            ? new CaptureRequest
+            {
+                Width = preset.Width,
+                Height = preset.Height,
+                Fps = rate.Hz,
+                // A preset's own 29.97 or 59.94 falls back to 30 or 60 on a device with whole rates only (a typed rate does not).
+                FallbackFps = captureFps.IsValid ? 0 : Math.Round(rate.Hz),
+                Format = preset.Format,
+            }
+            : new CaptureRequest { Width = width, Height = height, Fps = rate.IsValid ? rate.Hz : 0, Format = format };
         var hdrText = r.String("hdr");
         var hdr = hdrText is null ? preset?.Hdr ?? HdrMode.Follow : ParseHdr(hdrText);
         var peak = (int)r.Int64("hdr-peak-nits", ColorMetadata.DefaultPeakNits, 100, 10_000);
@@ -194,6 +230,8 @@ internal sealed record CaptureOptions
             List = list,
             Preset = preset,
             Request = request,
+            CaptureRate = rate,
+            CaptureRateForced = captureFps.IsValid,
             Color = new CaptureColorOverrides
             {
                 Hdr = hdr,
@@ -276,6 +314,15 @@ internal sealed record CaptureOptions
         CudaSync = CudaSync,
         Validate = Validate,
     };
+
+    /// <summary>A capture rate as <c>--capture-fps</c> and <c>--fps</c> take it: 30, 29.97, 60, 59.94, 30000/1001 (exact).</summary>
+    private static FrameRate ParseCaptureFps(ArgumentReader r, string name)
+    {
+        var text = r.String(name);
+        return FrameRate.TryParse(text, out var rate) && rate.Hz is >= 1 and <= 1000
+            ? rate
+            : throw new UsageException($"Option '--{name}' expects a rate in frames per second (1 to 1000: 30, 29.97, 60, 59.94 or a fraction such as 30000/1001), got '{text}'.");
+    }
 
     private static CapturePixelFormat ParseFormat(string? text) => text?.ToLowerInvariant() switch
     {

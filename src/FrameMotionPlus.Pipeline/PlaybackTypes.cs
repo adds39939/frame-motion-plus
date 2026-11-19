@@ -65,6 +65,14 @@ public sealed class PlaybackHooks
     /// <summary>Control thread: a capture changed between SDR and HDR10 (followed, or by hand); called once per change seen.</summary>
     public Action<Sources.V4l2.ColorSwitch>? OnColorSwitch { get; init; }
 
+    /// <summary>Control thread: under variable refresh, the display stopped following the presents or follows again
+    /// (<see cref="VrrFollowDetector"/>); rate-limited.</summary>
+    public Action<VrrFollowNotice>? OnVrrFollow { get; init; }
+
+    /// <summary>Control thread: a capture's repeats show a periodic beat between the card's rate and the source's (once
+    /// when it is first seen, again if it changes).</summary>
+    public Action<Sources.V4l2.RepeatBeat>? OnCaptureBeat { get; init; }
+
     /// <summary>Control thread: a quality switch the generator thread carried out (or refused); once per switch.</summary>
     public Action<QualitySwitchNotice>? OnQualitySwitch { get; init; }
 
@@ -80,6 +88,9 @@ public sealed class PlaybackHooks
     /// </summary>
     internal SimulatedCompositor? SimulatedDisplay { get; init; }
 }
+
+/// <summary>Variable refresh lost (<see cref="Lost"/>) or back, the episodes so far, and the one that ended's length (ns).</summary>
+public readonly record struct VrrFollowNotice(bool Lost, int Episodes, long DurationNs);
 
 /// <summary>What a session's source delivers (a file or a capture), in the terms every source shares.</summary>
 public readonly record struct SourceDescription
@@ -322,6 +333,12 @@ public sealed class PlaybackReport
 
     /// <summary>The variable-refresh probe before playback (fullscreen, or --clock vrr); null when not run.</summary>
     public VrrProbeResult? VrrProbe { get; set; }
+
+    /// <summary>Under variable refresh: episodes where the display stopped following the presents; null when not variable refresh.</summary>
+    public VrrFollowSummary? VrrFollow { get; set; }
+
+    /// <summary>When playback started (the pacing thread's clock, ns; 0 when it never did): times in the summary count from it.</summary>
+    public long PlaybackStartNs { get; set; }
 
     /// <summary>Auto chose fixed refresh although the display follows the presents: the output rate the source would have
     /// needed at the multiplier (fps; 0 when that was not why).</summary>

@@ -608,7 +608,7 @@ Priority by priority (the brief's order), then the backlogs.
    so the sweep then waits out its budget (`PresentLoop.Vrr.cs`, `SweepStep`); forced `--clock vrr` with the output's rate
    never known gives a half-period of 0 and could freeze the picture (`VrrTurn`, plausible, not reproduced); variable
    refresh never falls back to fixed mid-run if the display stops following the presents (it keeps presenting at the
-   slots' times); `SetFullscreen`'s result is ignored (`PlaybackSession`, the pre-roll), so a refused fullscreen goes
+   slots' times; *2026-11-19: now detected and reported, the fallback designed, not built: see the last section*); `SetFullscreen`'s result is ignored (`PlaybackSession`, the pre-roll), so a refused fullscreen goes
    unreported; `fmp` started as a background job from a non-interactive shell ignores SIGINT (the shell sets it to
    ignored; SIGTERM works). Untested by an automated test: at the end of a run a fullscreen window is now minimised
    before the teardown waits for the threads, so with stuck GPU work the desktop comes back at once instead of after
@@ -639,4 +639,211 @@ NativeAOT binary) was not chased; NativeAOT runs here allocate nothing on any th
 - `SimulatedDisplayTests.The_present_lead_starts_from_the_latch_measured_before_playback` asserts real-clock windows
   (latch 1.9 to 2.7 ms, lead 3.9 to 4.7 ms, no misses) and failed once when the whole solution's test assemblies
   ran at once; it passed 6 of 6 alone. This change does not reach it (it runs fixed refresh).
+
+
+## The capture rate and variable refresh lost (2026-11-19)
+
+Two findings from the owner's measurements of the day (`tv-share.*`, `tv-noshare.*` in the repository root: two 120 s
+runs of `fmp capture --mode 4k30-hdr --audio off`, fullscreen on HDMI-A-1, 119.88 Hz, variable refresh, with and
+without a Discord screen share), acted on in one time-boxed pass.
+
+### 1. The card repeated a frame every 33 s: it now captures at the console's rate
+
+**What the owner's runs showed.** Both runs: 3,609 captured → 3,605 unique, 4 repeats dropped (5 in the other); 3 to 4
+late shows, each alone, 8 to 12 ms late, at 20.08, 52.98, 85.85 and 118.65 s (32.80 to 32.90 s apart); "generated slots
+skipped 8"; intervals max 58.2 ms against a mean of 16.685. The app asked the card for 30.000 fps while a PS5 sends
+59.94 Hz: once every 1/(30.000 − 29.97) ≈ 33 s the card has no new frame and sends a duplicate, the app drops it, and the
+picture goes 58 ms without a new image. In the owner's two-hour session that is about 220 events (about 450 of its 767
+skipped generated slots).
+
+**What the card does** (with the console on, a 30 fps picture): it offers 29.970 and 59.940 beside 30.000 and 60.000 for
+these sizes (P010 2160p: 30 and 29.97; P010 1440p: 60, 59.94, 50, 30, 29.97; no 119.88 for the 120 and 144 modes). It
+**free-runs on its own crystal**: its frame period is 15 ppm short of nominal against CLOCK_MONOTONIC at every rate tried
+(−14.8 and −15.2 ppm at 30.000 in the owner's runs, −15.7 at 29.97, −15.0 at 59.94), so it does not lock to the input.
+The console's rate, from the beat at 30.000, is within a few ppm of CLOCK_MONOTONIC.
+
+| Run (offscreen unless said; the published scratch binary of this change for "new") | Repeats | Timestamps | Other |
+| --- | --- | --- | --- |
+| Owner, 30.000, 2160p P010, TV fullscreen VRR, 120 s (×2) | 4 and 5, periodic 32.8 to 32.9 s | mean 33.333 ms, sd 1.5 to 1.6 µs | 3 and 4 late shows; generated slots skipped 8; intervals sd 1.04 / 0.99 ms, max 58.2 ms; real frame 45.96 / 45.99 ms after its timestamp (p99 46.35 / 46.48) |
+| 29.97, 2160p P010, 300 s | **0** (2 black frames at the start) | mean 33.366 ms, sd 9.0 µs (a few ±0.2 ms delivery jitter pairs), card −15.7 ppm | — |
+| 59.94, 1440p P010, 240 s | **0 beat repeats**: 7,195 of 7,199 runs were the 30-in-60 cadence (one repeat each); one run of 2 at 79.9 s, two of 0 during two timestamp stretches (17.8 to 22.9 ms intervals at 140.8 and 214.3 s, the card's or the host's) | mean 16.685 ms, sd 80 µs (the stretches), card −15.0 ppm | — |
+| **New, `--mode 4k30-hdr` (now 29.97), TV fullscreen VRR, 120 s** | **0** | mean 33.366 ms, sd 25.7 µs, min 33.157, max 33.574 | **0 late shows, 0 missed** (verifier agrees); generated slots skipped 2; intervals sd **0.392 ms**, max **34.0 ms**; real frame **46.74 ms** (p99 47.23) after its timestamp; variable refresh chosen (probe 37 of 45 following); HDR10 with metadata; D 45.71 (hold 16.685 = T/2 exactly); 0 B on every thread, GC 0/0/0; PASS |
+
+So: **at 29.97 / 59.94 the periodic repeats are gone** from every run here (5 + 4 + 2 minutes). They are not gone
+forever: the card is about 16 ppm faster than the console, so it should still repeat a frame about every 1/(29.97 ×
+16 ppm) ≈ 35 min at 29.97 (17 min at 59.94); predicted from the measured clocks, not yet seen (no run that long was made,
+to keep the card free for the owner). In a two-hour session that is 3 or 4 instead of about 220. Latency: 46.74 ms
+against 45.96 / 45.99 in the owner's runs of the morning: +0.75 ms, all of it in the arrival lag (USB delivery p50 25.94
+against 25.40 ms; the offscreen 29.97 run measured 25.41), so run-to-run variation of the delivery, not the rate; Phase 6
+measured 46.6 ms for the same command. The two generated slots skipped came from timestamp jitter (one interval 34.0 ms).
+
+**Default: the console presets ask for the console's rate.** `4k30-hdr` 29.97 (30000/1001), `1440p60-hdr`, `4k60-sdr`,
+`1440p60-sdr`, `1080p60-sdr` 59.94 (60000/1001); the 120 fps presets stay at 120 (no 119.88 offered: a console at
+119.88 Hz repeats a frame every 8.3 s there, which the beat detector reports). Why not measure at start: the source's
+rate cannot be read from this card (UVC reports no input timing; the Elgato's own utility reads it through an
+undocumented extension unit), and telling 30.000 from 29.97 by the beat takes a minute or more; a PS5 always sends the
+NTSC rates.
+
+**A true 60.000 Hz source** (a PC, some devices) captured at 59.94: the card leaves one source frame out every 16.7 s (at
+29.97 of a 60.000 signal: every 33 s). That is a frame skipped, not a frame held: the motion jumps one frame; it does not
+make a 58 ms gap (no repeat reaches the app). When the content repeats (a 30 fps picture in the 60 Hz signal), the beat
+detector sees it as a run of repeats one shorter than the steady cadence and reports "frames left out" with the period
+and "the source looks like 60 Hz: use --capture-fps 60". When every source frame is new (a 60 fps game), the skipped
+frame leaves no trace in the repeats and nothing is reported. `--capture-fps 30` / `60` (or `fmp settings set
+capture.fps 60`) asks for the whole rate.
+
+**What changed.**
+- `CapturePreset` (`src/FrameMotionPlus.App/Capture/CaptureOptions.cs`) carries an exact `FrameRate`; `--capture-fps
+  <rate>` sets a preset's rate (or is `--fps` without `--mode`): 29.97, 30, 59.94, 60 or a fraction, parsed exactly
+  (`FrameRate.TryParse`: 29.97 → 30000/1001); settings key `capture.fps` (`CaptureSettings.Fps` in Core, `UserSettings`).
+- `CaptureFormats.ExactRate` (`src/FrameMotionPlus.Sources.V4l2/CaptureFormat.cs`): a driver interval within 100 ns of a
+  whole or NTSC period is taken as that exact rate, so `NegotiatedFormat.Rate` (the source's `NominalRate`, the cadence
+  tracker's prior, the summary) is 30000/1001 and not 10000000/333667. The scheduler's `T` was already measured from the
+  timestamps (the median): 33.366 ms in the runs above, the hold T/2 = 16.685 ms; the audio delay follows the measured
+  latency; the generated frame's timestep stays 0.5.
+- `RepeatBeatDetector` (`src/FrameMotionPlus.Sources.V4l2/RepeatBeat.cs`), fed once per judged frame on the capture
+  thread (allocation-free): the content's steady run of repeats (0 for a 30 fps game at 30, 1 at 60: one length making
+  90% of the last 64 runs), an extra repeat (a run one longer) or a frame left out (one shorter, when the steady run is
+  at least 1), and a periodic beat when 3 or more events of one kind agree (within 3 capture intervals or 2%, 1 s to an
+  hour apart). The implied source rate is the capture rate less (repeats) or plus (left out) one frame per period; it is
+  matched to the capture rate's NTSC or whole sibling (within 10% of the beat period those two make) or to nothing
+  ("something in the content, not the clocks": an autosave hitch every minute matches no rate).
+- Summary, a new line after `capture th`: `capture fps asked 29.97 fps (30000/1001, 33.3667 ms), set 29.97 fps (...);
+  extra repeats ... 0, frames left out 0; no periodic beat`, or `periodic: a repeat every 33.37 s (4 in a row agree), the
+  source about 29.970 Hz; the source looks like 29.97 Hz: use --capture-fps 29.97` (or "which the card does not offer at
+  this size and format: the beat stays"). On stderr, once when a beat is first seen (preformatted at start: the control
+  thread allocates nothing): `fmp: capture: the card repeats a frame periodically at 30 fps: the source looks like 29.97
+  Hz: use --capture-fps 29.97`. No automatic switch mid-run: a rate change means STREAMOFF, S_PARM, new buffers and a
+  restart of the stream (about 0.6 s of start-up, two black frames), which is not seamless.
+
+**Pacing with T = 33.3667 ms.**
+- *Variable refresh, both outputs:* slots follow the source, so nothing changes but T (the hold is T/2). Measured on the
+  TV above. At 2x the slots are 16.683 ms apart: exactly two refreshes of 119.88 Hz.
+- *Fixed refresh, HDMI-A-1 (119.88 Hz, windowed):* 59.94 × 2 = 119.88 exactly, so the slots become the refreshes
+  themselves; the source then drifts against the display only by the card's ~15 ppm (a stride slip about every 1/(59.94
+  × 15 ppm) ≈ 18 min) instead of the 0.1% of 30.000 (every 16.7 s). Not measured windowed in this pass.
+- *Fixed refresh, DP-3 (240.016 Hz):* 59.94 into 240.016 is 4.004 refreshes per slot (4.0003 at 60.000): the scheduler's
+  stride handles it as before (not phase-locked). Not measured in this pass.
+- *1440p60-hdr on HDMI-A-1:* 59.94 × 2 = 119.88 now fits the output's ceiling (`VrrFits`, 0.05% tolerance), so `--clock
+  auto` chooses **variable refresh** there where 60.000 × 2 = 120.00 used to be refused (fixed refresh, almost every slot
+  generated). At the ceiling the card's 15 ppm makes the slots that much faster than the shortest refresh period; the
+  shows then fall behind by 0.13 µs a slot and a slot would have to go about every 4 to 5 minutes. **Not measured**: if it
+  misbehaves, `--clock fixed` restores the old behaviour.
+- File playback is unaffected (its rate is the file's); the SDR presets change rate like the HDR ones (they are console
+  presets too) and nothing else.
+
+### 2. Variable refresh lost mid-run: detected and reported
+
+**The detector** (`VrrFollowDetector`, `src/FrameMotionPlus.Pipeline/VrrFollowDetector.cs`; fed by the present thread
+for every timed show under variable refresh, allocation-free): over the last 60 timed shows (a second at 60 Hz), the
+display is not following when at least half came more than max(1 ms, a quarter of the shortest refresh period) later
+after their hand-over than the delay the start-up probe measured while it followed, **and** at least 60% of the pairs of
+consecutive shows were a whole number of refreshes apart (within 0.25 ms). The probe's own criterion ("N of M pairs as
+far apart as their presents, K on the grid") does not work mid-run: at 2x the slots are already about two refreshes
+apart (exactly two at 29.97 → 119.88), so a following display and a gridded one give the same pairs; what differs is the
+delay from hand-over to first pixel (0.9 ms when following; anywhere up to a refresh more on the grid). The grid
+condition keeps a following display with a delay varying by milliseconds (the owner's 0.4 to 3.1 ms) from being taken
+for the grid. An episode starts at the first late-after-hand-over show of the window, ends (back-dated to its last
+such show) after 120 shows in a row without one (so a drifting grid's on-time stretch does not split it), and the late
+shows of the window before the decision are moved inside it. A grid whose phase sits within the threshold of the
+follow delay is not seen; its shows are on time.
+
+**Reported:** a summary line under `missed`: `follow      variable refresh lost 1x for a total of 37.4 s (the longest
+37.4 s) (...); late shows inside those 2242, outside 0 (whole run); at 2.6 s for 37.4 s` (or "never lost"); one stderr
+line when an episode starts ("fmp: variable refresh lost: the display shows on its refresh grid, ...", at most one every
+10 s) and one when it ends ("fmp: variable refresh back after 2.1 s (episode 1)"), from preformatted text and a reused
+buffer (the control thread allocates nothing; 0 B measured). `fmp verify <csv> --vrr` prints the same line from the CSV
+alone (hand-over = `present_submit_ns`, first pixel = `actual_display_ns`; the follow delay is the run's 10th percentile
+of the two's difference): on the reproduced loss below it gives the same episode to the tenth of a second; on the owner's
+`tv-share.csv` "never lost; late shows inside 0, outside 4" (the beat repeats).
+
+**Reproduced** (fullscreen `fmp play` of the dim 4K HDR10 29.97 clip on DP-3, 240.016 Hz, the KWin placement script):
+in one run of four, variable refresh was lost **2.6 s into playback and never came back** for the rest of the run
+(37.4 s): 2,242 of 2,278 slots late (2 to 8 ms; intervals still even, mean 16.686 ms), the lead driven to its 2 ms bound;
+the detector said so on stderr at once, and the summary and `fmp verify --vrr` agree. A notification (`notify-send`) was
+sent about then; the same notification sent 15 s into playback in a later run caused **no** loss, and two runs without
+any notification were clean (0 missed, the committed binary and this one alike). So the cause of that loss is not
+established; a notification by itself did not do it the second time. Not tried for lack of time: another window raised
+over the fullscreen one, leaving fullscreen and back, the cursor, focus on another output, and anything on HDMI-A-1.
+The commands for the owner (each about a minute, then read the `follow` line):
+
+    fmp play <30 fps clip> --fullscreen --loop --duration-s 60 --csv a.csv   # then during the run, one at a time:
+    notify-send test "a notification"                 # on the same output and on the other one
+    # Alt+Tab to another window on the same output and back; move the mouse onto that output; open a menu over it
+
+The owner's two-hour session (7.6% late in runs at an even cadence) fits this detector's picture; its CSV, run through
+`fmp verify --vrr` with this build, would say how much of it was the grid (not available to this pass).
+
+**The clock switch: designed, not built.** Switching to the fixed-refresh behaviour while the display is on its grid
+would cross the two clock paths Phase 6 wrote separately: the present thread's `VrrTurn` (hand-over at the slot's time,
+no grid, repeats absorbed) against its fixed path (`SendGrid`, the lead, fillers, the grid anchor), and the pacing
+thread's scheduler (`UpdateDisplayTiming` with a VRR clock V = ts + D + kT/M against a refresh grid). Not a contained
+change; the working variable-refresh path was not touched. The design:
+1. On an episode start (present thread), measure the grid from the episode's first pixels (they are on it: the anchor is
+   their residual modulo the period, the latch from hand-over to first pixel), and send the pacing thread a
+   `DisplayUpdate` with that anchor, the rate and a lead from the latch (the fixed clock's measured lead).
+2. The pacing thread's scheduler switches its slot clock to the grid (`UpdateDisplayTiming` as for fixed refresh, the
+   multiplier unchanged, the stride as the fixed path computes it); the present thread presents on the fixed path
+   (repeats presented, fillers on) while the flag is set.
+3. On the episode end (the first pixels following hand-overs again for 2 s while presenting on the grid, which means
+   the delay test above has to be judged against the grid's expected time, not the hand-over), switch back: a
+   `DisplayUpdate` with the VRR lead, the scheduler back to V = ts + D + kT/M from the next real frame.
+4. What must hold: no slot handed over twice or skipped across the switch (the switch at a real frame), the verifier
+   and the live counters judging each slot by the clock it was presented under (a per-slot mode bit in the telemetry),
+   the summary's miss accounting split by mode, and a test on `SimulatedCompositor` with a grid stretch (follow → 2 s
+   grid → follow: no late shows inside the stretch after the first second).
+
+**Tests:** `VrrFollowTests` (Pipeline, 5, pure): follow → 2 s on the 119.88 Hz grid → follow is one episode of about
+2 s with the late shows inside and none outside; a following display with a delay varying 0.4 to 3.1 ms and a 6 ms stall
+every 2 s has none; an exact multiple (29.97 → 59.94 on 119.88) on the grid is seen when its phase makes shows late;
+flapping episodes are each counted; an episode open at the end is closed there. `RepeatBeatTests` (Sources.V4l2, 20,
+pure): simulated arrival — 30.000 capture of a 29.97 source repeats every 33.4 s, periodic, 29.97 suggested; 60.000 of a
+30 fps picture in 59.94 every 16.7 s; matched rates none; 59.94 of a true 60 Hz source "frames left out" every 16.7 s
+when the content repeats, nothing when every frame is new; irregular content repeats and a slow game are no beat; a
+period matching no sibling suggests nothing; driver intervals to exact rates (UVC's 100 ns units); the presets' rates
+and `--capture-fps` parsing; the chosen mode for 29.97; the summary line. Hardware: `ElgatoTests.Each_target_mode_captures_the_console`
+gained 2160p P010 29.97 and 1440p P010 59.94 (negotiated as the exact 30000/1001 and 60000/1001, frames at that rate, no
+beat in 4 s); it skips without the card or without a picture on it, like the other cases.
+
+**Whole solution** (one assembly at a time, the console on): Core 711, Platform 100 + 1 skip, Audio 77, Cuda 144, Vulkan
+108, Gpu 129, Vfx 93 + 1 skip, Sources.File 154, Pipeline 163 of 164, Sources.V4l2 113 + 30 skips. The one Pipeline
+failure, `WindowedTests.A_short_windowed_vfg_run_presents_one_frame_per_refresh` (3 pipeline misses in a fixed-refresh
+window on the desktop, a path this change does not touch), passed twice run alone. Two `CaptureCliTests` asserted the old
+"@ 30 fps" / "@ 60 fps" and were updated (the whole V4l2 assembly then passed with the card).
+
+**What remains.**
+- A run of an hour at 29.97 to see the predicted residual repeat (about every 35 min) and its period.
+- The clock switch (above). The causes of a loss on each output (the list above is mostly untried).
+- 1440p60-hdr on HDMI-A-1 now under variable refresh at the output's ceiling: measure it.
+- Fixed refresh at 29.97 on both outputs (windowed) not re-measured.
+- `docs/implementation-plan.md` / the design doc should say: the capture rate is the console's (29.97 / 59.94), the card
+  free-runs (a residual beat of about 15 ppm), and variable refresh can be lost mid-run (detected, reported; fallback
+  designed).
+
+## Found by the independent review of the capture rate and the follow detector (2026-11-19)
+
+Approved with no must-fix. The reviewer's own runs on the TV with the console on, same build: `4k30-hdr` fullscreen
+90 s, variable refresh, 0 missed, never lost, 46.82 ms (p99 47.39), T 33.366 ms, largest interval 33.76 ms;
+`1440p60-hdr` fullscreen 90 s with 30 fps content, variable refresh, 0 missed, 31.96 ms; a 59.94 fps file at the
+TV's ceiling (119.88 slots), 0 missed, interval sd 0.135 ms. Fixed afterwards: a preset's 29.97 or 59.94 falls back
+to 30 or 60 on a device that offers only whole rates (it failed to start there; a rate typed with `--capture-fps`
+still fails with the rates offered). Not fixed:
+
+- **`1440p60-hdr` at the TV's ceiling is only partly measured:** no 60 fps game was available. In the file run at
+  the ceiling the hand-over to first pixel sat at 1.3 to 1.7 ms p50 against the probe's 0.93 ms and the lead ended
+  at 1.91 ms, near its 2 ms bound; it did not grow over 90 s. To do: ten minutes with a 60 fps game on the TV.
+  `--clock fixed` is the way back.
+- **The follow detector's grid test discriminates nothing** (85 to 99% of pairs are "on the grid" in every healthy
+  run); the delay test alone decides, with wide margin in every run seen (at most 1 of 60 shows over the cutoff where
+  30 are needed). It compares with the probe's fixed delay, so a steady rise of the real delay by about 1.1 ms on
+  DP-3 (cutoff 1.04 ms) would announce a loss on a display that follows. Compare with the adaptive lead instead.
+- **A loss can go unannounced on stderr:** an episode that starts within 10 s of the previous "lost" line is never
+  printed, at its start or its end (`PlaybackSession.cs:1078-1092`); the summary still counts it.
+- **A saved `capture.fps` applies to every preset:** saved `capture.fps=30` with `--mode 1440p60-hdr` captures 1440p
+  at 30 fps (`UserSettings.cs:313-322`); the settings line shows it.
+- **The card's residual beat will be described wrongly:** after the third 35-minute repeat the notice says it
+  "matches no rate next to it" and the summary suggests the content; it is the card's clock (`RepeatBeat.cs:192`).
+- A small ordering race in the beat notice (`RepeatBeat.cs:210`: the version is bumped before kind and period).
+- The windowed fixed-refresh tests (`WindowedTests`, Blend and None) failed during the review on the committed code
+  as well as on this change: the desktop's state at the time.
 
