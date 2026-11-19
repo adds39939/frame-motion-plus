@@ -47,6 +47,11 @@ public enum SlotReason
     /// <summary>The decision came too late for generation to finish by the target time, so the newest real frame
     /// at or before τ is shown instead of a generated frame that would miss its slot.</summary>
     Late = 6,
+
+    /// <summary>VRR: the real frame after this generated slot came too late for its planned time, so it is shown up to
+    /// <see cref="SchedulerOptions.VrrLateGeneratedNs"/> later instead of being skipped (its content moved by the same
+    /// amount, so τ = V − D still holds; <see cref="SlotDecision.DelayedByNs"/> says by how much).</summary>
+    Delayed = 7,
 }
 
 /// <summary>A unique source frame as the scheduler sees it. Only timestamps and ids, never pixels.</summary>
@@ -90,6 +95,13 @@ public readonly record struct SlotDecision
     /// VRR: generated slots skipped because their inputs arrived too late.</summary>
     public long SkippedSlots { get; init; }
 
+    /// <summary>VRR: of <see cref="SkippedSlots"/>, those in an interval with more slots than the multiplier (the source
+    /// made it longer than its own, by repeating or dropping a frame: the next frame could not have come in time).</summary>
+    public long SkippedInLongIntervals { get; init; }
+
+    /// <summary>VRR, <see cref="SlotReason.Delayed"/>: how far after its planned time this generated slot is shown, ns.</summary>
+    public long DelayedByNs { get; init; }
+
     public bool NeedsGeneration => Kind == SlotKind.Generated;
 }
 
@@ -131,6 +143,13 @@ public readonly record struct SchedulerCounters
 
     /// <summary>Times the interval estimate was re-seeded after the source rate dropped.</summary>
     public long Reseeds { get; init; }
+
+    /// <summary>VRR: of <see cref="Skipped"/>, those in intervals longer than the source's own (see
+    /// <see cref="SlotDecision.SkippedInLongIntervals"/>).</summary>
+    public long SkippedInLongIntervals { get; init; }
+
+    /// <summary>VRR: generated slots shown late instead of skipped (<see cref="SlotReason.Delayed"/>).</summary>
+    public long DelayedSlots { get; init; }
 }
 
 /// <summary>Snapshot of the scheduler's derived pacing state, for the HUD, telemetry and tests.</summary>

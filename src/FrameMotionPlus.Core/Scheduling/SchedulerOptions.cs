@@ -74,6 +74,11 @@ public sealed record SchedulerOptions
     /// back to the scheduler (via present feedback) so it is added to D.</remarks>
     public double VrrRateTolerance { get; init; } = 0.02;
 
+    /// <summary>VRR: a generated slot whose next real frame comes too late for its planned time is shown up to this much
+    /// later instead of being skipped (its content time moved by the same amount), if it still fits a shortest refresh
+    /// period before that real frame's slot. 0 (the default here) skips it, as before.</summary>
+    public long VrrLateGeneratedNs { get; init; }
+
     /// <summary>Fraction of the per-frame budget that must be spare before the multiplier is raised again.</summary>
     public double FallbackHeadroom { get; init; } = 0.1;
 
@@ -139,6 +144,8 @@ public sealed record SchedulerOptions
             throw new ArgumentOutOfRangeException(nameof(VrrRateTolerance), VrrRateTolerance, "Must be in [0, 0.1].");
         }
         ArgumentOutOfRangeException.ThrowIfNegative(DelayDeadbandNs, nameof(DelayDeadbandNs));
+        ArgumentOutOfRangeException.ThrowIfNegative(VrrLateGeneratedNs, nameof(VrrLateGeneratedNs));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(VrrLateGeneratedNs, 100_000_000, nameof(VrrLateGeneratedNs));
         if (!(FallbackHeadroom >= 0 && FallbackHeadroom < 1))
         {
             throw new ArgumentOutOfRangeException(nameof(FallbackHeadroom), FallbackHeadroom, "Must be in [0, 1).");

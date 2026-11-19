@@ -218,7 +218,7 @@ internal sealed partial class PresentLoop
                     }
 
                     // Whether the display still follows the presents (episodes where it showed on its grid instead).
-                    _vrrFollow?.OnShown(handover, shownNs, _grid.PeriodNs, deviation > half);
+                    _vrrFollow?.OnShown(handover, shownNs, _grid.PeriodNs, deviation > half, _vrrLeadNs);
                 }
 
                 if (shownNs > handover)

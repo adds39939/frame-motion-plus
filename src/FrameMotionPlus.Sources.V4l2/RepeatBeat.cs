@@ -34,7 +34,7 @@ public readonly record struct RepeatBeat
     public long PeriodNs { get; init; }
 
     /// <summary>Consecutive events that agree with the period (at least 3 when periodic).</summary>
-    public int PeriodicEvents { get; init; }
+    public int AgreeingEvents { get; init; }
 
     /// <summary>
     /// The source's rate the beat implies (the capture rate less one frame per period for repeats, plus one for skips), and
@@ -43,7 +43,23 @@ public readonly record struct RepeatBeat
     /// </summary>
     public FrameRate Suggested { get; init; }
 
+    /// <summary>Of <see cref="ExtraRepeats"/> and <see cref="Skips"/>, the events that were part of a periodic beat (three or
+    /// more agreeing); the rest are the content's own (a game's dropped frame, the first frames of a still).</summary>
+    public long PeriodicEvents { get; init; }
+
     public bool IsPeriodic => Kind != BeatKind.None && PeriodNs > 0;
+
+    /// <summary>
+    /// The beat is the card's own clock against the source's: the implied source rate is within
+    /// <see cref="CardClockPpm"/> of the capture rate (a period of minutes: at 29.97 about 35 min for the 16 ppm measured).
+    /// The card free-runs on its crystal and does not lock to its input, so this stays whatever rate is asked: nothing to
+    /// change.
+    /// </summary>
+    public bool IsCardClock => IsPeriodic && CaptureRate.IsValid
+        && Nanoseconds.PerSecond / (double)PeriodNs / CaptureRate.Hz <= CardClockPpm * 1e-6;
+
+    /// <summary>How far apart two crystals' rates may be and still be the same nominal rate (a card's and a console's).</summary>
+    public const double CardClockPpm = 200;
 
     /// <summary>The implied source rate, Hz (0 when not periodic).</summary>
     public double ImpliedSourceHz => !IsPeriodic || !CaptureRate.IsValid ? 0
@@ -93,7 +109,8 @@ public sealed class RepeatBeatDetector
     private long _skips;
     private int _kind;
     private long _periodNs;
-    private int _periodicEvents;
+    private int _agreeing;
+    private long _periodic;
     private long _version;
 
     public RepeatBeatDetector(FrameRate captureRate)
@@ -121,7 +138,8 @@ public sealed class RepeatBeatDetector
                 Skips = Volatile.Read(ref _skips),
                 Kind = kind,
                 PeriodNs = period,
-                PeriodicEvents = Volatile.Read(ref _periodicEvents),
+                AgreeingEvents = Volatile.Read(ref _agreeing),
+                PeriodicEvents = Volatile.Read(ref _periodic),
                 Suggested = Suggest(CaptureRate, kind, period),
             };
         }
@@ -207,8 +225,14 @@ public sealed class RepeatBeatDetector
         }
 
         times[count++] = timestampNs;
-        Volatile.Write(ref _version, _version + 1);
+        Classify(times, count, kind);
 
+        // Last, so a reader that sees the new version also sees the kind and period written for it.
+        Volatile.Write(ref _version, _version + 1);
+    }
+
+    private void Classify(long[] times, int count, BeatKind kind)
+    {
         // The newest intervals that agree with the newest one: the beat's period is their mean.
         if (count < 3)
         {
@@ -239,8 +263,11 @@ public sealed class RepeatBeatDetector
 
         if (agreeing >= 2)
         {
+            // This event belongs to the beat; when the beat is new, so do the earlier ones that agree with it.
+            var already = (BeatKind)_kind == kind && _periodNs > 0;
+            Volatile.Write(ref _periodic, _periodic + (already ? 1 : agreeing + 1));
             Volatile.Write(ref _periodNs, sum / agreeing);
-            Volatile.Write(ref _periodicEvents, agreeing + 1);
+            Volatile.Write(ref _agreeing, agreeing + 1);
             Volatile.Write(ref _kind, (int)kind);
         }
         else
@@ -255,7 +282,7 @@ public sealed class RepeatBeatDetector
         {
             Volatile.Write(ref _kind, (int)BeatKind.None);
             Volatile.Write(ref _periodNs, 0);
-            Volatile.Write(ref _periodicEvents, 0);
+            Volatile.Write(ref _agreeing, 0);
         }
     }
 

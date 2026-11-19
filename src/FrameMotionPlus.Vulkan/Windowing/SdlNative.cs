@@ -20,6 +20,7 @@ internal static unsafe partial class SdlNative
     public const ulong WindowHidden = 0x0000000000000008;
     public const ulong WindowOccluded = 0x0000000000000004;
     public const ulong WindowFullscreen = 0x0000000000000001;
+    public const ulong WindowInputFocus = 0x0000000000000200;
 
     public const uint EventQuit = 0x100;
     public const uint EventWindowShown = 0x202;
@@ -92,6 +93,14 @@ internal static unsafe partial class SdlNative
     [LibraryImport(Library, EntryPoint = "SDL_MinimizeWindow")]
     [return: MarshalAs(UnmanagedType.U1)]
     public static partial bool MinimizeWindow(nint window);
+
+    [LibraryImport(Library, EntryPoint = "SDL_HideCursor")]
+    [return: MarshalAs(UnmanagedType.U1)]
+    public static partial bool HideCursor();
+
+    [LibraryImport(Library, EntryPoint = "SDL_ShowCursor")]
+    [return: MarshalAs(UnmanagedType.U1)]
+    public static partial bool ShowCursor();
 
     [LibraryImport(Library, EntryPoint = "SDL_SyncWindow")]
     [return: MarshalAs(UnmanagedType.U1)]

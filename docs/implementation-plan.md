@@ -692,6 +692,21 @@ playback audio is left for later and Remote Play is left out entirely (both are 
   signature; what triggers it is not established. Falling back to fixed-refresh timing during a
   loss is designed, not built.
 
+- **After the owner's 3 h 10 min session on the capture-rate build (2026-11-19):** PASS, 0.1% of
+  slots late (7.6% in the first long session), audio error 0.00 ms mean with no underruns.
+  - **Why variable refresh is lost: KWin grants it only to the active fullscreen window.**
+    Activating any other window, on either output, loses it until the app's window is active
+    again (every time, both outputs); a notification or the pointer does not. 593 of that session's
+    723 late shows fell inside two such episodes. The stderr line now says so. Falling back to
+    fixed-refresh timing during a loss is still designed, not built.
+  - **A generated slot is shown late instead of skipped** (`--late-generated-ms`, default 4, at most
+    8; 0 is the old behaviour): 1,517 generated slots were skipped in that session, most because
+    the next real frame arrived a little after the scheduler's allowance. On the TV over 600 s:
+    9 such skips before, none after, latency unchanged. Skips where the game itself repeated a
+    frame remain and are counted separately.
+  - The start-up probe retries up to three times before settling for fixed refresh; the pointer is
+    hidden over the fullscreen picture.
+
 ### Phase 10: Windows portability
 
 *Design doc: milestone 7.* **Left for now by the owner on 2026-11-18** (listed under "Deferred"). The

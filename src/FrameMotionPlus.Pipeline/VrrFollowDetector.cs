@@ -42,7 +42,8 @@ public sealed record VrrFollowSummary
 /// appears): the app keeps handing presents over at their own times and the first pixels snap to the next refresh, so
 /// many come late while the intervals look even. The same criterion as the start-up probe, made sustained: over the last
 /// <see cref="Window"/> timed shows, at least half came more than <c>max(1 ms, a quarter of the refresh period)</c> later
-/// after their hand-over than the delay measured while the display followed (the probe's), and at least 60% of the pairs of
+/// after their hand-over than the delay expected while the display follows (the present loop's adaptive lead; the probe's
+/// delay when none is given), and at least 60% of the pairs of
 /// consecutive shows were a whole number of refreshes apart. Under variable refresh the first pixel comes the display's
 /// delay (about 0.9 ms) after the hand-over; on the grid it comes anywhere up to a refresh later, so a drifting phase puts
 /// most shows over the threshold, and the pairs land on the grid (a display that follows with a delay varying by
@@ -113,14 +114,19 @@ public sealed class VrrFollowDetector
 
     /// <summary>
     /// One timed show: when it was handed over and when its first pixel came, the output's shortest refresh period, and
-    /// whether it was late (first pixel more than half that period after the slot's time).
+    /// whether it was late (first pixel more than half that period after the slot's time). <paramref name="expectedDelayNs"/>
+    /// is the delay from hand-over to first pixel expected now (the present loop's adaptive lead: the median of the recent
+    /// delays, moved 0.1 ms per 64 shows at most); a show counts as late after its hand-over against it, so a display that
+    /// follows with a delay that rises steadily (0.93 ms at the probe, 1.3 to 1.7 ms at the TV's ceiling) is not taken for
+    /// the grid. 0: the delay given at construction (the start-up probe's).
     /// </summary>
-    public void OnShown(long handoverNs, long shownNs, double periodNs, bool late)
+    public void OnShown(long handoverNs, long shownNs, double periodNs, bool late, long expectedDelayNs = 0)
     {
         _shows++;
         var threshold = Math.Max(Nanoseconds.PerMillisecond, (long)(periodNs / 4));
+        var expected = expectedDelayNs > 0 ? expectedDelayNs : FollowDelayNs;
         byte flags = 0;
-        if (shownNs - handoverNs - FollowDelayNs > threshold)
+        if (shownNs - handoverNs - expected > threshold)
         {
             flags |= Off;
         }

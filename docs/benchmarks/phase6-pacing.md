@@ -847,3 +847,267 @@ still fails with the rates offered). Not fixed:
 - The windowed fixed-refresh tests (`WindowedTests`, Blend and None) failed during the review on the committed code
   as well as on this change: the desktop's state at the time.
 
+
+## Skipped generated slots, variable refresh at start-up, and the review's small fixes (2026-11-19, evening)
+
+The owner's session of the afternoon: 3 h 10 min of `fmp capture --mode 4k30-hdr --audio-sink inzone`, fullscreen on
+the TV (HDMI-A-1, 119.88 Hz, variable refresh), streamed on Discord, no CSV; "glorious". Its summary: 680,705 slots
+(341,061 real, 339,644 generated), 721 missed (the verifier agrees), 723 late shows of which 593 inside two losses of
+variable refresh (at 2.7 s for 12.7 s and at 3509.1 s for 5.7 s), **1,517 generated slots skipped** (one every 7.5 s),
+real frames 48.79 ms after their capture timestamps (p99 50.08), D 48.83 ms (arrival 28.81), timestamp → frame
+available p50 27.71, p99 28.54, max 30.31 ms, 912 repeats dropped, 102 holds, 402 black frames, 57 extra repeats, and on
+stderr "a periodic repeat at 29.97 fps that matches no rate next to it". Late shows had fallen from 7.6% to 0.1%. One
+time-boxed pass on the three things left; the console was on with a game moving for the capture runs below.
+
+### 1. Generated slots skipped under variable refresh
+
+**When a slot is skipped** (`FrameScheduler.ScheduleVrr`, the generated branch). A generated slot between real frames
+a and b has its time V = ts(a) + D + k·T/M (k = 1 of M = 2 at 29.97 → 59.94). It is decided at max(arrival of b,
+V − lead), the lead being p99 of the generation time d + p99 of the pacing thread's wake lateness + the 0.5 ms margin.
+It is skipped when that decision comes after V − p99(d) − margin/2 (lateness may eat the wake allowance and half the
+margin), or when V would crowd b's own slot (less than a shortest refresh period before it). D = hold + arrival + lead,
+where the hold is (M−1)/M of the 90th percentile of the source intervals (T/2 = 16.68 ms here) and **arrival is the
+99th percentile of the last 256 frames' timestamp → frame available** (8.5 s at 29.97; recomputed at every decision; D
+follows its target up at 50 ms/s at once, down at 5 ms/s past a 0.1 ms deadband). So a slot is skipped when b's arrival
+lag exceeds that rolling p99 by more than about (hold − T/2) + wake + margin/2 ≈ 0.4 ms, less the pacing thread's own
+delay from the frame's availability to the decision: measured, the skipped ones came 0.16 to 1.64 ms over the rolling
+p99. On screen a skip leaves a on screen one source interval (33.4 ms) instead of two halves: a small stutter.
+
+**Two kinds.** The skips counted together two different things, now counted apart (below):
+- *In an interval the source made longer* (a repeated or dropped frame: an interval of 2T gets four slots at 2x): the
+  first two generated slots need b by ts(a) + D + T/2 and + T, and b comes a whole interval later than in a normal
+  interval. They are skipped whatever the budget (only D ≥ 2T would cover them); the third (t = 0.75) is shown. This is
+  the game's own hitch, which the output already smooths (a held 50 ms instead of the source's 66.7 ms).
+- *In a normal interval*: b arrived late (USB delivery jitter beyond the rolling p99).
+
+**Measured, 600 s each, the TV fullscreen, variable refresh, the same binary, one after the other** (`fmp capture --mode
+4k30-hdr --audio off --duration-s 600 --csv`; A with `--late-generated-ms 0`, the old behaviour; B the new default):
+
+| Run (598 s measured each) | Skipped: long intervals / normal | Shown late instead | Late shows (verifier agrees) | Real frame after its timestamp p50 (p99) | D p50 | Intervals sd, max | Timestamp → available p50 / p99 / max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A, `--late-generated-ms 0` (as before) | **23**: 14 (7 content repeats × 2) / **9** | — | 5 | 46.780 (48.130) ms | 45.78 ms | 0.668, 58.25 ms | 26.63 / 26.98 / 28.63 ms |
+| B, default (4 ms) | **6**: 6 (3 content repeats × 2) / **0** | 3, by 0.046 ms mean, 0.063 at most | 3 | 46.784 (47.210) ms | 45.80 ms | 0.467, 58.25 ms | 26.63 / 27.03 / 27.24 ms |
+
+Both: variable refresh chosen by the probe and never lost, 0 pipeline misses, 0 B on every thread, GC 0/0/0 in the
+window, PASS; the 58.25 ms intervals are the content's repeated frames (a held 50 ms then t = 0.75). The CSVs say the
+same as the live counters (the long/normal split matches a reconstruction from the frame ids exactly). The two runs did
+not have the same arrival tail: A had three USB-delivery spikes of 1.6 ms over the rolling p99 at 8.2, 98.3 and 188.3 s
+(exactly 90 s apart: something on the host, not chased), B none, so B's "0 normal" is partly the conditions; what B
+shows is that the new path engages and costs nothing (its three slots came 0.05 ms past the deadline: shown 0.05 ms
+late instead of a 16.7 ms hole). The controlled comparison is the deterministic simulation (`VrrLateGeneratedTests`,
+the card's lag: 27.2 ms + uniform 1 ms + 1% of frames up to 2.4 ms more, d 2 ms ± 0.3, 300 s): **43 skipped → 0**, 44
+shown late, the same real frames, the same real-frame latency (47.987 ms both), 0 missed, 0 causality or timestep
+faults; and with 2% of source frames dropped (long intervals): 142 → 120, every one left in a long interval (120 → 120).
+
+**Where they fall.** Not at holds or cuts: an interval over 2.5 T (a hold) or after a discontinuity is never
+interpolated, so its slots are not counted as skipped at all (the session's 102 holds cost none); each run here had one
+hold and one black frame, at the start, with no skip near them. The normal-interval skips are spread out (A: 9 in 598 s,
+gaps 0.8 to 90 s, median 30 s), three of them on the host's 90 s delivery spikes; the long-interval ones come with the
+game's own repeated frames, sometimes in bursts (B: three repeats within 9 s at 67 to 75 s).
+
+**What covering the tail with a larger arrival budget would cost.** In A the normal-interval skips came 0.16 to 1.64 ms
+over the rolling p99 (median 0.37); frames over the rolling p99 + 0.5 / 1.0 / 1.5 ms: 4 / 3 / 2 of 17,976. Covering all
+of them by budget would need about +1.7 ms of D (+1.7 ms latency for every frame) on this day's card; on the owner's
+session (p99 28.54, max 30.31 ms) about +1.8 ms; and a short-window maximum instead of p99 costs its mean distance
+above p99 all the time (0.15 ms in A) yet still misses the first spike of each burst. Long-interval skips are out of
+reach of any budget under 2T.
+
+**The owner's 1,517.** Not split (no CSV), but bounded: 57 extra repeats in steady cadence make at most about 114
+long-interval skips, plus those in stretches without a steady cadence (loading, menus, 912 repeats dropped in all), so
+the large majority were normal-interval: an arrival tail of p99 − p50 = 0.83 ms that afternoon against 0.35 ms here.
+Those are what the change removes. Per 10 minutes: the session 80; A 23 (9 normal); B 6 (0 normal).
+
+**What changed.**
+- `SchedulerOptions.VrrLateGeneratedNs` (Core; **0 by default there: off and inert**, the decision is the old one to the
+  nanosecond). When set and a generated slot's decision comes after V − p99(d) − margin/2, the slot is moved to
+  now + p99(d) + margin/2 (the allowance an on-time late wake gets) if that is at most the limit after V; the crowding
+  test (a shortest refresh period before b's slot) still applies, so b keeps its time; its content time moves by the same
+  amount (τ = V − D holds; t = 0.5 + delay/T, inside (0, 1)). Reason `SlotReason.Delayed` ("delayed" in the CSV),
+  `SlotDecision.DelayedByNs`, counters `DelayedSlots` and `SkippedInLongIntervals` (a skip in an interval with more slots
+  than the multiplier). `FrameScheduler.ScheduleVrr` only; `NextDecisionTime` is unchanged (still pure).
+- `fmp capture` / `fmp play --late-generated-ms <ms>` (0 to 8, lowered from 50 after the review below; **default 4**: a quarter of the 16.7 ms between slots;
+  every delay seen was under 1.7 ms) → `PlaybackOptions.LateGeneratedNs`. No settings key: there is no latency to trade
+  (the option is for A/B and to switch it off).
+- Summary, the end of the `missed` line under variable refresh: `generated slots skipped (...) 23: 14 in intervals the
+  source made longer (a repeated or dropped frame: the next one cannot come sooner), 9 in its normal intervals (the next
+  frame arrived late); generated slots shown late instead of skipped (up to 4 ms) 3, by mean 0.046 ms, at most 0.063
+  (content moved to match)`.
+- `SimulatedSourceOptions.IngestTailProbability` / `IngestTailNs` (a rare extra arrival delay; no random numbers drawn
+  when 0, so every existing simulation is unchanged).
+
+### 2. Variable refresh lost in the first seconds
+
+**What the app does around then** (`PlaybackSession.PreRoll`): the window is created 1600x900 and pre-rolls; once the
+refresh grid is known it asks for fullscreen (`SetFullscreen`; the swapchain follows at 3840x2160 on the next present
+that sees the new size); the pre-roll goes on at least 0.8 s more (24 presents), 100 ms settle, the 600 ms probe, then
+playback. The warm-up's end at 2 s only starts the meters. So the fullscreen transition and the swapchain change come
+1.5 to 2 s *before* playback starts, and nothing of the app's falls 2.5 s after it.
+
+**Measured** (the dim 4K HDR10 29.97 clip, `fmp play --fullscreen --loop --duration-s 15`, the KWin placement script;
+the committed binary "before" and this change "after"; the pointer at rest on the TV):
+
+| | Starts | Probe found the display following (first try) | Lost during the run |
+| --- | --- | --- | --- |
+| TV, before / after (pointer at rest over the window) | 3 / 3 | 6 of 6 | 0 of 6 |
+| DP-3, before / after (pointer on the other output) | 3 / 3 | 6 of 6 | 0 of 6 |
+| `fmp capture` on the TV, 600 s (the runs of item 1, the pointer over the window all along) | 2 | 2 of 2 | 0 |
+| `fmp capture` on the TV, 600 s, the first run of the evening (before binary) | 1 | **no**: 32 of 44 pairs following, 8 on the grid, one show 22 ms late | (fixed refresh chosen for the whole run: 64.5 ms instead of 46.8) |
+
+Then one 40 s run per output and binary with desktop actions at set times (`actions.sh` in the scratch directory):
+
+| Action (seconds after launch; playback starts about 3 s after launch) | TV before | TV after | DP-3 before | DP-3 after |
+| --- | --- | --- | --- | --- |
+| `notify-send` (10 s; Plasma's popup on its screen) | no loss | no loss | no loss | no loss |
+| the pointer moving over the window for 3 s (16 s; on the TV: over fmp on the TV runs, on the other output on the DP-3 runs; shown before, hidden after) | no loss | no loss | no loss | no loss |
+| **another window activated** (24 s: the Konsole on the TV, raised over fmp on the TV runs, on the other output for the DP-3 runs) | **lost 4.4 s** | **lost 4.4 s** | **lost 5.1 s** | **lost 4.4 s** |
+| fmp activated again (28 s) | back | back | back | back |
+
+**So KWin's automatic variable refresh follows the active window**: the fullscreen window must have the focus, and
+giving the focus to any other window, on the same output or the other one, puts the display on its grid until fmp is
+active again (the episodes lasted as long as fmp was not active, plus 0.4 to 4 s before the display followed again:
+4.4 to 5.1 s for a 4 s gap in the four runs, 10.1 s for a 6 s gap in the check below). A notification, the pointer moving or resting over the picture,
+did nothing. The owner's episode at 2.7 s (12.7 s) fits the focus going to Discord to start the screen share and
+coming back (the recorder attached during it); the file reproduction at 2.6 s that never recovered fits the window
+losing the focus for good (a notification was sent then; when a popup that took the focus closes, KWin gives it to the
+window active before, the terminal; today's notification did not take the focus). Neither is the app's doing.
+
+**What changed.**
+- The "lost" line says when the window is not the active one (SDL's input-focus flag, read when the line is printed):
+  `fmp: variable refresh lost: the window is not the active one (another window took the focus, on either output; KWin
+  gives variable refresh only to the active fullscreen window): click the picture or Alt+Tab back to it; ...`
+  (`SdlWindow.HasInputFocus`, `VrrFollowNotice.Unfocused`); otherwise the old line (an overlay or another window).
+  Checked with the final binary on DP-3 (25 s, the Konsole activated at 12 s, fmp again at 18 s): that line, then "back
+  after 10.1 s (episode 1)", the summary `lost 1x ... at 9.9 s for 10.1 s`, PASS.
+- **The probe is made again** when it does not find the display following (fullscreen, `--clock auto`; up to 3 probes
+  of 0.6 s, `PlaybackSession.PreRoll`, `PresentLoop.RequestVrrProbe` now restartable): the first run of the evening
+  probed while KWin had not yet granted variable refresh (the grid for the probe's first presents, following for the
+  rest) and ran 10 minutes at fixed refresh. The summary's `clock` line says "the second (third) of up to 3" when it took
+  more than one. Not seen to engage on the hardware since (14 starts, every first probe following): unverified there.
+- The pointer is hidden over the window while it is fullscreen (`SDL_HideCursor`/`SDL_ShowCursor` in
+  `SdlWindow.SetFullscreen`): standard for a fullscreen picture; it made no difference to variable refresh here.
+
+**What the owner can do:** after starting a Discord share (or anything that takes the focus), click the fmp picture or
+Alt+Tab back to it; the stderr line now says so. The fixed-refresh fallback during a loss stays designed, not built.
+Not tried: the Discord share picker itself (expected to take the focus), a menu or tooltip over the picture, KWin's
+overview, a keep-above window without focus.
+
+### 3. The review's small fixes
+
+- **The card's own slow beat** (`RepeatBeat.cs`, `CapturePrinter.cs`). A periodic beat whose implied source rate is within
+  200 ppm of the capture rate (`RepeatBeat.IsCardClock`: a period of minutes, 34.8 min at 29.97 for the card's
+  measured 16 ppm) is the card's crystal free-running against its input. The summary says (the test's card, 16 ppm
+  fast, over 4 h) `periodic: a repeat every 34.8 min (... in a row agree), the source about ... Hz; the card's own clock,
+  about 16 ppm faster than the source's (it free-runs on its crystal, not locked to its input): expected at the source's
+  own rate, nothing to change`.
+  **stderr now carries only advice to change the rate** (a beat matching the offered NTSC or whole sibling: "use
+  --capture-fps 29.97"); a card-clock beat and one that matches no rate (the content's) are in the summary alone.
+  *What "extra repeats" counts:* every run of repeats one longer than the content's steady cadence while the cadence is
+  steady (one run length in 90% of the last 64): at 29.97 that is every single repeated picture during play, a game's
+  own repeated frame or the first frame of a still as much as the card's beat. The session's 57 against about 5 from
+  the clocks were the content's. The line now splits them: `extra repeats (...) 7, frames left out 0 (3 of them in a
+  periodic beat, the card's or the clocks'; 4 not: the content's own, a game's repeated frame or the start of a still)`
+  (`RepeatBeat.PeriodicEvents`: the events that belonged to a beat of three or more agreeing; the old field of that name,
+  the agreeing run, is `AgreeingEvents`). Run A above shows that three content repeats can line up by chance (2%
+  tolerance at a minute's spacing); such a "beat" matches no rate and stays in the summary.
+- **The beat's version is bumped last** (`RepeatBeatDetector.Record` → `Classify`, then the version), so the control
+  thread never sees a new version with the old kind or period.
+- **A loss within 10 s of the last "lost" line is announced** (`PlaybackSession.Control`): `IsLost` is tested every
+  turn while a loss is unannounced; once the 10 s have passed the "lost" line is printed (and later its "back"); a loss
+  over before then stays unannounced (the summary counts it). A "back" is also printed when a new episode replaced the
+  announced one between two turns.
+- **The follow detector compares with the adaptive lead** (`VrrFollowDetector.OnShown(..., expectedDelayNs)`; the present
+  loop passes its `_vrrLeadNs`, the median of the last 256 delays moved 0.1 ms per 64 shows, within 0.3 to 2 ms; `fmp
+  verify --vrr` passes each slot's time less its hand-over, which is that lead for a slot handed over on time). A delay
+  rising steadily on a display that follows moves the reference with it; a loss is still seen at once (the lead moves
+  0.1 ms in the 60 shows the decision needs) and stays one episode (the lead's 2 ms bound keeps half the grid's shows
+  over the cutoff even on DP-3). `fmp verify --vrr`, old → new: the recorded loss (`dp3-notify.csv`) "at 3.6 s for
+  36.4 s" → **"at 2.6 s for 37.4 s"** (exactly what the live detector said during that run); `dp3-notify2.csv`,
+  `tv-share.csv`, `tv-noshare.csv`, `tv-new.csv` and runs A and B: never lost, both.
+- **A saved `capture.fps` does not override a typed `--mode`** (`UserSettings.Apply`): the mode's own rate is used and
+  the settings line says `capture.fps (--mode given: its own rate)`; without `--mode` the saved rate applies to the saved
+  (or default) mode as before, and `--capture-fps` still wins over it.
+
+**Tests added:** `VrrLateGeneratedTests` (Core, 3: the jittered card before/after with every count checked, a dropping
+source's long-interval skips, off by default and inert under fixed refresh), `UserSettingsTests.A_saved_capture_rate_
+does_not_override_a_mode_typed_on_the_command_line` (Core), `RepeatBeatTests` +2 (Sources.V4l2: the card 16 ppm fast
+over 4 h is a card-clock beat with nothing on stderr while 30.000-of-29.97 still advises; irregular content repeats are
+counted as not periodic), `VrrFollowTests` +1 (Pipeline: a delay rising 0.93 → 2.3 ms on DP-3 is a loss against the
+probe's delay and none against the adaptive lead; a 20 s grid stretch with the lead tracking is still one episode).
+
+### Changes outside the obvious
+
+- `src/FrameMotionPlus.Core/Scheduling/FrameScheduler.cs` `ScheduleVrr` (the generated branch): the only decision change,
+  behind `VrrLateGeneratedNs > 0`; the unused `planned` local there removed; `_decisionSkippedLong` reset in `Schedule`.
+- `src/FrameMotionPlus.Core/Simulation/SimulatedSource.cs` `Deliver`: the optional arrival tail (test support).
+- `src/FrameMotionPlus.Pipeline/PresentLoop.cs` `RequestVrrProbe` and the probe gate in `RunWindow`: a probe can be
+  requested again after one finished (a request counter; the present thread resets its probe state on a new request).
+- `src/FrameMotionPlus.Vulkan/Windowing/SdlNative.cs` / `SdlWindow.cs`: `SDL_HideCursor`, `SDL_ShowCursor`, the
+  input-focus flag (window and pointer only).
+- `src/FrameMotionPlus.Sources.V4l2/RepeatBeat.cs`: `RepeatBeat.PeriodicEvents` now means the events that belonged to a
+  beat; the old meaning (the agreeing run) is `AgreeingEvents`.
+- `src/FrameMotionPlus.App/Cli/VerifyCommand.cs` `Follow`: passes each slot's lead to the detector.
+
+### What remains
+
+- **The card measurement of item 1 over a long session.** The two 10-minute runs were on a calm day (normal-interval
+  skips 9 in A, none in B); the owner's afternoon had a heavier arrival tail. To see it on a session like the owner's
+  (each with the console on and a game moving; the summary's `missed` line has the split):
+
+      fmp capture --mode 4k30-hdr --audio off --duration-s 1800 --csv a.csv --late-generated-ms 0   # as before
+      fmp capture --mode 4k30-hdr --audio off --duration-s 1800 --csv b.csv                          # the default
+
+- The probe retry has not been seen to engage on the hardware (one start of 15 needed it, before it existed).
+- The fixed-refresh fallback during a loss: designed (above), not built.
+- The host's 90-second USB-delivery spike seen in run A (1.6 ms, at 8.2, 98.3, 188.3 s): not chased (a periodic USB
+  poller? NZXT CAM and a Razer helper were running).
+- `fmp verify <csv> --vrr` on these runs infers the shortest refresh period as 16.686 ms (the slot spacing) and judges
+  fewer misses than the live verifier (1 against 5 and 3): pre-existing, not looked at.
+
+### What `docs/implementation-plan.md` and the design doc should say (not edited)
+
+- Under variable refresh a generated slot whose next real frame comes slightly late is shown late (content moved to
+  match) rather than skipped; skips in intervals the source lengthened are inherent and counted apart.
+- KWin's automatic variable refresh needs the fullscreen window to be the active one; focus elsewhere (either output)
+  is a loss for as long as it lasts.
+- The card's own clock makes a residual repeat about every 35 minutes at the console's rate; it is reported, not acted
+  on.
+
+### Tests and checks
+
+Whole solution, one assembly at a time (`dotnet test FrameMotionPlus.slnx`, the console on): Core **715** (711 + 4),
+Platform 100 + 1 skip, Audio 77, Cuda 144, Vulkan 108, Gpu 129, Vfx 93 + 1 skip, Sources.File 154, Pipeline **163 + 2
+skips of 165** (164 + 1; the two skips are `WindowedTests` cases that skip when the compositor takes presents too early
+to judge or skips refreshes: the desktop's state, not a failure), Sources.V4l2 **115 + 30 skips of 146** (113 + 2
+new; one of the new tests failed in that run on its own expectation of the period's text, "every 35." against the
+34.8 min the 16 ppm card makes; corrected, `RepeatBeatTests` 22 of 22 run again). Solution build 0 warnings; `-r
+win-x64` build of the app 0 warnings; NativeAOT publish clean. 0 B on every thread and GC 0/0/0 in the measured window
+in runs A and B.
+
+## Found by the independent review of the delayed generated slots (2026-11-19)
+
+Approved with no must-fix. A differential run of the committed scheduler against the new one with the option at 0
+gave identical records over 14 simulated scenarios (the new unit tests alone do not prove that for variable refresh);
+with it on (0.1, 4, 16, 100 ms) nothing was out of order, duplicated, backwards or closer than the shortest refresh
+period, and D and latency matched to 0.01 ms. The reviewer's runs with a game moving: on the TV, 180 s, 3 delayed (at
+most 1.28 ms), 0 skipped, 0 missed, 46.709 ms (p99 47.200), against 46.728 ms with the option off; on DP-3, 60 s,
+2 delayed (at most 1.785 ms), 0 missed: a delayed slot is judged against its moved time, so the 2.08 ms tolerance
+there is not used up. The probe retry engaged twice on hardware (the second probe found the display following).
+Fixed afterwards: the request count is bumped before "done" is cleared in `RequestVrrProbe` (a retry could be spent
+on the previous probe's answer), and the option's limit is 8 ms. Not fixed:
+
+- **At 3x and up, the later slots of a pair do not follow a delayed slot:** only the delayed slot's content moves,
+  so the content step after it shrinks (240 Hz 4x: 1.4 ms of content shown 4.1 ms apart; the TV at 4x: 5.7 against
+  8.3 ms). Never backwards or duplicated at 8 ms and below. With larger limits in an interval the source made longer
+  the next slot became a repeat that was neither shown nor counted as skipped (334 in a 600 s run with 2% drops at
+  50 ms), hence the 8 ms limit. Does not arise at 2x.
+- **A fullscreen `--clock auto` start on an output that never grants variable refresh** now makes three probes,
+  about 1.2 to 1.4 s more (by reading; not reproducible here without changing display settings).
+- **The pointer stays hidden for the session over the app's own surface:** it is shown again only by
+  `SetFullscreen(false)`, which the session never calls, so if the compositor takes the window out of fullscreen, or
+  it loses focus, the pointer is invisible while over the picture (`SdlWindow.cs:241`). It is never hidden elsewhere
+  on the desktop and was visible after every exit path tried.
+- Not exercised: the keys (Escape, H, A, Q) with the pointer hidden, a crash exit, and a live loss of variable refresh.
+- `SimulatedDisplayTests.Variable_refresh_on_a_119_88_Hz_output_with_a_varying_display_delay_is_judged_alike_by_both_
+  accounts` failed once in a run of the whole Pipeline test project after the two follow-up fixes and then passed
+  9 of 9 (5 alone, 4 with its class). It runs on the real clock; its failure message was not captured. To watch.
+

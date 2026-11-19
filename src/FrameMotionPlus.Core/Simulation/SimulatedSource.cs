@@ -21,6 +21,12 @@ public sealed record SimulatedSourceOptions
     /// <summary>Extra uniform [0, J] delay added to each frame's availability (USB and driver jitter).</summary>
     public long IngestJitterNs { get; init; }
 
+    /// <summary>With this probability a frame's availability gets a further uniform [0, <see cref="IngestTailNs"/>] delay
+    /// (the rare slow USB deliveries behind a capture card's long tail). 0: none (no random numbers drawn for it).</summary>
+    public double IngestTailProbability { get; init; }
+
+    public long IngestTailNs { get; init; }
+
     /// <summary>Probability that a frame is dropped (the game misses a refresh).</summary>
     public double DropProbability { get; init; }
 
@@ -183,6 +189,11 @@ public sealed class SimulatedSource
 
         _lastContentNs = contentNs;
         var jitter = _options.IngestJitterNs > 0 ? (long)(_random.NextDouble() * _options.IngestJitterNs) : 0;
+        if (_options.IngestTailProbability > 0 && _random.NextDouble() < _options.IngestTailProbability)
+        {
+            jitter += (long)(_random.NextDouble() * _options.IngestTailNs);
+        }
+
         var arrival = Math.Max(contentNs + _options.IngestLatencyNs + jitter, _lastArrivalNs);
         _lastArrivalNs = arrival;
         var discontinuity = !_discontinuitySent && contentNs >= _options.DiscontinuityAtNs;

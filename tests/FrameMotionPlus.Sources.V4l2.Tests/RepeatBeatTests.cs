@@ -180,6 +180,85 @@ public class RepeatBeatTests
     }
 
     [Fact]
+    public void The_cards_own_slow_beat_at_the_sources_rate_is_its_clock_nothing_to_change_and_not_on_stderr()
+    {
+        // 29.97 asked of a 29.97 source, the card 16 ppm fast (as measured): a repeat about every 35 min.
+        var cardRate = new FrameRate(30000 * 1_000_016L, 1001 * 1_000_000L);
+        var detector = new RepeatBeatDetector(Ntsc30);
+        var lastPicture = long.MinValue;
+        var frames = (long)(4 * 3600 * Ntsc30.Hz);
+        for (long k = 0; k < frames; k++)
+        {
+            var t = cardRate.TickTimeNs(k);
+            var picture = (long)Math.Floor((t / Ntsc30.PeriodNs) + 0.37);
+            detector.Add(t, picture != lastPicture);
+            lastPicture = picture;
+        }
+
+        var beat = detector.Snapshot;
+        Assert.Equal(BeatKind.Repeats, beat.Kind);
+        Assert.True(beat.IsCardClock);
+        Assert.InRange(beat.PeriodNs / 60e9, 34, 36);
+        Assert.False(beat.Suggested.IsValid);
+        Assert.Equal(beat.ExtraRepeats, beat.PeriodicEvents);
+
+        var line = CapturePrinter.RateLine(new FrameMotionPlus.Pipeline.CaptureSummary
+        {
+            Counters = new CaptureStatistics(),
+            State = CaptureSignalState.Streaming,
+            AskedRate = Ntsc30,
+            NegotiatedRate = Ntsc30,
+            Beat = beat,
+            OfferedRates = [FrameRate.FromHz(30), Ntsc30],
+        });
+        Assert.Contains("periodic: a repeat every 34.", line, StringComparison.Ordinal); // 1 / (29.97 x 16 ppm) = 34.8 min
+        Assert.Contains(" min (", line, StringComparison.Ordinal);
+        Assert.Contains("the card's own clock, about 16 ppm faster", line, StringComparison.Ordinal);
+        Assert.Contains("nothing to change", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("matches no", line, StringComparison.Ordinal);
+
+        // Nothing on stderr for it (only advice to change the rate goes there); the 30.000-of-29.97 beat still does.
+        using var error = new StringWriter();
+        CapturePrinter.BeatNotices(error, Ntsc30, [FrameRate.FromHz(30), Ntsc30], forced: false)(beat);
+        Assert.Equal("", error.ToString());
+        CapturePrinter.BeatNotices(error, FrameRate.FromHz(30), [FrameRate.FromHz(30), Ntsc30], forced: false)(Simulate(FrameRate.FromHz(30), Ntsc30, 200));
+        Assert.Contains("use --capture-fps 29.97", error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Extra_repeats_of_the_content_are_told_apart_from_a_periodic_beat()
+    {
+        // A 30 fps game at 29.97 with an irregular repeated frame now and then (its own hitches): extra repeats, none periodic.
+        var detector = new RepeatBeatDetector(Ntsc30);
+        var random = new Random(5);
+        var t = 0L;
+        for (var k = 0; k < 30 * 600; k++)
+        {
+            t += (long)Ntsc30.PeriodNs;
+            var hitch = k > 100 && random.NextDouble() < 0.002;
+            detector.Add(t, true);
+            if (hitch)
+            {
+                t += (long)Ntsc30.PeriodNs;
+                detector.Add(t, false);
+            }
+        }
+
+        var beat = detector.Snapshot;
+        Assert.True(beat.ExtraRepeats >= 20, $"extra repeats {beat.ExtraRepeats}");
+        Assert.False(beat.IsPeriodic);
+        var line = CapturePrinter.RateLine(new FrameMotionPlus.Pipeline.CaptureSummary
+        {
+            Counters = new CaptureStatistics(),
+            State = CaptureSignalState.Streaming,
+            AskedRate = Ntsc30,
+            NegotiatedRate = Ntsc30,
+            Beat = beat,
+        });
+        Assert.Contains($"{beat.ExtraRepeats - beat.PeriodicEvents} not: the content's own", line, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void The_summary_line_says_what_was_asked_and_what_the_beat_says()
     {
         var beat = Simulate(FrameRate.FromHz(30), Ntsc30, 200);

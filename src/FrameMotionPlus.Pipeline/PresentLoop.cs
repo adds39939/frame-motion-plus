@@ -136,6 +136,8 @@ internal sealed partial class PresentLoop : IDisposable
 
     // The variable-refresh probe before playback, and the mode.
     private bool _vrrProbeRequested;
+    private int _vrrProbeRequests;
+    private int _vrrProbeStarted;
     private bool _vrrProbeDone;
     private long _vrrProbeBudgetNs;
     private long _vrrProbeUntilNs = long.MinValue;
@@ -302,7 +304,12 @@ internal sealed partial class PresentLoop : IDisposable
     /// </summary>
     public void RequestVrrProbe(long durationNs)
     {
+        // Again after a probe that finished: the present thread starts afresh when it sees the new request.
         Volatile.Write(ref _vrrProbeBudgetNs, durationNs);
+        // The request count first: a present thread that ran between the two writes would otherwise step the previous
+        // (expired) probe with "done" cleared and finish at once with the old answer.
+        Volatile.Write(ref _vrrProbeRequests, _vrrProbeRequests + 1);
+        Volatile.Write(ref _vrrProbeDone, false);
         Volatile.Write(ref _vrrProbeRequested, true);
         _wake.Set();
     }
@@ -568,7 +575,14 @@ internal sealed partial class PresentLoop : IDisposable
             }
 
             SendGrid(now);
-            if (Volatile.Read(ref _vrrProbeRequested) && !_vrrProbeDone && !_havePending && _jobs.IsEmpty)
+            if (Volatile.Read(ref _vrrProbeRequested) && Volatile.Read(ref _vrrProbeRequests) != _vrrProbeStarted)
+            {
+                _vrrProbeStarted = Volatile.Read(ref _vrrProbeRequests);
+                _vrrProbeUntilNs = long.MinValue;
+                _vrrProbeCount = 0;
+            }
+
+            if (Volatile.Read(ref _vrrProbeRequested) && !Volatile.Read(ref _vrrProbeDone) && !_havePending && _jobs.IsEmpty)
             {
                 waiter.WaitUntil(VrrProbeStep(now));
                 continue;

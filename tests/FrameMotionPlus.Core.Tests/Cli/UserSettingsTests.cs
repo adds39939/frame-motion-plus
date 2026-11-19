@@ -148,6 +148,22 @@ public sealed class UserSettingsTests : IDisposable
     }
 
     [Fact]
+    public void A_saved_capture_rate_does_not_override_a_mode_typed_on_the_command_line()
+    {
+        // Saved 30 (with or without a saved mode): --mode 1440p60-hdr keeps its own 59.94, the saved rate is reported unused.
+        var path = Write("""{ "capture": { "mode": "4k30-hdr", "fps": "30" } }""");
+        var loaded = UserSettings.Load(path, mustExist: true);
+        var applied = UserSettings.Apply(SettingsTarget.Capture, ["--mode", "1440p60-hdr"], loaded);
+        Assert.Equal(new FrameMotionPlus.Core.Time.FrameRate(60000, 1001), CaptureOptions.Parse(applied.Args).CaptureRate);
+        Assert.Contains(applied.Overridden, o => o.StartsWith("capture.fps (--mode given", StringComparison.Ordinal));
+
+        // Without --mode the saved rate applies to the saved mode, and --capture-fps still beats it.
+        Assert.Equal(FrameMotionPlus.Core.Time.FrameRate.FromHz(30), CaptureOptions.Parse(UserSettings.Apply(SettingsTarget.Capture, [], loaded).Args).CaptureRate);
+        Assert.Equal(new FrameMotionPlus.Core.Time.FrameRate(30000, 1001),
+            CaptureOptions.Parse(UserSettings.Apply(SettingsTarget.Capture, ["--capture-fps", "29.97"], loaded).Args).CaptureRate);
+    }
+
+    [Fact]
     public void A_missing_default_file_is_normal_and_changes_nothing()
     {
         var loaded = UserSettings.Load(Path.Combine(_directory, "none", "settings.json"), mustExist: false);

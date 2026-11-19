@@ -146,8 +146,8 @@ internal static class CommandDispatcher
           fmp settings path         The file's path
           fmp settings set <key> <value>   Check and save one value (creates the file; other keys are kept; atomic)
           fmp settings unset <key>  Remove one value (the default applies again)
-          keys: capture.device (/dev/videoN), capture.mode (--mode), capture.fps (--capture-fps), generator.backend (--generator), generator.quality
-          (--quality), generator.multiplier (--multiplier), generator.qualitySwitch (true: --quality-switch, false:
+          keys: capture.device (/dev/videoN), capture.mode (--mode), capture.fps (--capture-fps; not with a typed --mode),
+          generator.backend (--generator), generator.quality (--quality), generator.multiplier (--multiplier), generator.qualitySwitch (true: --quality-switch, false:
           --no-quality-switch), display.clock (--clock), display.fullscreen (true: --fullscreen,
           false: a window), display.window (WxH: the window's size when windowed; unlike --window it does not choose a window),
           audio.mode (--audio), audio.sink (--audio-sink), audio.source (--audio-source), audio.offsetMs (--audio-offset-ms),
@@ -329,6 +329,10 @@ internal static class CommandDispatcher
                                     too late misses the compositor's latch, slowly back down to where it started
           --latch-ms <ms>           The least a present is assumed to need before its refresh (offscreen: how early a
                                     slot is submitted; windowed: a floor under the adaptive lead)     (1)
+          --late-generated-ms <ms>  Variable refresh: when the real frame after a generated slot comes too late for it,
+                                    show the generated frame up to this much after its time (its content moved to match)
+                                    instead of skipping it (the image before then stays a whole slot longer). Costs no
+                                    latency; 0 skips it as before                                       (4)
           --cuda-sync <mode>        How threads wait in CUDA synchronisations: blocking (sleep; VFG's blocking call
                                     then costs about 0.06 instead of 0.35 ms of CPU per slot), spin, yield, auto (blocking)
           --gate                    The Phase 4 gate: exactly VFG Medium at 2x, looped, 10 minutes (--duration-s may
@@ -366,7 +370,8 @@ internal static class CommandDispatcher
                                     (the preset's: the console's 29.97 or 59.94, as a PS5 sends 59.94 Hz; a card at 30.000
                                     repeats a frame every 33 s, which shows as a hitch). 30 or 60 for a source that sends
                                     60.000 Hz (a PC). The summary says when the repeats show a periodic beat and which rate
-                                    the source looks like
+                                    the source looks like (stderr only when that is advice to change the rate; a repeat
+                                    every half hour at the console's rate is the card's own clock: nothing to change)
           --size <WxH>              Capture size (must be one the device offers)
           --fps <rate>              Capture rate: 30, 60, 59.94 ... (59.94 and 60 differ)        (the highest offered)
           --format <nv12|p010|yuyv> Pixel format (MJPEG is never used: its decode adds latency)  (P010 first)
@@ -396,7 +401,7 @@ internal static class CommandDispatcher
                                     refresh, which --clock auto uses (the lowest latency); a window is fixed refresh
           --generator, --quality, --quality-switch, --no-quality-switch, --multiplier, --output-hz, --duration-s, --window,
           --fullscreen, --clock, --validate, --csv, --settings, --no-settings, --vfx-sdk, --warmup-s, --present-lead-ms,
-          --latch-ms, --cuda-sync   As for play (the
+          --latch-ms, --late-generated-ms, --cuda-sync   As for play (the
                                     duration is unlimited by default: until Ctrl+C, closing the window or Escape)
                                     Without a device or --mode, the saved capture.device and capture.mode are used if set
           --offscreen               No window: an offscreen target on the real clock at --display-hz

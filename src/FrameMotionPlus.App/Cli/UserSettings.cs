@@ -316,6 +316,12 @@ internal static class UserSettings
             {
                 Skip("capture.fps", "--capture-fps/--fps given");
             }
+            else if (Any("mode"))
+            {
+                // A mode typed on the command line brings its own rate (29.97 for 4k30-hdr, 59.94 for 1440p60-hdr): a saved
+                // rate was chosen for the saved mode, or for every mode, and must not turn 1440p60 into 1440p at 30.
+                Skip("capture.fps", "--mode given: its own rate");
+            }
             else
             {
                 Use("capture.fps", "--capture-fps", fps);

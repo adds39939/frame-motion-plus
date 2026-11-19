@@ -249,7 +249,10 @@ presentation ring, and shown one per refresh in a window (FIFO, at most two pres
 feedback: first-pixel times where the display reports them). The present lead (how long before its refresh a slot's
 content must be ready) starts from the compositor's latch, measured before playback, plus 2 ms, and adapts. Fullscreen,
 where the display follows the presents (variable refresh), each slot is instead handed over at its own time
-(`--clock auto`, the default; `--clock fixed|vrr` to choose). A file a hair off the display's rate (60.000 fps on
+(`--clock auto`, the default; `--clock fixed|vrr` to choose). There, a generated slot whose next real frame arrives a
+little too late for it is shown up to 4 ms after its time, its content moved to match, instead of being skipped (which
+would leave the image before it on screen a whole slot longer); it costs no latency, and `--late-generated-ms <ms>` sets
+the limit (0 skips them as before). A file a hair off the display's rate (60.000 fps on
 119.88 Hz) plays 0.1% slower to lock to it. At the end it prints a summary:
 slots, presents, every missed slot with its time and whose it was (the pipeline's unless the timestamps show the present
 was handed over in time and the display showed it late; misses while the output's rate changes are counted apart),
@@ -323,7 +326,10 @@ sends 59.94 Hz. A card set to 30.000 runs out of new frames once every 33 s and 
 (at 60.000: every 17 s). `--capture-fps 30` or `60` (or `fmp settings set capture.fps 60`) asks for the whole rate, for
 a source that really sends 60.000 Hz. The summary's `capture fps` line says what was asked and set, the repeats one more
 than the content's steady cadence and the frames left out, and, when they come at a regular period, which rate the
-source looks like and the `--capture-fps` to use (also said once on stderr as soon as it is seen). The 120 fps presets
+source looks like and the `--capture-fps` to use (also said once on stderr as soon as it is seen: stderr carries only that
+advice). A repeat every half hour or so at the console's own rate is the card's clock (it free-runs a few tens of ppm from
+its input): the summary says so and that nothing needs changing. Extra repeats that come at no regular period are the
+content's own (a game's repeated frame, the start of a still) and are counted apart. The 120 fps presets
 stay at 120: the card offers no 119.88. Under variable refresh the summary's `follow` line says whether the display
 stopped following the presents mid-run (first pixels on its refresh grid for a second or more: an overlay, another
 window), for how long, and how many late shows fell inside those stretches; one stderr line marks each start and end, and
@@ -367,7 +373,8 @@ Precedence: built-in defaults < the file < the command line: an option you type 
 such as `--size` against a saved mode, or `--audio off` against a saved sink) wins for that run. At the start both commands
 print one `settings` line naming the file and every value taken from it, and what was not used and why. A malformed file
 stops the command with one error naming the file and the line; a key this fmp does not know is reported and skipped. The
-keys are `capture.device`, `capture.mode`, `capture.fps` (`--capture-fps`), `generator.backend`, `generator.quality`, `generator.multiplier`,
+keys are `capture.device`, `capture.mode`, `capture.fps` (`--capture-fps`; not used when `--mode` is typed: the mode
+brings its own rate), `generator.backend`, `generator.quality`, `generator.multiplier`,
 `generator.qualitySwitch` (true or false: `--quality-switch` / `--no-quality-switch`),
 `display.clock`, `display.fullscreen` (true or false), `display.window` (the window's size when windowed), `audio.mode`,
 `audio.sink`, `audio.source`, `audio.offsetMs`, `hdr.mode`, `hdr.peakNits`, `hdr.maxCll`, `hdr.maxFall` and

@@ -594,6 +594,11 @@ internal sealed class TelemetryCollector
                 case SlotReason.Fallback:
                     s.FallbackSlots++;
                     break;
+                case SlotReason.Delayed when d.Kind == SlotKind.Generated:
+                    s.VrrDelayedSlots++;
+                    s.VrrDelayedTotalNs += d.DelayedByNs;
+                    s.VrrDelayedMaxNs = Math.Max(s.VrrDelayedMaxNs, d.DelayedByNs);
+                    break;
                 default:
                     break;
             }
@@ -610,6 +615,7 @@ internal sealed class TelemetryCollector
                 // Variable refresh has no refresh that goes without a slot: a generated slot the scheduler skipped (the
                 // next real frame came too late for it) leaves the image before it on screen longer. Counted apart.
                 s.VrrSkippedSlots += d.SkippedSlots;
+                s.VrrSkippedInLongIntervals += d.SkippedInLongIntervals;
             }
             else if (d.SkippedSlots > 0)
             {

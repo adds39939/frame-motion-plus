@@ -44,6 +44,7 @@ public sealed class FrameScheduler
     private readonly long _alignGuardNs;
     private readonly double _percentile;
     private readonly double _vrrTolerance;
+    private readonly long _vrrLateGeneratedNs;
 
     private readonly UniqueFrameTimeline _timeline;
     private readonly SourceIntervalEstimator _intervals;
@@ -120,6 +121,11 @@ public sealed class FrameScheduler
     private long _holdsDetected;
     private long _discontinuities;
     private long _framesDroppedLate;
+    private long _skippedLong;
+    private long _delayedSlots;
+
+    // VRR: the skipped slots of the decision being made that sat in a long interval (reset by each ScheduleVrr call).
+    private long _decisionSkippedLong;
 
     public FrameScheduler(SchedulerOptions options)
     {
@@ -137,6 +143,7 @@ public sealed class FrameScheduler
         _alignGuardNs = options.MarginNs / 2;
         _percentile = options.GenerationTimePercentile;
         _vrrTolerance = options.VrrRateTolerance;
+        _vrrLateGeneratedNs = options.VrrLateGeneratedNs;
 
         _timeline = new UniqueFrameTimeline(options.TimelineCapacity);
         _intervals = new SourceIntervalEstimator(
@@ -205,6 +212,8 @@ public sealed class FrameScheduler
         Discontinuities = _discontinuities,
         FramesDroppedLate = _framesDroppedLate,
         Reseeds = _intervals.Reseeds,
+        SkippedInLongIntervals = _skippedLong,
+        DelayedSlots = _delayedSlots,
     };
 
     public SchedulerDiagnostics Diagnostics => new()
@@ -408,6 +417,7 @@ public sealed class FrameScheduler
         // Wake lateness is measured against exactly what NextDecisionTime promised (it is pure, so asking again is
         // safe), before this call changes any lead or delay.
         var planned = NextDecisionTime(nowNs);
+        _decisionSkippedLong = 0;
         return _mode == ClockMode.FixedRefresh ? ScheduleFixed(nowNs, planned) : ScheduleVrr(nowNs, planned);
     }
 
@@ -640,16 +650,36 @@ public sealed class FrameScheduler
                 return EmitEmpty(now, now, reason, skipped);
             }
 
-            var planned = VrrPlannedGenerated(a.ContentTimeNs, b.ContentTimeNs, _vrrK, _vrrSlots);
             var target = VrrGeneratedTarget(a.ContentTimeNs, b.ContentTimeNs, _vrrK, _vrrSlots);
             var nextReal = b.ContentTimeNs + d;
 
             // Lateness may eat the wake allowance and half the margin; generation (p99 of d) plus the other half,
             // kept against d outliers, must still fit, and the slot must not crowd the next real frame.
-            if (now > target - _tuner.GenerationLeadNs - (_marginNs / 2) || target > nextReal - MinimumSpacingNs())
+            var generationLead = _tuner.GenerationLeadNs + (_marginNs / 2);
+            var delayedBy = 0L;
+            if (_vrrLateGeneratedNs > 0 && now > target - generationLead)
+            {
+                // Too late for its planned time (the real frame after it came late, or the wake did): shown later, with
+                // the same allowance as an on-time decision, rather than skipped (a hole of a whole slot), when the
+                // delay is within the limit; the crowding test below still applies, so the next real frame keeps its time.
+                var delayed = now + generationLead;
+                if (delayed - target <= _vrrLateGeneratedNs)
+                {
+                    delayedBy = delayed - target;
+                    target = delayed;
+                }
+            }
+
+            if (now > target - generationLead || target > nextReal - MinimumSpacingNs())
             {
                 skipped++;
                 _starvedSlots++;
+                if (_vrrSlots > _multiplier)
+                {
+                    _skippedLong++;
+                    _decisionSkippedLong++;
+                }
+
                 _vrrK++;
                 continue;
             }
@@ -657,11 +687,28 @@ public sealed class FrameScheduler
             var interval = b.ContentTimeNs - a.ContentTimeNs;
             var t = _vrrK / (double)_vrrSlots;
             var content = a.ContentTimeNs + (long)Math.Round(_vrrK * (double)interval / _vrrSlots);
+            var slotReason = SlotReason.None;
+            if (delayedBy > 0)
+            {
+                // τ = V − D still holds: the content moves with the display time (before b, which the crowding test
+                // keeps at least a shortest refresh period away, so t stays inside (0, 1)).
+                content += delayedBy;
+                t = (content - a.ContentTimeNs) / (double)interval;
+                slotReason = SlotReason.Delayed;
+            }
+
             _vrrK++;
             _lastTargetNs = target;
             _cursor = _vrrBase;
             _skipped += skipped;
-            return EmitGenerated(target, content, now, d, a.FrameId, b.FrameId, t, content, SlotReason.None, skipped);
+            var decision = EmitGenerated(target, content, now, d, a.FrameId, b.FrameId, t, content, slotReason, skipped);
+            if (delayedBy > 0 && decision.Kind == SlotKind.Generated)
+            {
+                _delayedSlots++;
+                decision = decision with { DelayedByNs = delayedBy };
+            }
+
+            return decision;
         }
     }
 
@@ -1136,6 +1183,7 @@ public sealed class FrameScheduler
             FrameB = -1,
             PipelineDelayNs = _tuner.CurrentNs,
             SkippedSlots = skipped,
+            SkippedInLongIntervals = _decisionSkippedLong,
         };
     }
 
@@ -1161,6 +1209,7 @@ public sealed class FrameScheduler
             Timestep = t,
             PipelineDelayNs = d,
             SkippedSlots = skipped,
+            SkippedInLongIntervals = _decisionSkippedLong,
         };
     }
 

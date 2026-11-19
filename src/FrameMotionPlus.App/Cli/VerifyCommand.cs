@@ -99,8 +99,9 @@ internal static class VerifyCommand
 
     /// <summary>
     /// Under variable refresh: the episodes where the display stopped following the presents, from the CSV alone (each
-    /// slot's hand-over and first pixel, as the live detector judges them). The delay it followed with is the 10th
-    /// percentile of hand-over to first pixel over the run (kept within 0.3 to 2 ms).
+    /// slot's hand-over and first pixel, as the live detector judges them). The delay expected is the lead each slot was
+    /// handed over with (its time less its hand-over, within 0.3 to 2 ms), as the live detector uses the present loop's
+    /// adaptive lead; the 10th percentile of hand-over to first pixel over the run is the detector's fallback.
     /// </summary>
     internal static VrrFollowSummary Follow(IReadOnlyList<VerifierRow> rows, long periodNs, long from)
     {
@@ -111,7 +112,10 @@ internal static class VerifyCommand
         var detector = new VrrFollowDetector(follow);
         foreach (var r in shows)
         {
-            detector.OnShown(r.SubmitNs, r.ActualNs, periodNs, r.ActualNs - r.TargetNs > periodNs / 2);
+            // The live detector compares with the present loop's adaptive lead: a slot handed over on time was handed over
+            // that lead before its time, so the CSV's time less the hand-over is the lead then (kept within its 0.3 to 2 ms).
+            var lead = Math.Clamp(r.TargetNs - r.SubmitNs, 300_000, 2_000_000);
+            detector.OnShown(r.SubmitNs, r.ActualNs, periodNs, r.ActualNs - r.TargetNs > periodNs / 2, lead);
         }
 
         return detector.Finish(shows.Count > 0 ? shows[^1].ActualNs : 0);

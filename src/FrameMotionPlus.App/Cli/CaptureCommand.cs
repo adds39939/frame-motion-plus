@@ -144,6 +144,7 @@ internal static class CaptureCommand
             WarmupNs = (long)(options.WarmupS * Nanoseconds.PerSecond),
             PresentLeadNs = options.PresentLeadMs < 0 ? -1 : (long)(options.PresentLeadMs * Nanoseconds.PerMillisecond),
             LatchLeadNs = (long)(options.LatchMs * Nanoseconds.PerMillisecond),
+            LateGeneratedNs = (long)Math.Round(options.LateGeneratedMs * Nanoseconds.PerMillisecond),
             VfxSdkDirectory = options.VfxSdk,
             Settings = settings,
             CsvPath = options.CsvPath,

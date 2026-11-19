@@ -84,6 +84,72 @@ public class VrrFollowTests
         Assert.Equal(2, s.Log.Count);
     }
 
+    /// <summary>The present loop's adaptive lead, as <c>UpdateVrrLead</c> keeps it: the median of the last 256 delays from
+    /// hand-over to first pixel, recomputed every 64 shows, moved at most 0.1 ms at a time, within 0.3 to 2 ms.</summary>
+    private sealed class LeadModel(long start)
+    {
+        private readonly long[] _delays = new long[256];
+        private int _count;
+        private int _head;
+
+        public long LeadNs { get; private set; } = start;
+
+        public void Add(long delayNs)
+        {
+            _delays[_head] = delayNs;
+            _head = (_head + 1) % _delays.Length;
+            _count = Math.Min(_count + 1, _delays.Length);
+            if (_head % 64 == 0)
+            {
+                var sorted = _delays.Take(_count).Order().ToArray();
+                var median = sorted[sorted.Length / 2];
+                LeadNs = Math.Clamp(Math.Clamp(median, LeadNs - 100_000, LeadNs + 100_000), 300_000, 2_000_000);
+            }
+        }
+    }
+
+    /// <summary>DP-3 at 240.016 Hz (cutoff max(1 ms, a quarter refresh) = 1.04 ms), 29.97 → 59.94 slots; the display follows
+    /// with a delay that <paramref name="delay"/> gives, or shows on its grid while <paramref name="grid"/>.</summary>
+    private static VrrFollowSummary RunDp3(double seconds, Func<long, long> delay, Func<long, bool> grid, bool adaptive)
+    {
+        const double period = 1e9 / 240.016;
+        var slot = 1e9 * 1001 / 60000;
+        var detector = new VrrFollowDetector(930_000);
+        var lead = new LeadModel(930_000);
+        var origin = 1_000_000_000L;
+        long last = 0;
+        for (long k = 0; k < (long)(seconds * 1e9 / slot); k++)
+        {
+            var target = origin + (long)(k * slot);
+            var handover = target - lead.LeadNs;
+            var shown = grid(handover - origin)
+                ? (long)(Math.Ceiling((handover + 900_000) / period) * period) + 120_000
+                : handover + delay(handover - origin);
+            shown = Math.Max(shown, last + (long)period);
+            last = shown;
+            detector.OnShown(handover, shown, period, shown - target > period / 2, adaptive ? lead.LeadNs : 0);
+            lead.Add(shown - handover);
+        }
+
+        return detector.Finish(last);
+    }
+
+    [Fact]
+    public void A_steady_rise_of_the_delay_on_a_following_display_is_no_loss_against_the_adaptive_lead()
+    {
+        // 0.93 ms rising to 2.3 ms over 30 s (the TV's ceiling saw 1.3 to 1.7 ms against the probe's 0.93): against the
+        // probe's fixed delay the cutoff (1.04 ms on DP-3) is crossed and a loss announced; against the lead it is not.
+        static long Rising(long t) => 930_000 + Math.Min(1_370_000, t * 1_370_000 / 30_000_000_000L) + ((t / 16_683_000) % 7 * 30_000);
+        Assert.True(RunDp3(40, Rising, _ => false, adaptive: false).Episodes >= 1);
+        Assert.Equal(0, RunDp3(40, Rising, _ => false, adaptive: true).Episodes);
+
+        // A real loss is still one episode, with the lead driven up by it (to its 2 ms bound) while it lasts: on the grid
+        // from 5 to 25 s, following again after.
+        var lost = RunDp3(35, _ => 930_000, t => t >= 5_000_000_000 && t < 25_000_000_000, adaptive: true);
+        Assert.Equal(1, lost.Episodes);
+        Assert.InRange(lost.TotalNs / 1e9, 18, 21);
+    }
+
     [Fact]
     public void An_episode_open_at_the_end_is_closed_there()
     {

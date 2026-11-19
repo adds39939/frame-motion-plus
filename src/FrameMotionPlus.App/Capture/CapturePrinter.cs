@@ -197,20 +197,34 @@ internal static class CapturePrinter
     {
         var b = c.Beat;
         var rates = string.Create(Ic, $"  capture fps asked {Exact(c.AskedRate)}, set {Exact(c.NegotiatedRate)}; ");
-        var events = string.Create(Ic, $"extra repeats (one more than the content's steady cadence) {b.ExtraRepeats}, frames left out {b.Skips}");
+        var periodic = Math.Min(b.PeriodicEvents, b.ExtraRepeats + b.Skips);
+        var events = string.Create(Ic, $"extra repeats (one more than the content's steady cadence) {b.ExtraRepeats}, frames left out {b.Skips}") +
+            (b.ExtraRepeats + b.Skips == 0 ? ""
+                : string.Create(Ic, $" ({periodic} of them in a periodic beat, the card's or the clocks'; {b.ExtraRepeats + b.Skips - periodic} not: the content's own, a game's repeated frame or the start of a still)"));
         if (!b.IsPeriodic)
         {
-            return rates + events + "; no periodic beat (the card's rate and the source's agree, or the content hides it)";
+            return rates + events + "; no periodic beat at the end (the card's rate and the source's agree, or the content hides it)";
         }
 
         var what = b.Kind == BeatKind.Repeats ? "a repeat" : "a frame left out";
-        var line = rates + events + string.Create(Ic, $"; periodic: {what} every {b.PeriodNs / 1e9:0.00} s ({b.PeriodicEvents} in a row agree), the source about {b.ImpliedSourceHz:0.000} Hz");
+        var every = b.PeriodNs >= 120 * Nanoseconds.PerSecond
+            ? string.Create(Ic, $"{b.PeriodNs / 60e9:0.0} min")
+            : string.Create(Ic, $"{b.PeriodNs / 1e9:0.00} s");
+        var line = rates + events + string.Create(Ic, $"; periodic: {what} every {every} ({b.AgreeingEvents} in a row agree), the source about {b.ImpliedSourceHz:0.0000} Hz");
         return line + "; " + Advice(b, c.OfferedRates);
     }
 
     /// <summary>What to do about a periodic beat: the --capture-fps that matches the source, if the device offers it.</summary>
     public static string Advice(RepeatBeat b, IReadOnlyList<FrameRate> offered)
     {
+        if (b.IsCardClock)
+        {
+            var ppm = Nanoseconds.PerSecond / (double)b.PeriodNs / b.CaptureRate.Hz * 1e6;
+            var way = b.Kind == BeatKind.Repeats ? "faster" : "slower";
+            return string.Create(Ic,
+                $"the card's own clock, about {ppm:0} ppm {way} than the source's (it free-runs on its crystal, not locked to its input): expected at the source's own rate, nothing to change");
+        }
+
         if (!b.Suggested.IsValid)
         {
             return "it matches no whole or NTSC rate next to the capture's (something in the content, not the clocks?)";
@@ -239,8 +253,15 @@ internal static class CapturePrinter
             ? $"fmp: capture: the card {(sibling.Hz < asked.Hz ? "repeats a frame" : "leaves a frame out")} periodically at {askedText} fps: " +
               Advice(new RepeatBeat { Suggested = sibling }, offered) + (forced ? " (--capture-fps chose " + askedText + ")" : "")
             : "";
-        var other = $"fmp: capture: a periodic repeat at {askedText} fps that matches no rate next to it (the summary has its period)";
-        return b => error.WriteLine(b.Suggested.IsValid && b.Suggested == sibling ? match : other);
+        // Only advice to change the rate goes to stderr: the card's own slow beat at the source's rate (its clock free-runs a
+        // few tens of ppm from its input) and a beat that matches no rate (the content's) are in the summary alone.
+        return b =>
+        {
+            if (b.Suggested.IsValid && b.Suggested == sibling && !b.IsCardClock)
+            {
+                error.WriteLine(match);
+            }
+        };
     }
 
     /// <summary>The colour lines of the summary: what the frames were at the end, the switches, the output.</summary>

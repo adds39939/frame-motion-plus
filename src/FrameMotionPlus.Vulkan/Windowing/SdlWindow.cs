@@ -234,11 +234,19 @@ public sealed unsafe class SdlWindow : IDisposable
     public bool SetFullscreen(bool fullscreen)
     {
         ObjectDisposedException.ThrowIf(_window == 0, this);
+
+        // No mouse pointer over a fullscreen picture: a pointer drawn over it is one more thing the compositor must
+        // composite (KWin's "automatic" variable refresh wants the fullscreen window alone on the output). SDL hides it
+        // over its own windows only; elsewhere it stays.
+        _ = fullscreen ? SdlNative.HideCursor() : SdlNative.ShowCursor();
         var ok = SdlNative.SetWindowFullscreen(_window, fullscreen);
         SdlNative.SyncWindow(_window);
         UpdatePixelSize();
         return ok;
     }
+
+    /// <summary>Whether the window has the keyboard focus, i.e. is the compositor's active window (SDL's window flags).</summary>
+    public bool HasInputFocus => _window != 0 && (SdlNative.GetWindowFlags(_window) & SdlNative.WindowInputFocus) != 0;
 
     /// <summary>Whether the window is fullscreen now (SDL's window flags).</summary>
     public bool IsFullscreen => _window != 0 && (SdlNative.GetWindowFlags(_window) & SdlNative.WindowFullscreen) != 0;

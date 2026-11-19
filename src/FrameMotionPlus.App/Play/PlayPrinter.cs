@@ -149,7 +149,7 @@ internal static class PlayPrinter
             $"{s.MissCount(MissKind.DisplayLate)}, given back after those {s.MissCount(MissKind.CatchUp)}, handed over in time and discarded by the compositor " +
             $"{s.MissCount(MissKind.Discarded)}; during a refresh-rate change {s.RateChangeMisses}; unjudged {s.UnjudgedSlots}; refreshes without a new present " +
             $"{s.RefreshesWithoutPresent}; late shows {r.LateShows}: the refresh given back by the compositor {r.CompositorCatchUps}x, by the present thread {r.OwnCatchUps}x" +
-            $"{(r.RefreshModeUsed == RefreshMode.Vrr ? $"; generated slots skipped (variable refresh: the next real frame came too late for them) {s.VrrSkippedSlots}" : "")}"));
+            $"{(r.RefreshModeUsed == RefreshMode.Vrr ? VrrSkipText(s, r.LateGeneratedNs) : "")}"));
         if (r.VrrFollow is { } follow)
         {
             o.WriteLine(VrrFollowLine(follow, r.PlaybackStartNs));
@@ -421,8 +421,10 @@ internal static class PlayPrinter
     private static string VrrProbe(PlaybackReport r) => r.VrrProbe is not { } p
         ? ""
         : string.Create(Ic,
-            $" (probe before playback: {p.Following} of {p.Pairs} pairs of shows as far apart as their presents, {p.OnGrid} on the refresh grid; " +
+            $" (probe before playback{(r.VrrProbeAttempts > 1 ? $", the {Ordinal(r.VrrProbeAttempts)} of up to 3 (the earlier ones did not find the display following yet)" : "")}: {p.Following} of {p.Pairs} pairs of shows as far apart as their presents, {p.OnGrid} on the refresh grid; " +
             $"first pixel {Ms(p.DelayP50Ns)} ms after the present, at most {Ms(p.DelayMaxNs)}: {(p.Active ? "the display follows the presents" : "fixed refresh")})");
+
+    private static string Ordinal(int n) => n switch { 1 => "first", 2 => "second", 3 => "third", _ => n.ToString(Ic) + "th" };
 
     private static string LeadHistory(PlaybackReport r) => r.LeadRaises == 0
         ? " (it did not need to adapt)"
@@ -493,19 +495,40 @@ internal static class PlayPrinter
     private const int VrrFollowDetectorWindow = Pipeline.VrrFollowDetector.Window;
 
     /// <summary>
+    /// The end of the <c>missed</c> line under variable refresh: the generated slots skipped, split into those the source's
+    /// own long intervals made (it repeated or dropped a frame: the next frame cannot come sooner) and the rest (the next
+    /// frame arrived late), and the ones shown late instead of skipped (<c>--late-generated-ms</c>).
+    /// </summary>
+    public static string VrrSkipText(PlaybackStatistics s, long lateGeneratedNs)
+    {
+        var shortSkips = s.VrrSkippedSlots - s.VrrSkippedInLongIntervals;
+        var delayed = lateGeneratedNs <= 0
+            ? "; generated slots shown late instead of skipped: off (--late-generated-ms 0)"
+            : s.VrrDelayedSlots == 0
+                ? string.Create(Ic, $"; generated slots shown late instead of skipped (up to {lateGeneratedNs / 1e6:0.###} ms) 0")
+                : string.Create(Ic, $"; generated slots shown late instead of skipped (up to {lateGeneratedNs / 1e6:0.###} ms) {s.VrrDelayedSlots}, " +
+                    $"by mean {s.VrrDelayedTotalNs / (double)s.VrrDelayedSlots / 1e6:0.000} ms, at most {s.VrrDelayedMaxNs / 1e6:0.000} (content moved to match)");
+        return string.Create(Ic,
+            $"; generated slots skipped (variable refresh: the next real frame came too late for them) {s.VrrSkippedSlots}: " +
+            $"{s.VrrSkippedInLongIntervals} in intervals the source made longer (a repeated or dropped frame: the next one cannot come sooner), " +
+            $"{shortSkips} in its normal intervals (the next frame arrived late){delayed}");
+    }
+
+    /// <summary>
     /// Under variable refresh, one stderr line when the display stops following the presents and one when it follows again,
     /// from preformatted text and a reused buffer (the control thread allocates nothing).
     /// </summary>
     public static Action<Pipeline.VrrFollowNotice> VrrFollowNotices(TextWriter error)
     {
-        const string Lost = "fmp: variable refresh lost: the display shows on its refresh grid, not when the presents come (an overlay, a notification or another window on that output?); slots may come late until it follows again";
+        const string Lost = "fmp: variable refresh lost: the display shows on its refresh grid, not when the presents come (an overlay or another window on that output?); slots may come late until it follows again";
+        const string Unfocused = "fmp: variable refresh lost: the window is not the active one (another window took the focus, on either output; KWin gives variable refresh only to the active fullscreen window): click the picture or Alt+Tab back to it; slots may come late until then";
         const string Back = "fmp: variable refresh back after ";
         var buffer = new char[160];
         return n =>
         {
             if (n.Lost)
             {
-                error.WriteLine(Lost);
+                error.WriteLine(n.Unfocused ? Unfocused : Lost);
                 return;
             }
 

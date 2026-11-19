@@ -127,6 +127,16 @@ public sealed record PlaybackOptions
     /// <summary>Fixed refresh, variable refresh, or variable when the display does it (windowed: fixed).</summary>
     public RefreshMode Refresh { get; init; } = RefreshMode.Auto;
 
+    /// <summary>Default of <see cref="LateGeneratedNs"/>: a quarter of the 16.7 ms between slots at 2x of a 29.97 source.</summary>
+    public const long LateGeneratedDefaultNs = 4 * Nanoseconds.PerMillisecond;
+
+    /// <summary>
+    /// Variable refresh: a generated slot whose next real frame comes too late for it is shown up to this much after its
+    /// planned time (its content moved to match) instead of being skipped (<see cref="FrameMotionPlus.Core.Scheduling.SchedulerOptions.VrrLateGeneratedNs"/>).
+    /// 0 skips it, the behaviour before 2026-11-19. No effect under fixed refresh.
+    /// </summary>
+    public long LateGeneratedNs { get; init; } = LateGeneratedDefaultNs;
+
     /// <summary>
     /// A file within 0.5% of a whole number of refreshes per frame plays that much slower or faster so it phase-locks to
     /// fixed refresh (60.000 fps on 119.88 Hz: 0.1% slower). Never a live source.

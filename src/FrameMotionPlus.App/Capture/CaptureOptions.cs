@@ -123,6 +123,9 @@ internal sealed record CaptureOptions
 
     public double PresentLeadMs { get; init; } = -1;
 
+    /// <summary>Variable refresh: how late a generated slot may be shown instead of skipped, ms (0: skipped).</summary>
+    public double LateGeneratedMs { get; init; } = Pipeline.PlaybackOptions.LateGeneratedDefaultNs / 1e6;
+
     public double LatchMs { get; init; } = 1;
 
     public CudaSchedulingMode CudaSync { get; init; } = CudaSchedulingMode.BlockingSync;
@@ -271,6 +274,7 @@ internal sealed record CaptureOptions
             VfxSdk = r.String("vfx-sdk"),
             WarmupS = r.Double("warmup-s", 2, 0, 600),
             PresentLeadMs = r.Double("present-lead-ms", -1, -1, 100),
+            LateGeneratedMs = r.Double("late-generated-ms", Pipeline.PlaybackOptions.LateGeneratedDefaultNs / 1e6, 0, 8),
             LatchMs = r.Double("latch-ms", 1, 0, 50),
             CudaSync = ParseSync(r.String("cuda-sync")),
             Audio = audio,

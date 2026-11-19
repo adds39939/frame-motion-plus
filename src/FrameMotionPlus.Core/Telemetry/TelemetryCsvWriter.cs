@@ -151,6 +151,7 @@ public sealed class TelemetryCsvWriter : IDisposable
         Scheduling.SlotReason.Discontinuity => "discontinuity"u8,
         Scheduling.SlotReason.Fallback => "fallback"u8,
         Scheduling.SlotReason.Late => "late"u8,
+        Scheduling.SlotReason.Delayed => "delayed"u8,
         _ => ""u8,
     };
 }

@@ -797,12 +797,26 @@ public sealed class PlaybackSession : IDisposable
         }
         else if (probeVrr)
         {
-            presentLoop.RequestVrrProbe(VrrProbeNs);
-            var probeBy = Monotonic.NowNs + VrrProbeNs + Nanoseconds.PerSecond;
-            while (!presentLoop.VrrProbeDone && Monotonic.NowNs < probeBy && _stopReason == (int)StopReason.None)
+            // KWin grants a fullscreen window variable refresh a moment after it goes fullscreen, sometimes later than the
+            // pre-roll's 0.8 s (a probe that found the grid for its first presents and the display following for the
+            // rest): fullscreen and auto, a probe that does not find the display following is made again, up to
+            // VrrProbeTries in all, before fixed refresh is chosen for the run.
+            for (var attempt = 1; attempt <= VrrProbeTries; attempt++)
             {
-                PumpWindow();
-                Thread.Sleep(2);
+                presentLoop.RequestVrrProbe(VrrProbeNs);
+                var probeBy = Monotonic.NowNs + VrrProbeNs + Nanoseconds.PerSecond;
+                while (!presentLoop.VrrProbeDone && Monotonic.NowNs < probeBy && _stopReason == (int)StopReason.None)
+                {
+                    PumpWindow();
+                    Thread.Sleep(2);
+                }
+
+                report.VrrProbeAttempts = attempt;
+                if (!presentLoop.VrrProbeDone || presentLoop.VrrProbe is { Active: true } || _o.Refresh != RefreshMode.Auto
+                    || !_fullscreenDone || _stopReason != (int)StopReason.None)
+                {
+                    break;
+                }
             }
 
             report.VrrProbe = presentLoop.VrrProbe;
@@ -890,6 +904,9 @@ public sealed class PlaybackSession : IDisposable
 
     /// <summary>The most the variable-refresh probe before playback may take (about 24 presents).</summary>
     private const long VrrProbeNs = 600 * Nanoseconds.PerMillisecond;
+
+    /// <summary>Probes made at most before fixed refresh is chosen (fullscreen, --clock auto).</summary>
+    private const int VrrProbeTries = 3;
 
     private bool _fullscreenDone;
     private bool _vrr;
@@ -999,12 +1016,14 @@ public sealed class PlaybackSession : IDisposable
             // The scheduler's V is when a slot's present must be queued: the refresh minus the present lead.
             VblankAnchorNs = anchor - presentLead,
             StartupFrames = Math.Min(baseOptions.StartupFrames, _o.HistoryDepth - 2),
+            VrrLateGeneratedNs = _o.LateGeneratedNs,
         };
         _startupFrames = options.StartupFrames;
         report.DisplayRate = rate;
         report.Multiplier = multiplier;
         report.PresentLeadNs = presentLead;
         report.MarginNs = options.MarginNs;
+        report.LateGeneratedNs = options.VrrLateGeneratedNs;
         report.InitialGenerationTimeNs = options.InitialGenerationTimeNs;
         _presentLeadNs = presentLead;
         return (new FrameScheduler(options), anchor);
@@ -1021,6 +1040,7 @@ public sealed class PlaybackSession : IDisposable
         var followVersion = 0L;
         var followNoticeAt = long.MinValue / 2;
         var lostSaid = false;
+        var lostSaidEpisode = 0;
         var beatVersion = 0L;
         var beatSaid = BeatKind.None;
         var beatSuggested = default(FrameRate);
@@ -1075,21 +1095,29 @@ public sealed class PlaybackSession : IDisposable
                 }
             }
 
-            if (_hooks.OnVrrFollow is { } onFollow && _presentLoop!.VrrFollow is { } follow && follow.Version != followVersion)
+            if (_hooks.OnVrrFollow is { } onFollow && _presentLoop!.VrrFollow is { } follow
+                && (follow.Version != followVersion || (follow.IsLost && !lostSaid)))
             {
-                // Variable refresh lost or back (rare): one line each way, at most one "lost" every 10 s while it flaps.
+                // Variable refresh lost or back (rare): one line each way, at most one "lost" every 10 s while it flaps. A
+                // loss that starts within 10 s of the last "lost" line is said once the 10 s have passed if it still lasts
+                // (IsLost is tested every turn until then), and its end with it; one that is over by then stays unsaid
+                // (the summary counts every episode).
+                var episodes = follow.Episodes;
                 followVersion = follow.Version;
                 var now = Monotonic.NowNs;
+                if (lostSaid && (!follow.IsLost || episodes != lostSaidEpisode))
+                {
+                    // Back (or back and lost again between two turns: the episode said is over either way).
+                    lostSaid = false;
+                    onFollow(new VrrFollowNotice(false, lostSaidEpisode, follow.LastDurationNs));
+                }
+
                 if (follow.IsLost && !lostSaid && now - followNoticeAt >= FollowNoticeIntervalNs)
                 {
                     lostSaid = true;
+                    lostSaidEpisode = episodes;
                     followNoticeAt = now;
-                    onFollow(new VrrFollowNotice(true, follow.Episodes, 0));
-                }
-                else if (!follow.IsLost && lostSaid)
-                {
-                    lostSaid = false;
-                    onFollow(new VrrFollowNotice(false, follow.Episodes, follow.LastDurationNs));
+                    onFollow(new VrrFollowNotice(true, episodes, 0, _window is { HasInputFocus: false }));
                 }
             }
 

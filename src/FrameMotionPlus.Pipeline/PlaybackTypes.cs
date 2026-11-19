@@ -90,7 +90,7 @@ public sealed class PlaybackHooks
 }
 
 /// <summary>Variable refresh lost (<see cref="Lost"/>) or back, the episodes so far, and the one that ended's length (ns).</summary>
-public readonly record struct VrrFollowNotice(bool Lost, int Episodes, long DurationNs);
+public readonly record struct VrrFollowNotice(bool Lost, int Episodes, long DurationNs, bool Unfocused = false);
 
 /// <summary>What a session's source delivers (a file or a capture), in the terms every source shares.</summary>
 public readonly record struct SourceDescription
@@ -285,6 +285,12 @@ public sealed class PlaybackReport
     public long InitialGenerationTimeNs { get; set; }
 
     public long MarginNs { get; set; }
+
+    /// <summary>Variable refresh: how late a generated slot may be shown instead of skipped (0: skipped).</summary>
+    public long LateGeneratedNs { get; set; }
+
+    /// <summary>Variable-refresh probes made before playback (more than one when the first did not find the display following).</summary>
+    public int VrrProbeAttempts { get; set; }
 
     public long FramesRead { get; set; }
 

@@ -193,6 +193,18 @@ public sealed class PlaybackStatistics
     /// image before stays on screen for both): not a missed refresh (there is no grid), counted on its own.</summary>
     public long VrrSkippedSlots { get; internal set; }
 
+    /// <summary>Of <see cref="VrrSkippedSlots"/>, those in an interval the source made longer than its own (it repeated or
+    /// dropped a frame): the next frame could not have come in time for them, whatever the budget.</summary>
+    public long VrrSkippedInLongIntervals { get; internal set; }
+
+    /// <summary>Variable refresh: generated slots shown late instead of skipped (the real frame after them came late), and
+    /// by how much after their planned time, ns.</summary>
+    public long VrrDelayedSlots { get; internal set; }
+
+    public long VrrDelayedMaxNs { get; internal set; }
+
+    public long VrrDelayedTotalNs { get; internal set; }
+
     public long MaxOutstanding { get; internal set; }
 
     public long MaxPresentsInFlight { get; internal set; }
