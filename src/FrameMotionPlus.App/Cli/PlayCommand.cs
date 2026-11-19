@@ -80,6 +80,7 @@ internal static class PlayCommand
             Path = options.Path,
             Generator = generator.Value,
             Quality = options.Quality,
+            QualitySwitch = options.QualitySwitch,
             Multiplier = options.Multiplier,
             OutputHz = options.OutputHz,
             Loop = options.Loop,
@@ -119,7 +120,12 @@ internal static class PlayCommand
             }
 
             PlaybackReport report;
-            var hooks = fault is null ? null : new PlaybackHooks { WrapGenerator = fault };
+            var hooks = new PlaybackHooks
+            {
+                WrapGenerator = fault,
+                OnQualitySwitch = PlayPrinter.QualityNotices(output),
+                OnQualityNotice = PlayPrinter.QualityIgnored(output),
+            };
             using (var session = new PlaybackSession(playback, cuda, hooks, validationEcho: options.Validate ? error : null))
             {
                 Volatile.Write(ref live, session);
@@ -152,6 +158,7 @@ internal static class PlayCommand
                 PlayPrinter.PrintSetup(output, options, playback, setup, why, cuda);
                 output.WriteLine(UserSettings.Describe(loaded, applied));
                 output.Flush();
+                using var qualitySwitcher = QualitySwitchEvery(session, error, "play");
                 report = session.Run();
             }
 
@@ -208,4 +215,25 @@ internal static class PlayCommand
     internal static Action<int>? ExitNow { get; set; } = Platform.Runtime.ImmediateExit.Now;
 
     internal static string Ms(double ns) => (ns / 1e6).ToString("0.000", CultureInfo.InvariantCulture);
+    /// <summary>
+    /// Diagnostics: FMP_QUALITY_SWITCH_EVERY_S=&lt;s&gt; asks for the other generator quality every s seconds, as pressing Q in
+    /// the window does (to exercise the switch with no one at the keyboard; fmp play and fmp capture). Null when not set.
+    /// </summary>
+    internal static Timer? QualitySwitchEvery(PlaybackSession session, TextWriter error, string command)
+    {
+        var text = Environment.GetEnvironmentVariable("FMP_QUALITY_SWITCH_EVERY_S");
+        if (text is null)
+        {
+            return null;
+        }
+
+        if (!double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds) || seconds < 0.05 || seconds > 3600)
+        {
+            error.WriteLine($"fmp: {command}: FMP_QUALITY_SWITCH_EVERY_S expects seconds (0.05 to 3600), got '{text}'; ignored");
+            return null;
+        }
+
+        var period = TimeSpan.FromSeconds(seconds);
+        return new Timer(_ => session.RequestQualityToggle(), null, period, period);
+    }
 }

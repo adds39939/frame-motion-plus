@@ -662,6 +662,20 @@ playback audio is left for later and Remote Play is left out entirely (both are 
   - 767 generated slots skipped in 8,146 s under variable refresh, one every 10.6 s (the known
     late-capture-frame item).
 
+- **Live quality switching (2026-11-19, `docs/benchmarks/phase9-polish.md` sections 4 and 5):** Q in
+  the window swaps VFG between the start quality and High with no load: both instances are loaded
+  at start (about 90 ms more start-up and 1,540 MiB more GPU memory at 4K), the scheduler raises its
+  delay and lead before an up-switch, and the generator swaps between frames. On by default
+  (`--no-quality-switch`, setting `generator.qualitySwitch`), because the idle second instance
+  changes neither Medium's timing nor latency. High costs about 4.8 ms more latency. No slot missed
+  around 16 switches, nor in the reviewer's several hundred. Not exercised on the capture card (the
+  console was off).
+- **Whole-solution test runs** now take every test assembly through the machine lock one at a time
+  (three assemblies used to run beside the GPU suites, which is what made timing tests fail only
+  in full runs).
+- **Still open in Phase 9:** direct display mode and its two gates (needs the owner at a text
+  console), a graphical settings window, and the items listed as not done in the results document.
+
 ### Phase 10: Windows portability
 
 *Design doc: milestone 7.* **Left for now by the owner on 2026-11-18** (listed under "Deferred"). The

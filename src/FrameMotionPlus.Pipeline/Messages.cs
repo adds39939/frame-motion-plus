@@ -16,6 +16,12 @@ public enum WriteKind : byte
 
     /// <summary>The generator's frame at a timestep between two real frames.</summary>
     Generated = 2,
+
+    /// <summary>
+    /// No write: switch the generator to <see cref="WriteJob.Quality"/> (an instance loaded at start, so no load and no CUDA
+    /// call), between the writes queued before it and those after it. <see cref="WriteJob.SlotIndex"/> is the switch's epoch.
+    /// </summary>
+    Quality = 3,
 }
 
 /// <summary>One ring write, handed from the pacing thread to the generator thread (in write order).</summary>
@@ -34,6 +40,31 @@ public readonly record struct WriteJob
     public GpuFrame Curr { get; init; }
 
     public float Timestep { get; init; }
+
+    /// <summary><see cref="WriteKind.Quality"/>: the quality to switch to.</summary>
+    public FrameGenQuality Quality { get; init; }
+}
+
+/// <summary>Generator thread → pacing thread: one generation's GPU time, and the quality epoch it ran in.</summary>
+internal readonly record struct GenerationSample(long Nanoseconds, int Epoch);
+
+/// <summary>Generator thread → control thread: a quality switch carried out (or refused) between two writes.</summary>
+internal readonly record struct QualityApplied
+{
+    public int Epoch { get; init; }
+
+    public FrameGenQuality Quality { get; init; }
+
+    public bool Switched { get; init; }
+
+    /// <summary>Host time of the switch (CLOCK_MONOTONIC).</summary>
+    public long AtNs { get; init; }
+
+    /// <summary>How long the switch call took on the generator thread.</summary>
+    public long CallNs { get; init; }
+
+    /// <summary>The last write enqueued before it (every later write runs at the new quality).</summary>
+    public ulong AfterWrite { get; init; }
 }
 
 /// <summary>What the present thread shows for one output slot.</summary>
@@ -129,6 +160,15 @@ internal readonly record struct DecisionRecord
     /// <summary>The present lead: the slot's refresh is <see cref="SlotDecision.TargetTimeNs"/> plus this.</summary>
     public long PresentLeadNs { get; init; }
 
+    /// <summary>The generator quality this slot was decided for (committed switches: its write runs at it).</summary>
+    public FrameGenQuality Quality { get; init; }
+
+    /// <summary>A quality switch was being prepared when this slot was decided (D rising for a dearer generator).</summary>
+    public bool SwitchPending { get; init; }
+
+    /// <summary>Quality switches committed before this slot was decided.</summary>
+    public int QualityEpoch { get; init; }
+
     /// <summary>The refresh this slot is shown at (the scheduler's V is that minus the present lead).</summary>
     public long RefreshNs => Decision.TargetTimeNs + PresentLeadNs;
 }
@@ -164,6 +204,9 @@ internal readonly record struct WriteRecord
 
     /// <summary>GPU time the write was signalled, on CLOCK_MONOTONIC (anchored CUDA events); 0 when unknown.</summary>
     public long GpuEndNs { get; init; }
+
+    /// <summary>The generator's quality when the write was enqueued.</summary>
+    public FrameGenQuality Quality { get; init; }
 }
 
 /// <summary>What became of a present.</summary>

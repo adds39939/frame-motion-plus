@@ -1,3 +1,4 @@
+using FrameMotionPlus.Core.Abstractions;
 using FrameMotionPlus.Core.Cadence;
 using FrameMotionPlus.Core.Frames;
 using FrameMotionPlus.Core.Scheduling;
@@ -63,6 +64,15 @@ public sealed class PlaybackHooks
 
     /// <summary>Control thread: a capture changed between SDR and HDR10 (followed, or by hand); called once per change seen.</summary>
     public Action<Sources.V4l2.ColorSwitch>? OnColorSwitch { get; init; }
+
+    /// <summary>Control thread: a quality switch the generator thread carried out (or refused); once per switch.</summary>
+    public Action<QualitySwitchNotice>? OnQualitySwitch { get; init; }
+
+    /// <summary>Control thread: one line about a Q that did nothing (a generator with one quality, switching off).</summary>
+    public Action<string>? OnQualityNotice { get; init; }
+
+    /// <summary>Tests: called instead of loading the second quality's instance at start (throw to model a failed load).</summary>
+    public Action<FrameGenQuality>? BeforeSecondQualityLoad { get; init; }
 
     /// <summary>
     /// Tests: an offscreen session on the real clock presents as a window does, to this model of a compositor's FIFO (its
@@ -137,6 +147,21 @@ public sealed class PlaybackSetup
 
     public VfgLoadReport? VfgLoad { get; init; }
 
+    /// <summary>The second quality's instance loaded at start for Q (null: none loaded).</summary>
+    public VfgLoadReport? SecondVfgLoad { get; init; }
+
+    /// <summary>Q's two qualities (start, other) when live switching is on; null otherwise.</summary>
+    public (FrameGenQuality Start, FrameGenQuality Other)? QualitySwitch { get; init; }
+
+    /// <summary>Why Q does nothing in this run (null when it switches).</summary>
+    public string? QualitySwitchOff { get; init; }
+
+    /// <summary>The second instance was asked for and could not be loaded (the message).</summary>
+    public string? QualitySwitchLoadFailure { get; init; }
+
+    /// <summary>The context's free device memory before the generator was built and after (both instances), bytes.</summary>
+    public long GeneratorDeviceBytes { get; init; }
+
     public string? VfxSdk { get; init; }
 
     public bool GeneratorMayBlock { get; init; }
@@ -168,6 +193,24 @@ public sealed class PlaybackSetup
     public required string VulkanDriver { get; init; }
 }
 
+/// <summary>One quality switch as the generator thread carried it out (or refused it).</summary>
+public readonly record struct QualitySwitchNotice
+{
+    public QualityCommit Commit { get; init; }
+
+    /// <summary>False: the generator refused (its other instance unusable); it stays at <see cref="QualityCommit.From"/>.</summary>
+    public bool Switched { get; init; }
+
+    /// <summary>When the generator thread switched (CLOCK_MONOTONIC).</summary>
+    public long AppliedNs { get; init; }
+
+    /// <summary>The switch call on the generator thread (a pointer swap for VFG).</summary>
+    public long CallNs { get; init; }
+
+    /// <summary><see cref="AppliedNs"/> after the start of playback (0 before it started).</summary>
+    public long SinceStartNs { get; init; }
+}
+
 /// <summary>A quality mode's display name (avoids boxing an enum into a string on any path that matters).</summary>
 public readonly record struct FrameGenQualityName(string Name)
 {
@@ -180,6 +223,22 @@ public sealed class PlaybackReport
     public required PlaybackOptions Options { get; init; }
 
     public required PlaybackSetup Setup { get; init; }
+
+    /// <summary>Quality switches carried out (Q), in order.</summary>
+    public List<QualitySwitchNotice> QualitySwitches { get; } = [];
+
+    /// <summary>The generator's quality at the end (a run with VFG).</summary>
+    public FrameGenQuality QualityAtEnd { get; set; }
+
+    /// <summary>Q presses (and diagnostic requests) seen; prepared switches called off by a second press; switches committed
+    /// before D was ready (the wait gave up); generation times dropped as the quality before a switch.</summary>
+    public long QualityRequests { get; set; }
+
+    public long QualityCancels { get; set; }
+
+    public long QualityGaveUp { get; set; }
+
+    public long QualityStaleSamples { get; set; }
 
     public PlaybackStatistics Statistics { get; init; } = new();
 

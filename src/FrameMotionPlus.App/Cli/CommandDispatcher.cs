@@ -147,7 +147,8 @@ internal static class CommandDispatcher
           fmp settings set <key> <value>   Check and save one value (creates the file; other keys are kept; atomic)
           fmp settings unset <key>  Remove one value (the default applies again)
           keys: capture.device (/dev/videoN), capture.mode (--mode), generator.backend (--generator), generator.quality
-          (--quality), generator.multiplier (--multiplier), display.clock (--clock), display.fullscreen (true: --fullscreen,
+          (--quality), generator.multiplier (--multiplier), generator.qualitySwitch (true: --quality-switch, false:
+          --no-quality-switch), display.clock (--clock), display.fullscreen (true: --fullscreen,
           false: a window), display.window (WxH: the window's size when windowed; unlike --window it does not choose a window),
           audio.mode (--audio), audio.sink (--audio-sink), audio.source (--audio-source), audio.offsetMs (--audio-offset-ms),
           hdr.mode (--hdr), hdr.peakNits (--hdr-peak-nits), hdr.maxCll (--hdr-max-cll), hdr.maxFall (--hdr-max-fall),
@@ -288,6 +289,12 @@ internal static class CommandDispatcher
           --generator <name>        auto (VFG when the NVIDIA VFX SDK is found, else blend, saying why), vfg, blend,
                                     repeat, or none (real frames only)                        (auto)
           --quality <mode>          VFG quality: low, medium or high                          (medium)
+          --quality-switch, --no-quality-switch   VFG: load the other quality too at start (High, or Medium when
+                                    --quality high), so Q in the window switches between the two while playing, between
+                                    two frames and with no load (D rises first for High, then the lead; nothing late).
+                                    Costs that instance's load at start (about 90 ms) and its GPU memory (1.5 GB at
+                                    4K, 1.3 GB at 1440p). --no-quality-switch keeps one instance; a load that fails
+                                    keeps one too, said once. Q with blend, repeat or none says so  (on)
           --multiplier <n>          Cap on output frames per source frame, 1 to 8: a 60 fps file at 2 shows a new
                                     image every refresh of a 120 Hz display and every other refresh of a 240 Hz one;
                                     at 4 every refresh of the 240 Hz one                      (2)
@@ -339,7 +346,11 @@ internal static class CommandDispatcher
                                     --generator vfg, the VFX SDK. Ctrl+C, SIGTERM, closing the window or Escape stop it
                                     cleanly with its summary, at any point of the start-up too. If GPU work never finishes,
                                     it stops, reports what teardown left and ends the process.
+                                    Keys in the window act when pressed (not while held): Esc stops, Q switches the
+                                    generator's quality (Medium and High) and prints one line; the summary lists every
+                                    switch, what it cost, the slots around it and each quality's latency and d.
                                     Diagnostics: FMP_PLAY_WATCHDOG=1 prints where each pipeline thread is once a second;
+                                    FMP_QUALITY_SWITCH_EVERY_S=<s> asks for the other quality every s seconds, as Q does;
                                     FMP_PLAY_FAULT=gpu-wait@N (a GPU wait that never completes at the N-th generated frame)
                                     or gpu-busy@N:S (S seconds of GPU work there) checks that the run still ends.
 
@@ -361,7 +372,8 @@ internal static class CommandDispatcher
                                     In the window: H switches between SDR and HDR10 by hand (stops following; the output
                                     follows within a few frames; P010 captures only), A follows the signal again
                                     Keys in the window act when pressed (not while held), with or without modifiers:
-                                    Esc stops, H switches SDR/HDR10 by hand, A follows the signal again
+                                    Esc stops, H switches SDR/HDR10 by hand, A follows the signal again, Q switches the
+                                    generator's quality (Medium and High, as for play)
           --hdr-peak-nits <n>       HDR10 metadata sent with the picture (the card carries none): mastering peak, and
                                     MaxCLL unless given. Best set to the peak the PS5's HDR calibration was done for
                                     (the display's). KWin shows a PQ window's 203 nits at the output's SDR brightness
@@ -377,8 +389,9 @@ internal static class CommandDispatcher
           --windowed                A window instead of borderless fullscreen (also implied by --window <WxH>). By
                                     default capture is fullscreen on the window's output: there KWin gives it variable
                                     refresh, which --clock auto uses (the lowest latency); a window is fixed refresh
-          --generator, --quality, --multiplier, --output-hz, --duration-s, --window, --fullscreen, --clock, --validate, --csv,
-          --settings, --no-settings, --vfx-sdk, --warmup-s, --present-lead-ms, --latch-ms, --cuda-sync   As for play (the
+          --generator, --quality, --quality-switch, --no-quality-switch, --multiplier, --output-hz, --duration-s, --window,
+          --fullscreen, --clock, --validate, --csv, --settings, --no-settings, --vfx-sdk, --warmup-s, --present-lead-ms,
+          --latch-ms, --cuda-sync   As for play (the
                                     duration is unlimited by default: until Ctrl+C, closing the window or Escape)
                                     Without a device or --mode, the saved capture.device and capture.mode are used if set
           --offscreen               No window: an offscreen target on the real clock at --display-hz
@@ -398,7 +411,8 @@ internal static class CommandDispatcher
                                     for what the timestamps cannot see (the TV's processing, the card itself)     (0)
                                     Diagnostics: FMP_AUDIO_LOG=<s> prints the delay, its target, the ratio and the learned
                                     clock drift every s seconds on stderr; FMP_CAPTURE_SWITCH_EVERY_S=<s> switches between
-                                    SDR and HDR10 every s seconds as H does (to exercise the switch).
+                                    SDR and HDR10 every s seconds as H does (to exercise the switch); FMP_QUALITY_SWITCH_EVERY_S
+                                    as for play.
                                     Prints what it negotiated (and what the driver changed), the colour it resolved and
                                     why, the buffer mode, then the play summary plus capture statistics: frames dequeued,
                                     skipped as stale (newest wins), dropped by the driver, unique, repeats dropped, dropped

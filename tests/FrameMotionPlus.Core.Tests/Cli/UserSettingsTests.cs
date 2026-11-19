@@ -188,6 +188,45 @@ public sealed class UserSettingsTests : IDisposable
     }
 
     [Fact]
+    public void Quality_switching_is_an_option_of_both_commands_and_a_saved_setting()
+    {
+        // The default, the two options and their contradiction.
+        Assert.Equal(PlayOptions.QualitySwitchDefault, CaptureOptions.Parse([]).QualitySwitch);
+        Assert.Equal(PlayOptions.QualitySwitchDefault, PlayOptions.Parse(["clip.mkv"]).QualitySwitch);
+        Assert.False(CaptureOptions.Parse(["--no-quality-switch"]).QualitySwitch);
+        Assert.True(CaptureOptions.Parse(["--quality-switch"]).QualitySwitch);
+        Assert.False(PlayOptions.Parse(["clip.mkv", "--no-quality-switch"]).QualitySwitch);
+        Assert.True(PlayOptions.Parse(["clip.mkv", "--quality-switch", "--quality", "high"]).QualitySwitch);
+        Assert.Throws<UsageException>(() => CaptureOptions.Parse(["--quality-switch", "--no-quality-switch"]));
+        Assert.Throws<UsageException>(() => PlayOptions.Parse(["clip.mkv", "--quality-switch", "--no-quality-switch"]));
+
+        // Saved: generator.qualitySwitch, checked as a boolean, applied as the option unless one is typed.
+        Assert.Equal(0, Run("settings", "set", "generator.qualitySwitch", "OFF", "--settings", FilePath).Exit);
+        var loaded = UserSettings.Load(FilePath, mustExist: true);
+        Assert.False(loaded.Settings.Generator.QualitySwitch);
+        Assert.Equal("false", loaded.Values["generator.qualitySwitch"]);
+        var applied = UserSettings.Apply(SettingsTarget.Capture, [], loaded);
+        Assert.False(CaptureOptions.Parse(applied.Args).QualitySwitch);
+        Assert.Contains("generator.qualitySwitch=false", applied.Applied);
+        Assert.False(PlayOptions.Parse(UserSettings.Apply(SettingsTarget.Play, ["clip.mkv"], loaded).Args).QualitySwitch);
+        applied = UserSettings.Apply(SettingsTarget.Capture, ["--quality-switch"], loaded);
+        Assert.True(CaptureOptions.Parse(applied.Args).QualitySwitch);
+        Assert.Contains(applied.Overridden, o => o.StartsWith("generator.qualitySwitch", StringComparison.Ordinal));
+        Assert.Equal(2, Run("settings", "set", "generator.qualitySwitch", "maybe", "--settings", FilePath).Exit);
+        Assert.Contains("\"qualitySwitch\": false", File.ReadAllText(FilePath), StringComparison.Ordinal);
+        Assert.Equal(0, Run("settings", "set", "generator.qualitySwitch", "true", "--settings", FilePath).Exit);
+        Assert.True(UserSettings.Load(FilePath, mustExist: true).Settings.Generator.QualitySwitch);
+        var show = Run("settings", "show", "--settings", FilePath);
+        Assert.Contains("generator.qualitySwitch", show.Out, StringComparison.Ordinal);
+
+        // The help names the key, the options and the setting.
+        var help = Run("--help").Out;
+        Assert.Contains("--no-quality-switch", help, StringComparison.Ordinal);
+        Assert.Contains("generator.qualitySwitch", help, StringComparison.Ordinal);
+        Assert.Contains(" Q ", help, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void The_command_line_wins_over_the_file()
     {
         var path = Write("""

@@ -78,6 +78,10 @@ public sealed class PlaybackSession : IDisposable
     private PacingLoop? _pacing;
     private PlaybackSetup? _setup;
     private long _initialGenerationNs;
+    private QualitySwitchControl? _qualitySwitch;
+    private string? _qualitySwitchOff;
+    private string _qualityIgnored = "Q ignored: no quality switching in this run";
+    private bool _lastSwitchRefused;
     private long _presentLeadNs;
     private int _startupFrames;
 
@@ -131,6 +135,22 @@ public sealed class PlaybackSession : IDisposable
         }
 
         capture.Source.RequestColor(request);
+        return true;
+    }
+
+    /// <summary>
+    /// Asks for the other generator quality (what Q does in the window; any thread, also before playback starts, which then
+    /// starts at it). False, and nothing asked, when this run cannot switch (<see cref="PlaybackSetup.QualitySwitchOff"/>
+    /// says why). Allocation-free.
+    /// </summary>
+    public bool RequestQualityToggle()
+    {
+        if (_qualitySwitch is not { } control)
+        {
+            return false;
+        }
+
+        control.Toggle();
         return true;
     }
 
@@ -284,10 +304,17 @@ public sealed class PlaybackSession : IDisposable
         // The generator first: VFG's load and warm-up synchronise the context, so they belong here, before anything runs.
         var config = new FrameGenConfig { Width = width, Height = height, Format = format, Quality = _o.Quality, Color = info.Color };
         VfgLoadReport? load = null;
+        VfgLoadReport? secondLoad = null;
+        string? secondFailure = null;
+        var freeBefore = _cuda.MemoryInfo.FreeBytes;
+        var startQuality = QualitySwitchControl.Normalise(_o.Quality);
+        var otherQuality = QualitySwitchControl.OtherOf(startQuality);
+        Func<FrameGenQuality, bool>? switchQuality = null;
         if (_hooks.GeneratorFactory is { } factory)
         {
             _generator = factory(_cuda, _kernels, _generatorStream);
             _generator.Generator.Configure(config);
+            switchQuality = _o.QualitySwitch ? _generator.SwitchQuality : null;
         }
         else
         {
@@ -307,7 +334,36 @@ public sealed class PlaybackSession : IDisposable
                         }
 
                         load = vfg.LastLoad;
-                        _generator = new GeneratorHandle(vfg, vfg.TryReadGpuTime, $"VFG {QualityName(_o.Quality)}");
+                        if (_o.QualitySwitch)
+                        {
+                            // Q's other quality, loaded now (a drained point): during playback the generator thread only
+                            // swaps between the two loaded instances (VfgGenerator.TryConfigurePrepared: no load, no CUDA call).
+                            try
+                            {
+                                if (_hooks.BeforeSecondQualityLoad is { } before)
+                                {
+                                    before(otherQuality);
+                                }
+
+                                var other = config with { Quality = otherQuality };
+                                var report = vfg.Prepare(other);
+                                secondLoad = report.LoadNs > 0 ? report : null;
+                                var start = config with { Quality = startQuality };
+                                switchQuality = q => vfg.TryConfigurePrepared(q == otherQuality ? other : start);
+                            }
+                            catch (Exception e) when (e is not OutOfMemoryException)
+                            {
+                                // Short of video memory, or any other failure: one instance, as without the option.
+                                secondFailure = $"{e.GetType().Name}: {FirstLine(e.Message)}";
+                                switchQuality = null;
+                                if (!vfg.IsConfigured || vfg.IsFaulted)
+                                {
+                                    vfg.Configure(config);
+                                }
+                            }
+                        }
+
+                        _generator = new GeneratorHandle(vfg, vfg.TryReadGpuTime, $"VFG {QualityName(_o.Quality)}", switchQuality);
                         break;
                     }
 
@@ -335,10 +391,34 @@ public sealed class PlaybackSession : IDisposable
         if (_generator is { } made && _hooks.WrapGenerator is { } wrap)
         {
             _generator = wrap(made, _generatorStream, _kernels);
+            if (switchQuality is not null && _generator.SwitchQuality is null)
+            {
+                // A wrapper (fault injection) runs the same generator: Q still switches the instance under it.
+                _generator = new GeneratorHandle(_generator.Generator, _generator.ReadGpuTime, _generator.Name, switchQuality);
+            }
+        }
+
+        var generatorBytes = Math.Max(0, freeBefore - _cuda.MemoryInfo.FreeBytes);
+        if (switchQuality is not null && _generator is not null)
+        {
+            _qualitySwitch = new QualitySwitchControl(startQuality, otherQuality, q => InitialGenerationTime(GeneratorKind.Vfg, q));
+        }
+        else
+        {
+            _qualitySwitchOff = _generator is null ? "no generator (real frames only)"
+                : _o.Generator != GeneratorKind.Vfg && _hooks.GeneratorFactory is null ? $"the {_generator.Name} generator has one quality"
+                : secondFailure is not null ? $"the {QualityName(otherQuality)} instance could not be loaded at start ({secondFailure}); one instance kept"
+                : !_o.QualitySwitch ? "quality switching is off for this run (one VFG instance loaded)"
+                : "this generator has one quality";
+            _qualityIgnored = $"Q ignored: {_qualitySwitchOff}";
         }
 
         _initialGenerationNs = InitialGenerationTime(_o.Generator, _o.Quality);
-        var operations = OperationsPerWrite(_generator is null ? GeneratorKind.None : _o.Generator, _o.Quality);
+
+        // With Q on, the bridge is budgeted for the dearer of the two qualities (VFG High enqueues 170 operations a run).
+        var operations = Math.Max(
+            OperationsPerWrite(_generator is null ? GeneratorKind.None : _o.Generator, _o.Quality),
+            _qualitySwitch is null ? 0 : OperationsPerWrite(GeneratorKind.Vfg, otherQuality));
         var slots = new VulkanPresenterOptions().SlotCount;
         var maxLead = Math.Min(slots + 1, CudaVulkanBridgeOptions.StreamQueueOperations / operations);
         _bridge = new CudaVulkanBridge(_cuda, _presenter, new CudaVulkanBridgeOptions
@@ -350,7 +430,11 @@ public sealed class PlaybackSession : IDisposable
         _bridge.Configure(new BridgeConfig { Width = width, Height = height, Format = format });
 
         var records = Math.Max(_o.TelemetryCapacity, 1024);
-        _writer = new RingWriter(_cuda, _generatorStream, _generator, format, RingWriterQueue, records) { BeforeJob = _hooks.BeforeWrite };
+        _writer = new RingWriter(_cuda, _generatorStream, _generator, format, RingWriterQueue, records)
+        {
+            BeforeJob = _hooks.BeforeWrite,
+            Quality = startQuality,
+        };
         _presentLoop = new PresentLoop(
             _presenter,
             WindowTiming ? DisplayKind.Window : _o.Display,
@@ -388,6 +472,11 @@ public sealed class PlaybackSession : IDisposable
             GeneratorName = _generator?.Name ?? "none (real frames only)",
             Quality = new FrameGenQualityName(QualityName(_o.Quality)),
             VfgLoad = load,
+            SecondVfgLoad = secondLoad,
+            QualitySwitch = _qualitySwitch is { } qs ? (qs.Start, qs.Other) : null,
+            QualitySwitchOff = _qualitySwitchOff,
+            QualitySwitchLoadFailure = secondFailure,
+            GeneratorDeviceBytes = generatorBytes,
             VfxSdk = sdk,
             GeneratorMayBlock = _generator?.Generator.Capabilities.EnqueueMayBlock ?? false,
             Display = _target is SwapchainTarget swapchain
@@ -480,6 +569,7 @@ public sealed class PlaybackSession : IDisposable
         _ran = true;
         var collector = new TelemetryCollector(_o.TelemetryCapacity, _o.WarmupNs);
         var report = new PlaybackReport { Options = _o, Setup = _setup!, ValidationEnabled = _o.Validate, Statistics = collector.Statistics };
+        report.QualitySwitches.Capacity = QualitySwitchControl.LogCapacity;
         report.CsvPath = _o.CsvPath;
         TelemetryCsvWriter? csv = null;
         DedicatedThread? writerThread = null, presentThread = null, pacingThread = null;
@@ -534,6 +624,7 @@ public sealed class PlaybackSession : IDisposable
             {
                 OnTurn = _hooks.PacingTurn,
                 OtherMeters = [_writer.Meter, _presentLoop.Meter],
+                QualitySwitch = _qualitySwitch,
             };
             _source.Start(origin);
             _presentLoop.EnableFillers();
@@ -799,9 +890,69 @@ public sealed class PlaybackSession : IDisposable
     /// <summary>Window events outside the control loop (the pre-roll): a close or Escape stops the run there too.</summary>
     private void PumpWindow()
     {
-        if (_window is not null && (_window.PumpEvents() & (WindowEvents.CloseRequested | WindowEvents.EscapePressed)) != 0)
+        if (_window is null)
+        {
+            return;
+        }
+
+        var events = _window.PumpEvents();
+        if ((events & (WindowEvents.CloseRequested | WindowEvents.EscapePressed)) != 0)
         {
             RequestStop(StopReason.User);
+        }
+
+        if ((events & WindowEvents.QualityTogglePressed) != 0)
+        {
+            // Before playback: playback then starts at the other quality (the pacing thread commits it at once).
+            QualityKey();
+        }
+    }
+
+    /// <summary>Q: the other quality, or one line on why not (control thread).</summary>
+    private void QualityKey()
+    {
+        if (!RequestQualityToggle())
+        {
+            _hooks.OnQualityNotice?.Invoke(_qualityIgnored);
+        }
+    }
+
+    /// <summary>Quality switches the generator thread carried out since the last call: reported, once each (control thread).</summary>
+    private void DrainQualityApplied(PlaybackReport report)
+    {
+        if (_writer is null)
+        {
+            return;
+        }
+
+        while (_writer.QualityApplied.TryDequeue(out var applied))
+        {
+            var commit = _qualitySwitch is { } control && control.TryGetCommit(applied.Epoch, out var c) ? c
+                : new QualityCommit { Epoch = applied.Epoch, To = applied.Quality };
+            var start = _pacing?.PlaybackStartNs ?? long.MinValue;
+            var notice = new QualitySwitchNotice
+            {
+                Commit = commit,
+                Switched = applied.Switched,
+                AppliedNs = applied.AtNs,
+                CallNs = applied.CallNs,
+                SinceStartNs = start == long.MinValue ? 0 : Math.Max(0, applied.AtNs - start),
+            };
+            if (report.QualitySwitches.Count < report.QualitySwitches.Capacity)
+            {
+                // Room made before playback: the control thread allocates nothing for a switch.
+                report.QualitySwitches.Add(notice);
+            }
+
+            _hooks.OnQualitySwitch?.Invoke(notice);
+            if (!applied.Switched && !_lastSwitchRefused && _qualitySwitch is { } back && back.Desired == applied.Quality)
+            {
+                // The generator stayed where it was: the wish follows it, so the scheduler's estimate is put back too (once:
+                // a generator that refuses the way back as well is left where it is).
+                back.Toggle();
+            }
+
+            _lastSwitchRefused = !applied.Switched;
         }
     }
 
@@ -883,6 +1034,12 @@ public sealed class PlaybackSession : IDisposable
                     _ = RequestCaptureColor(CaptureColorRequest.Follow);
                 }
 
+                // Q: the other generator quality (both instances loaded at start; the switch is made between two writes).
+                if ((events & WindowEvents.QualityTogglePressed) != 0)
+                {
+                    QualityKey();
+                }
+
                 if (!fullscreenDone && _presenter!.IsTimingKnown)
                 {
                     fullscreenDone = true;
@@ -892,6 +1049,7 @@ public sealed class PlaybackSession : IDisposable
 
             collector.Drain(_pacing!, _writer!, _presentLoop!);
             DrainCsv(collector, csv, report);
+            DrainQualityApplied(report);
             if (OperatingSystem.IsLinux() && _hooks.OnColorSwitch is { } onSwitch && _source is CapturePlaybackSource switched
                 && switched.Source.ColorSwitches != colorSwitches)
             {
@@ -1076,6 +1234,20 @@ public sealed class PlaybackSession : IDisposable
             report.Pacing = Cost(p.Meter);
         }
 
+        DrainQualityApplied(report);
+        if (_writer is { } wq)
+        {
+            report.QualityAtEnd = _generator is null ? FrameGenQuality.Default : wq.Quality;
+        }
+
+        if (_qualitySwitch is { } qs)
+        {
+            report.QualityRequests = qs.Requests;
+            report.QualityCancels = qs.Cancels;
+            report.QualityGaveUp = qs.GaveUp;
+        }
+
+        report.QualityStaleSamples = _pacing?.StaleGenerationTimes ?? 0;
         if (_writer is { } w)
         {
             report.Copies = w.Copies;

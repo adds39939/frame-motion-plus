@@ -571,6 +571,66 @@ public class GeneratorTests
     }
 
     /// <summary>
+    /// Live quality switching (Q): the first pair generated after a switch between two loaded qualities is the frame that
+    /// quality makes for that pair at any other time, bit for bit, whatever the other instance and this one ran before (VFG
+    /// keeps no history across runs), so the pipeline generates it normally and substitutes no real frame. The two
+    /// qualities really are different instances (their frames differ), and switching never loads.
+    /// </summary>
+    [Fact]
+    public void The_first_pair_after_a_quality_switch_has_no_history_from_before()
+    {
+        var env = VfxHardware.Require();
+        var format = PixelFormat.Rgb10A2;
+        using var generator = new VfgGenerator(env.Context);
+        var medium = new FrameGenConfig { Width = Width, Height = Height, Format = format, Quality = FrameGenQuality.Medium };
+        var high = medium with { Quality = FrameGenQuality.High };
+        generator.Configure(medium);
+        generator.Prepare(high);
+        using var a = env.Pattern(Width, Height, format, 20);
+        using var b = env.Pattern(Width, Height, format, 22);
+        using var c = env.Pattern(Width, Height, format, 31);
+        using var d = env.Pattern(Width, Height, format, 33);
+        using var outHigh = env.Image(Width, Height, format);
+        using var outMedium = env.Image(Width, Height, format);
+        using var scratch = env.Image(Width, Height, format);
+        using var done = CudaEvent.Create(env.Context);
+        void Run(CudaDeviceBuffer p, CudaDeviceBuffer q, long t0, CudaDeviceBuffer o)
+        {
+            generator.Enqueue(p.AsFrame(contentTimeNs: t0), q.AsFrame(contentTimeNs: t0 + 1), 0.5f, o.AsFrame(), done.Signal);
+            done.Synchronize();
+        }
+
+        // References: each quality on (a, b) straight after loading.
+        Assert.True(generator.TryConfigurePrepared(high));
+        Run(a, b, 1, outHigh);
+        var highRef = env.Read(outHigh);
+        Assert.True(generator.TryConfigurePrepared(medium));
+        Run(a, b, 3, outMedium);
+        var mediumRef = env.Read(outMedium);
+        Assert.False(highRef.AsSpan().SequenceEqual(mediumRef), "Medium and High made the same frame: not two instances?");
+
+        var loads = generator.Loads;
+        for (var round = 0; round < 3; round++)
+        {
+            // Medium runs other pairs (a moving history of its own), then the switch, then High's first pair.
+            Run(c, d, 10 + (10 * round), scratch);
+            Run(d, c, 12 + (10 * round), scratch);
+            Assert.True(generator.TryConfigurePrepared(high));
+            Run(a, b, 14 + (10 * round), outHigh);
+            Assert.True(env.Read(outHigh).AsSpan().SequenceEqual(highRef), $"round {round}: High's first pair after the switch differs");
+
+            // And back: High ran other pairs, Medium's first pair is its own frame.
+            Run(c, d, 16 + (10 * round), scratch);
+            Assert.True(generator.TryConfigurePrepared(medium));
+            Run(a, b, 18 + (10 * round), outMedium);
+            Assert.True(env.Read(outMedium).AsSpan().SequenceEqual(mediumRef), $"round {round}: Medium's first pair after the switch differs");
+        }
+
+        Assert.Equal(loads, generator.Loads); // no reload: only pointer swaps
+        Assert.False(generator.IsFaulted);
+    }
+
+    /// <summary>
     /// Generator backlog item 1 (Phase 3 review): a control thread switches between two prepared instances of different
     /// sizes (a source changing resolution) as fast as it can while the generator thread enqueues frames of the small
     /// size. The active instance and its configuration used to be two fields that Enqueue read separately, so a switch

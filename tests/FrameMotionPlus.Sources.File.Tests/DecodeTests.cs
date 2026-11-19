@@ -507,6 +507,28 @@ public class DecodeTests
     public void A_buffer_is_not_overwritten_until_its_release_point(bool releaseWithReader)
     {
         var env = Media.Require();
+        if (releaseWithReader)
+        {
+            Assert.True(DelayedCopySeesTheFrame(env, releaseWithReader: true), "the buffer was overwritten before its last reader finished");
+            return;
+        }
+
+        // Control: released with no signal, the decoder cycles its buffers inside the 300 ms delay and the delayed copy
+        // sees a later frame. Whether the decoder's work gets the GPU beside the delay kernel in time is the GPU's
+        // scheduling (once, in a whole-solution run, it did not), so the control may take three tries: it only has to
+        // show that an early overwrite is seen when it happens.
+        var overwritten = 0;
+        for (var attempt = 0; attempt < 3 && overwritten == 0; attempt++)
+        {
+            overwritten += DelayedCopySeesTheFrame(env, releaseWithReader: false) ? 0 : 1;
+        }
+
+        Assert.True(overwritten > 0, "control: released with no signal, the buffer was expected to be overwritten early (3 tries)");
+    }
+
+    /// <summary>One try: true when the delayed copy of the first frame still saw that frame.</summary>
+    private static bool DelayedCopySeesTheFrame(MediaEnvironment env, bool releaseWithReader)
+    {
         using var source = new FileFrameSource(env.Context, env.Clip("h264-3s"), new FileSourceOptions { DecodeAhead = 1, HistoryDepth = 2, Kernels = env.Kernels });
         source.Start();
         using var reader = CudaStream.Create(env.Context);
@@ -529,13 +551,6 @@ public class DecodeTests
         reader.Synchronize();
         var seen = new uint[original.Length];
         reader.CopyFrameToHost(copy.AsFrame(), seen);
-        if (releaseWithReader)
-        {
-            Assert.True(seen.AsSpan().SequenceEqual(original), "the buffer was overwritten before its last reader finished");
-        }
-        else
-        {
-            Assert.False(seen.AsSpan().SequenceEqual(original), "control: released with no signal, the buffer was expected to be overwritten early");
-        }
+        return seen.AsSpan().SequenceEqual(original);
     }
 }

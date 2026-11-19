@@ -13,13 +13,14 @@ public delegate bool GpuTimeReader(out long nanoseconds);
 /// <summary>A generator and how to read the GPU time of each of its <see cref="IFrameGenerator.Enqueue"/> calls.</summary>
 public sealed class GeneratorHandle
 {
-    public GeneratorHandle(IFrameGenerator generator, GpuTimeReader? readGpuTime, string name)
+    public GeneratorHandle(IFrameGenerator generator, GpuTimeReader? readGpuTime, string name, Func<FrameGenQuality, bool>? switchQuality = null)
     {
         ArgumentNullException.ThrowIfNull(generator);
         ArgumentException.ThrowIfNullOrEmpty(name);
         Generator = generator;
         ReadGpuTime = readGpuTime;
         Name = name;
+        SwitchQuality = switchQuality;
     }
 
     public IFrameGenerator Generator { get; }
@@ -28,6 +29,13 @@ public sealed class GeneratorHandle
     public GpuTimeReader? ReadGpuTime { get; }
 
     public string Name { get; }
+
+    /// <summary>
+    /// Switches the generator to another quality whose instance is loaded already (no load, no CUDA call), between two
+    /// <see cref="IFrameGenerator.Enqueue"/> calls on the generator thread; false when it cannot (nothing changed). Null: one
+    /// quality only.
+    /// </summary>
+    public Func<FrameGenQuality, bool>? SwitchQuality { get; }
 }
 
 /// <summary>
@@ -51,8 +59,9 @@ internal sealed class RingWriter : IDisposable
     private readonly CudaSpanTimerRing _copySpans;
     private readonly GpuClock _clock;
     private readonly SpscRing<WriteJob> _jobs;
-    private readonly SpscRing<long> _generationTimes;
+    private readonly SpscRing<GenerationSample> _generationTimes;
     private readonly SpscRing<WriteRecord> _records;
+    private readonly SpscRing<QualityApplied> _qualityApplied = new(64);
     // An AutoResetEvent, not a ManualResetEventSlim: under NativeAOT the slim event's Monitor-based slow path allocates
     // lazily created state the first time a thread contends for it, which can be at any point of a long run (seen in the
     // 10-minute gate: 120 B, once, on this thread). The wait subsystem's event allocates nothing after a thread's first
@@ -64,6 +73,9 @@ internal sealed class RingWriter : IDisposable
     private int _pendingCount;
     private volatile bool _stop;
     private bool _faulted;
+    private int _epoch;
+    private int _quality;
+    private long _qualitySwitches;
 
     // Counters: written by this thread, read by others after it is joined (or as a snapshot).
     private long _enqueuedWrite;
@@ -89,7 +101,7 @@ internal sealed class RingWriter : IDisposable
         _generator = generator;
         _fillPixel = format == PixelFormat.Rgb10A2 ? 0xC0000000u : 0xFF000000u;
         _jobs = new SpscRing<WriteJob>(queueCapacity);
-        _generationTimes = new SpscRing<long>(1024);
+        _generationTimes = new SpscRing<GenerationSample>(1024);
         _records = new SpscRing<WriteRecord>(recordCapacity);
         _copySpans = CudaSpanTimerRing.Create(context, 64);
         try
@@ -106,8 +118,21 @@ internal sealed class RingWriter : IDisposable
     /// <summary>Jobs, pacing thread → this thread (single producer at a time: the pre-roll, then the pacing thread).</summary>
     public SpscRing<WriteJob> Jobs => _jobs;
 
-    /// <summary>Generation GPU times (d), this thread → pacing thread.</summary>
-    public SpscRing<long> GenerationTimes => _generationTimes;
+    /// <summary>Generation GPU times (d) and the quality epoch each ran in, this thread → pacing thread.</summary>
+    public SpscRing<GenerationSample> GenerationTimes => _generationTimes;
+
+    /// <summary>Quality switches carried out (or refused), this thread → control thread.</summary>
+    public SpscRing<QualityApplied> QualityApplied => _qualityApplied;
+
+    /// <summary>The generator's quality now (this thread switches it; set before the thread starts).</summary>
+    public FrameGenQuality Quality
+    {
+        get => (FrameGenQuality)Volatile.Read(ref _quality);
+        init => _quality = (int)value;
+    }
+
+    /// <summary>Quality switches the generator made.</summary>
+    public long QualitySwitches => Volatile.Read(ref _qualitySwitches);
 
     /// <summary>Write records, this thread → collector.</summary>
     public SpscRing<WriteRecord> Records => _records;
@@ -213,10 +238,22 @@ internal sealed class RingWriter : IDisposable
         {
             _ = read(out _);
         }
+
+        if (_generator?.SwitchQuality is { } change)
+        {
+            // A switch to the quality it has (it stays there): the switch path's first use is here, not at the first Q.
+            _ = change((FrameGenQuality)_quality);
+        }
     }
 
     private void Execute(in WriteJob job)
     {
+        if (job.Kind == WriteKind.Quality)
+        {
+            SwitchQuality(job);
+            return;
+        }
+
         BeforeJob?.Invoke(job);
         var start = Monotonic.NowNs;
         var stream = _stream;
@@ -276,8 +313,49 @@ internal sealed class RingWriter : IDisposable
             Volatile.Write(ref _recordsDropped, _recordsDropped + 1);
         }
 
-        _pending[(_pendingHead + _pendingCount) % PendingCapacity] = new Pending(job.SlotIndex, slot.Write, outcome, source, start, end, -1);
+        _pending[(_pendingHead + _pendingCount) % PendingCapacity] = new Pending(job.SlotIndex, slot.Write, outcome, source, start, end, -1, _epoch, (FrameGenQuality)_quality);
         _pendingCount++;
+    }
+
+    /// <summary>
+    /// A <see cref="WriteKind.Quality"/> job: the generator switches between the write before it and the write after it (a
+    /// pointer swap in VFG: both instances were loaded at start). No slot, no GPU work. The epoch moves on whatever the
+    /// outcome, so generation times from before it are told apart from those after it.
+    /// </summary>
+    private void SwitchQuality(in WriteJob job)
+    {
+        var start = Monotonic.NowNs;
+        var switched = false;
+        if (_generator?.SwitchQuality is { } change)
+        {
+            try
+            {
+                switched = change(job.Quality);
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                // Not a generation fault: the generator stays at the quality it had (reported as refused).
+                switched = false;
+            }
+        }
+
+        var end = Monotonic.NowNs;
+        _epoch = (int)job.SlotIndex;
+        if (switched)
+        {
+            Volatile.Write(ref _quality, (int)job.Quality);
+            Volatile.Write(ref _qualitySwitches, _qualitySwitches + 1);
+        }
+
+        _ = _qualityApplied.TryEnqueue(new QualityApplied
+        {
+            Epoch = (int)job.SlotIndex,
+            Quality = job.Quality,
+            Switched = switched,
+            AtNs = end,
+            CallNs = end - start,
+            AfterWrite = (ulong)_enqueuedWrite,
+        });
     }
 
     private static bool IsFaulted(IFrameGenerator generator) => generator is Vfx.VfgGenerator { IsFaulted: true };
@@ -314,7 +392,7 @@ internal sealed class RingWriter : IDisposable
                 }
 
                 head = head with { GpuNs = ns };
-                if (head.Source == SpanSource.Generator && !_generationTimes.TryEnqueue(ns))
+                if (head.Source == SpanSource.Generator && !_generationTimes.TryEnqueue(new GenerationSample(ns, head.Epoch)))
                 {
                     Volatile.Write(ref _samplesDropped, _samplesDropped + 1);
                 }
@@ -335,6 +413,7 @@ internal sealed class RingWriter : IDisposable
                 HostEndNs = head.HostEndNs,
                 GpuNs = head.GpuNs,
                 GpuEndNs = endNs,
+                Quality = head.Quality,
             };
             if (!_records.TryEnqueue(record))
             {
@@ -360,5 +439,5 @@ internal sealed class RingWriter : IDisposable
         Generator = 2,
     }
 
-    private readonly record struct Pending(long SlotIndex, ulong Write, WriteOutcome Outcome, SpanSource Source, long HostStartNs, long HostEndNs, long GpuNs);
+    private readonly record struct Pending(long SlotIndex, ulong Write, WriteOutcome Outcome, SpanSource Source, long HostStartNs, long HostEndNs, long GpuNs, int Epoch, FrameGenQuality Quality);
 }

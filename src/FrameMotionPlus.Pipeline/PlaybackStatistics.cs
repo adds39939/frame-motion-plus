@@ -1,3 +1,4 @@
+using FrameMotionPlus.Core.Abstractions;
 using FrameMotionPlus.Core.Time;
 
 namespace FrameMotionPlus.Pipeline;
@@ -61,6 +62,40 @@ public enum MissKind
 
 /// <summary>One missed slot: when (ns after the start of playback) and why.</summary>
 public readonly record struct MissEvent(long AtNs, MissKind Kind, int Refreshes);
+
+/// <summary>
+/// The slots around one quality switch (measured window): from the first slot decided while it was prepared (or its first
+/// slot at the new quality) to <see cref="PlaybackStatistics.SwitchWindowNs"/> after that first slot.
+/// </summary>
+public record struct QualitySwitchWindow
+{
+    /// <summary>The switch's number (<see cref="QualityCommit.Epoch"/>).</summary>
+    public int Epoch { get; internal set; }
+    public FrameGenQuality From { get; internal set; }
+    public FrameGenQuality To { get; internal set; }
+
+    /// <summary>Refresh of the first slot decided while the switch was prepared, ns after the start of playback.</summary>
+    public long PreparedAtNs { get; internal set; }
+
+    /// <summary>Refresh of the first slot decided at the new quality, ns after the start of playback.</summary>
+    public long BoundaryNs { get; internal set; }
+
+    public long Slots { get; internal set; }
+    public long Real { get; internal set; }
+    public long Generated { get; internal set; }
+
+    /// <summary>Slots that missed their refresh (whoever's), as the live accounting judged them.</summary>
+    public long Missed { get; internal set; }
+
+    /// <summary>A real frame shown instead of a generated one because the decision came too late (fixed refresh).</summary>
+    public long LateDecisions { get; internal set; }
+
+    /// <summary>Variable refresh: generated slots skipped (the real frame after them came too late for them).</summary>
+    public long VrrSkipped { get; internal set; }
+
+    /// <summary>Generated slots written with a real frame because the generator could not (none expected).</summary>
+    public long Fallbacks { get; internal set; }
+}
 
 /// <summary>What the measured window of a playback showed (filled by the collector on the control thread).</summary>
 public sealed class PlaybackStatistics
@@ -169,6 +204,74 @@ public sealed class PlaybackStatistics
     public double MeasuredSeconds => LastMeasuredNs > FirstMeasuredNs ? Nanoseconds.ToSeconds(LastMeasuredNs - FirstMeasuredNs) : 0;
 
     public long MissEventsDropped { get; private set; }
+
+    /// <summary>How long after its first slot at the new quality a switch's window lasts (and its latency is kept apart).</summary>
+    public const long SwitchWindowNs = 2 * Nanoseconds.PerSecond;
+
+    public const int MaxSwitchWindows = 64;
+
+    private readonly QualitySwitchWindow[] _switches = new QualitySwitchWindow[MaxSwitchWindows];
+    private readonly RunningStats[] _latencyByQuality = NewStats(4, 10 * Nanoseconds.PerMicrosecond, 2 * Nanoseconds.PerSecond);
+    private readonly RunningStats[] _generationByQuality = NewStats(4, Nanoseconds.PerMicrosecond, 100 * Nanoseconds.PerMillisecond);
+    private readonly RunningStats[] _delayByQuality = NewStats(4, 10 * Nanoseconds.PerMicrosecond, 2 * Nanoseconds.PerSecond);
+
+    /// <summary>The windows around the quality switches (the first <see cref="MaxSwitchWindows"/>).</summary>
+    public ReadOnlySpan<QualitySwitchWindow> QualitySwitches => _switches.AsSpan(0, QualitySwitchCount);
+
+    public int QualitySwitchCount { get; private set; }
+
+    /// <summary>Switches beyond <see cref="MaxSwitchWindows"/> (not windowed).</summary>
+    public long QualitySwitchesDropped { get; private set; }
+
+    /// <summary>
+    /// Real frames' latency (shown minus content time) at one quality, outside the switch windows (a run with quality
+    /// switching; empty otherwise).
+    /// </summary>
+    public RunningStats RealFrameLatencyAt(FrameGenQuality quality) => _latencyByQuality[QualityIndex(quality)];
+
+    /// <summary>Generation time d of the writes made at one quality (a run with quality switching).</summary>
+    public RunningStats GenerationTimesAt(FrameGenQuality quality) => _generationByQuality[QualityIndex(quality)];
+
+    /// <summary>The scheduler's D over the slots decided at one quality, outside the switch windows.</summary>
+    public RunningStats PipelineDelaysAt(FrameGenQuality quality) => _delayByQuality[QualityIndex(quality)];
+
+    internal ref QualitySwitchWindow OpenSwitch(int epoch, FrameGenQuality from, FrameGenQuality to, long preparedAtNs, long boundaryNs, out bool kept)
+    {
+        if (QualitySwitchCount < MaxSwitchWindows)
+        {
+            ref var w = ref _switches[QualitySwitchCount++];
+            w = new QualitySwitchWindow { Epoch = epoch, From = from, To = to, PreparedAtNs = preparedAtNs, BoundaryNs = boundaryNs };
+            kept = true;
+            return ref w;
+        }
+
+        QualitySwitchesDropped++;
+        kept = false;
+        return ref _switches[MaxSwitchWindows - 1];
+    }
+
+    internal ref QualitySwitchWindow LastSwitch => ref _switches[Math.Max(0, QualitySwitchCount - 1)];
+
+    internal void DropLastSwitch()
+    {
+        if (QualitySwitchCount > 0)
+        {
+            _switches[--QualitySwitchCount] = default;
+        }
+    }
+
+    private static int QualityIndex(FrameGenQuality quality) => (int)quality is >= 0 and < 4 ? (int)quality : 0;
+
+    private static RunningStats[] NewStats(int n, long bin, long max)
+    {
+        var stats = new RunningStats[n];
+        for (var i = 0; i < n; i++)
+        {
+            stats[i] = new RunningStats(bin, max);
+        }
+
+        return stats;
+    }
 
     public int MissEventCount { get; private set; }
 

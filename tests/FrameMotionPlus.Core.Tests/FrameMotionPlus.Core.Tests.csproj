@@ -25,4 +25,9 @@
     <ProjectReference Include="..\..\src\FrameMotionPlus.App\FrameMotionPlus.App.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- One timing-sensitive or CPU-heavy test assembly at a time on a machine: see the remarks in the file. -->
+    <Compile Include="..\Shared\GpuMachineLock.cs" Link="Support\GpuMachineLock.cs" />
+  </ItemGroup>
+
 </Project>

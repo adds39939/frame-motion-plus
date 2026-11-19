@@ -65,6 +65,9 @@ internal sealed record CaptureOptions
 
     public FrameGenQuality Quality { get; init; } = FrameGenQuality.Medium;
 
+    /// <summary>VFG: load the other quality too at start, so Q switches live (<c>--quality-switch</c> / <c>--no-quality-switch</c>).</summary>
+    public bool QualitySwitch { get; init; } = Play.PlayOptions.QualitySwitchDefault;
+
     public int Multiplier { get; init; } = 2;
 
     public double? OutputHz { get; init; }
@@ -118,7 +121,7 @@ internal sealed record CaptureOptions
 
     public static readonly IReadOnlySet<string> Flags = new HashSet<string>(StringComparer.Ordinal)
     {
-        "list", "fullscreen", "windowed", "offscreen", "validate", "no-cadence",
+        "list", "fullscreen", "windowed", "offscreen", "validate", "no-cadence", "quality-switch", "no-quality-switch",
     };
 
     public static CaptureOptions Parse(IReadOnlyList<string> args)
@@ -205,6 +208,7 @@ internal sealed record CaptureOptions
             Cadence = !r.Flag("no-cadence"),
             Generator = ParseGenerator(r.String("generator")),
             Quality = r.String("quality") is { } quality ? Vfg.VfgBenchOptions.ParseMode(quality) : FrameGenQuality.Medium,
+            QualitySwitch = Play.PlayOptions.ParseQualitySwitch(r),
             Multiplier = (int)r.Int64("multiplier", 2, 1, 8),
             OutputHz = r.Has("output-hz") ? r.Double("output-hz", 0, 1, 1000) : null,
             DurationS = r.Double("duration-s", 0, 0.05, 86_400),

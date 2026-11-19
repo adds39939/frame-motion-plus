@@ -132,6 +132,8 @@ internal static class CapturePrinter
                 $"automatic shot-change detection on; output written straight into the ring slots"));
         }
 
+        Play.PlayPrinter.PrintQualitySetup(o, s, playback);
+        Play.PlayPrinter.PrintKeys(o, playback, capture: true);
         o.WriteLine($"  device      {s.DeviceName}, Vulkan driver {s.VulkanDriver}; CUDA context scheduling {options.CudaSync}");
         o.WriteLine($"  display     {s.Display}; transform {s.Transform}");
         o.WriteLine($"  output      {s.Output}");

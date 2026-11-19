@@ -1,5 +1,6 @@
 using System.Globalization;
 using FrameMotionPlus.App.Capture;
+using FrameMotionPlus.Core.Abstractions;
 using FrameMotionPlus.Core.Scheduling;
 using FrameMotionPlus.Core.Time;
 using FrameMotionPlus.Cuda;
@@ -28,6 +29,8 @@ internal static class PlayPrinter
                 $"automatic shot-change detection on; output written straight into the ring slots"));
         }
 
+        PrintQualitySetup(o, s, playback);
+        PrintKeys(o, playback, capture: false);
         o.WriteLine($"  device      {s.DeviceName}, Vulkan driver {s.VulkanDriver}; CUDA context scheduling {options.CudaSync}");
         o.WriteLine($"  display     {s.Display}; transform {s.Transform}");
         o.WriteLine($"  signal      {DescribeFileSignal(info)}");
@@ -192,6 +195,8 @@ internal static class PlayPrinter
         {
             o.WriteLine(string.Create(Ic, $"              real-frame copy into the ring p50 {Ms(s.CopyTimes.Percentile(0.5))} ms, p99 {Ms(s.CopyTimes.Percentile(0.99))} ms over {s.CopyTimes.Count}"));
         }
+
+        PrintQualitySwitches(o, r);
 
         var dd = s.PipelineDelays;
         var stride = s.StrideDelay;
@@ -419,4 +424,120 @@ internal static class PlayPrinter
         : string.Create(Ic, $" (raised {r.LeadRaises}x when a frame's content missed the compositor's latch; peak {Ms(r.PeakLeadNs)} ms)");
 
     private static string Ms(double ns) => (ns / 1e6).ToString("0.000", Ic);
+
+    /// <summary>The start-up line on Q: both VFG qualities loaded (and what the second cost), or why Q does nothing.</summary>
+    public static void PrintQualitySetup(TextWriter o, PlaybackSetup s, PlaybackOptions playback)
+    {
+        if (s.QualitySwitch is { } pair)
+        {
+            var second = s.SecondVfgLoad is { } l
+                ? string.Create(Ic, $"{Pipeline.PlaybackSession.QualityName(pair.Other)} loaded too in {l.LoadNs / 1e6:0.0} ms, warmed up in {l.WarmupNs / 1e6:0.0} ms, {l.DeviceBytes / 1048576.0:0} MiB more GPU memory")
+                : $"{Pipeline.PlaybackSession.QualityName(pair.Other)} loaded too";
+            o.WriteLine(string.Create(Ic,
+                $"  quality     Q switches {Pipeline.PlaybackSession.QualityName(pair.Start)} <-> {Pipeline.PlaybackSession.QualityName(pair.Other)} while playing: {second} " +
+                $"(the generator's instances together {s.GeneratorDeviceBytes / 1048576.0:0} MiB); the switch is made between two frames, with no load " +
+                $"(--no-quality-switch keeps one instance)"));
+        }
+        else if (playback.Generator == Pipeline.GeneratorKind.Vfg)
+        {
+            o.WriteLine($"  quality     Q does nothing: {s.QualitySwitchOff}");
+        }
+    }
+
+    /// <summary>The window's keys, once at start (a window only).</summary>
+    public static void PrintKeys(TextWriter o, PlaybackOptions playback, bool capture)
+    {
+        if (playback.Display != Pipeline.DisplayKind.Window)
+        {
+            return;
+        }
+
+        o.WriteLine(capture
+            ? "  keys        in the window: Esc quits; H switches SDR/HDR10 by hand, A follows the signal again; Q switches the generator's quality (Medium/High)"
+            : "  keys        in the window: Esc quits; Q switches the generator's quality (Medium/High)");
+    }
+
+    /// <summary>The live line printed when the generator has switched (preformatted: the control thread allocates nothing).</summary>
+    public static Action<Pipeline.QualitySwitchNotice> QualityNotices(TextWriter o)
+    {
+        string[] lines =
+        [
+            "  quality     now Low (Q): the generator switched between two frames, no load",
+            "  quality     now Medium (Q): the generator switched between two frames, no load",
+            "  quality     now High (Q): the generator switched between two frames, no load",
+            "  quality     Q: the generator could not switch (its other instance is unusable); it stays where it was",
+        ];
+        return n => o.WriteLine(lines[!n.Switched ? 3 : n.Commit.To switch { FrameGenQuality.Low => 0, FrameGenQuality.High => 2, _ => 1 }]);
+    }
+
+    /// <summary>One "Q ignored" line (the session's text is made once at start).</summary>
+    public static Action<string> QualityIgnored(TextWriter o) => text =>
+    {
+        o.Write("  quality     ");
+        o.WriteLine(text);
+    };
+
+    /// <summary>The summary's quality lines: every switch with what it cost and the slots around it, and each quality's figures.</summary>
+    public static void PrintQualitySwitches(TextWriter o, PlaybackReport r)
+    {
+        var setup = r.Setup;
+        if (setup.QualitySwitch is not { } pair)
+        {
+            return;
+        }
+
+        var s = r.Statistics;
+        o.WriteLine(string.Create(Ic,
+            $"  quality     {r.QualitySwitches.Count} switch(es) (Q pressed {r.QualityRequests}x; called off before they were made {r.QualityCancels}; " +
+            $"made before D was ready {r.QualityGaveUp}); at the end {Pipeline.PlaybackSession.QualityName(r.QualityAtEnd)}; " +
+            $"generation times of the quality before a switch dropped from the estimate {r.QualityStaleSamples}"));
+        var windows = s.QualitySwitches;
+        foreach (var n in r.QualitySwitches)
+        {
+            var c = n.Commit;
+            var line = string.Create(Ic,
+                $"              {n.SinceStartNs / 1e9:0.000} s {Pipeline.PlaybackSession.QualityName(c.From)} -> {Pipeline.PlaybackSession.QualityName(c.To)}: " +
+                $"{(n.Switched ? "switched" : "REFUSED")} on the generator thread in {n.CallNs / 1e3:0.0} µs (no load); " +
+                $"prepared {(c.CommittedNs - c.RequestedNs) / 1e6:0.0} ms (D {Ms(c.DelayAtRequestNs)} -> {Ms(c.DelayAtCommitNs)} ms{(c.GaveUpWaiting ? ", not ready: gave up waiting" : "")}); " +
+                $"d estimate restarted at {Ms(c.EstimateNs)} ms");
+            var window = -1;
+            for (var i = 0; i < windows.Length; i++)
+            {
+                if (windows[i].Epoch == c.Epoch)
+                {
+                    window = i;
+                }
+            }
+
+            if (window >= 0 && windows[window].BoundaryNs != long.MinValue)
+            {
+                var w = windows[window];
+                line += string.Create(Ic,
+                    $"; around it ({(w.BoundaryNs - w.PreparedAtNs) / 1e6:0} ms before + {Pipeline.PlaybackStatistics.SwitchWindowNs / 1e9:0} s after its first slot): " +
+                    $"{w.Slots} slots ({w.Real} real, {w.Generated} generated), missed {w.Missed}, late {w.LateDecisions}, " +
+                    $"generated slots skipped {w.VrrSkipped}, fallbacks {w.Fallbacks}");
+            }
+            else
+            {
+                line += window >= 0 ? "; no slot decided at the new quality before the end" : "; outside the measured window";
+            }
+
+            o.WriteLine(line);
+        }
+
+        foreach (var q in new[] { pair.Start, pair.Other })
+        {
+            var lat = s.RealFrameLatencyAt(q);
+            var gen = s.GenerationTimesAt(q);
+            var delay = s.PipelineDelaysAt(q);
+            if (lat.Count == 0 && gen.Count == 0)
+            {
+                continue;
+            }
+
+            o.WriteLine(string.Create(Ic,
+                $"  at {Pipeline.PlaybackSession.QualityName(q),-8} real frames shown {(lat.Count == 0 ? "-" : Ms(lat.Mean))} ms after their content time (p99 {(lat.Count == 0 ? "-" : Ms(lat.Percentile(0.99)))}, {lat.Count} frames, outside the switches); " +
+                $"d p50 {Ms(gen.Percentile(0.5))} ms, p99 {Ms(gen.Percentile(0.99))} ms over {gen.Count}; D p50 {(delay.Count == 0 ? "-" : Ms(delay.Percentile(0.5)))} ms"));
+        }
+    }
 }

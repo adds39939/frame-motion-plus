@@ -109,6 +109,7 @@ internal static class CaptureCommand
             },
             Generator = generator.Value,
             Quality = options.Quality,
+            QualitySwitch = options.QualitySwitch,
             Multiplier = options.Multiplier,
             OutputHz = options.OutputHz,
             DurationNs = (long)(options.DurationS * Nanoseconds.PerSecond),
@@ -146,6 +147,8 @@ internal static class CaptureCommand
             var hooks = new PlaybackHooks
             {
                 OnColorSwitch = w => output.WriteLine(notices[(w.ToHdr ? 1 : 0) + (w.Cause == ColorSwitchCause.Manual ? 0 : 2)]),
+                OnQualitySwitch = PlayPrinter.QualityNotices(output),
+                OnQualityNotice = PlayPrinter.QualityIgnored(output),
             };
             using (var session = new PlaybackSession(playback, cuda, hooks, validationEcho: options.Validate ? error : null))
             {
@@ -181,6 +184,7 @@ internal static class CaptureCommand
                 audio.PrintSetup(output, options);
                 output.Flush();
                 using var switcher = SwitchEvery(session, error);
+                using var qualitySwitcher = PlayCommand.QualitySwitchEvery(session, error, "capture");
                 report = session.Run();
                 if (options.FramesCsvPath is { } path && session.PlaybackSource is CapturePlaybackSource capture)
                 {

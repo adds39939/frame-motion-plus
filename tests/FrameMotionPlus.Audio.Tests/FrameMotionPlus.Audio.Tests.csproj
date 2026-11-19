@@ -42,4 +42,9 @@
     <Compile Include="..\FrameMotionPlus.Cuda.Tests\Support\Repo.cs" Link="Support\Repo.cs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- One timing-sensitive or CPU-heavy test assembly at a time on a machine: see the remarks in the file. -->
+    <Compile Include="..\Shared\GpuMachineLock.cs" Link="Support\GpuMachineLock.cs" />
+  </ItemGroup>
+
 </Project>

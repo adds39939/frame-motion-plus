@@ -160,6 +160,14 @@ internal sealed class PacingLoop
     /// <summary>Test hook, pacing thread: once per loop turn (allocation injection).</summary>
     public Action? OnTurn { get; set; }
 
+    /// <summary>Live quality switching (null: one quality): polled every turn, before the decision.</summary>
+    public QualitySwitchControl? QualitySwitch { get; init; }
+
+    /// <summary>Generation times dropped because they came from the quality before a switch.</summary>
+    public long StaleGenerationTimes => Volatile.Read(ref _staleGenerationTimes);
+
+    private long _staleGenerationTimes;
+
     /// <summary>Set when playback ends by itself (duration, slot limit, end of file); read by the session.</summary>
     public StopReason Ended { get; private set; }
 
@@ -229,6 +237,7 @@ internal sealed class PacingLoop
             PumpSource(now);
             PumpGenerationTimes();
             PumpDisplay();
+            PumpQuality(now);
             CheckProgress();
             if (CheckEnd(now))
             {
@@ -395,13 +404,38 @@ internal sealed class PacingLoop
 
     private void PumpGenerationTimes()
     {
-        while (_writer.GenerationTimes.TryDequeue(out var ns))
+        var epoch = QualitySwitch?.Epoch ?? 0;
+        while (_writer.GenerationTimes.TryDequeue(out var sample))
         {
+            if (sample.Epoch != epoch)
+            {
+                // Generated at the quality before the last switch (still in flight when it was committed): not this
+                // quality's cost, so it must not move the estimate the switch started again.
+                Volatile.Write(ref _staleGenerationTimes, _staleGenerationTimes + 1);
+                continue;
+            }
+
             if (!_virtual)
             {
-                _scheduler.ReportGenerationTime(ns);
+                _scheduler.ReportGenerationTime(sample.Nanoseconds);
             }
         }
+    }
+
+    /// <summary>
+    /// A quality switch: prepared on the scheduler, then committed, and the generator's switch queued behind every write
+    /// already handed out (in order with them), so the slots decided before the commit are generated at the old quality and
+    /// every later one at the new.
+    /// </summary>
+    private void PumpQuality(long now)
+    {
+        if (QualitySwitch is not { } control || !control.Poll(_scheduler, now, out var to, out var epoch))
+        {
+            return;
+        }
+
+        EnqueueOrWait(_writer.Jobs, new WriteJob { Kind = WriteKind.Quality, SlotIndex = epoch, Quality = to });
+        _writer.Wake();
     }
 
     private void PumpDisplay()
@@ -514,6 +548,9 @@ internal sealed class PacingLoop
             Multiplier = _scheduler.Diagnostics.Multiplier,
             Outstanding = write != 0 ? _bridge.Outstanding : 0,
             PresentLeadNs = _presentLeadNs,
+            Quality = QualitySwitch?.Committed ?? FrameGenQuality.Default,
+            SwitchPending = QualitySwitch is { Pending: true },
+            QualityEpoch = QualitySwitch?.Epoch ?? 0,
         };
         if (!_decisions.TryEnqueue(record))
         {

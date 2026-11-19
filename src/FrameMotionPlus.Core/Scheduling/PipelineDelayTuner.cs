@@ -38,7 +38,7 @@ public sealed class PipelineDelayTuner
 
     private readonly AgedPercentile _generationTimes;
     private readonly double _percentile;
-    private readonly long _initialGenerationTimeNs;
+    private long _initialGenerationTimeNs;
     private readonly long _slewUpNsPerSecond;
     private readonly long _slewDownNsPerSecond;
     private readonly long _deadbandNs;
@@ -161,6 +161,21 @@ public sealed class PipelineDelayTuner
     }
 
     public void ResetGenerationStats() => _generationTimes.Clear();
+
+    /// <summary>
+    /// The generator's cost changed (a quality switch): every sample is forgotten and the estimate starts again from
+    /// <paramref name="initialGenerationTimeNs"/>, as at start-up (never below it until <see cref="ConfidentSampleCount"/>
+    /// samples of the new cost exist). D is not touched; it slews to whatever target follows.
+    /// </summary>
+    public void Restart(long initialGenerationTimeNs)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(initialGenerationTimeNs);
+        _generationTimes.Clear();
+        _initialGenerationTimeNs = initialGenerationTimeNs;
+        _probing = false;
+        _lastKnownNs = 0;
+        _currentMaxAgeNs = _maxSampleAgeNs;
+    }
 
     /// <summary>Jumps D straight to <paramref name="valueNs"/> (start-up, or after a source change).</summary>
     public void Reset(long valueNs)

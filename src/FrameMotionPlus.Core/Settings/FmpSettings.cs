@@ -324,6 +324,12 @@ public sealed class GeneratorSettings
     public FrameGenQuality Quality { get; set; } = FrameGenQuality.Medium;
 
     /// <summary>
+    /// <c>--quality-switch</c> (true) or <c>--no-quality-switch</c> (false) of fmp capture and fmp play: VFG loads the other
+    /// quality's instance at start so Q switches between the two live (null: not set, the build's default).
+    /// </summary>
+    public bool? QualitySwitch { get; set; }
+
+    /// <summary>
     /// Directory of the NVIDIA VFX SDK (the one holding lib/ and features/), which is never shipped with the app; null to
     /// look in $FMP_VFX_SDK, a repository checkout's lib/VideoFX and then the installer's /usr/local/VideoFX.
     /// </summary>

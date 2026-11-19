@@ -5,19 +5,23 @@ using System.Diagnostics;
 namespace FrameMotionPlus.TestSupport;
 
 /// <summary>
-/// Lets only one GPU hardware test assembly run at a time on this machine.
+/// Lets only one test assembly that measures real time, or loads the machine, run at a time on this machine.
 /// </summary>
 /// <remarks>
 /// <c>dotnet test</c> on the solution starts every test project at once. The hardware suites measure display cadence,
 /// GPU span times and back-pressure, and two of them sharing the GPU and the compositor disturb each other: a windowed
-/// cadence test was shown 168 frames/s on a 240 Hz display while another suite ran. Each such assembly holds an
-/// exclusive lock on one file for its whole run, so they queue behind each other. The operating system drops the lock
-/// when the test host exits, however it exits, so a leftover file means nothing. Without a GPU the tests skip and the
-/// lock is held for a moment only.
+/// cadence test was shown 168 frames/s on a 240 Hz display while another suite ran. The audio suite's loopback tests run
+/// a delay line on a thread that is not real-time against PipeWire's clock, and Core's and Platform's suites keep every
+/// core busy (scheduler sweeps, stress tests) or measure timer wake-ups: beside them the real-clock windows of the
+/// Pipeline, Vulkan and Audio tests (a latch measured to ±0.4 ms, clicks through a delay line, zero missed slots) failed
+/// in whole-solution runs and passed alone. So every test assembly of the solution holds an exclusive lock on one file
+/// for its whole run, and they queue behind each other (the GPU suites dominate the wall time either way). The
+/// operating system drops the lock when the test host exits, however it exits, so a leftover file means nothing. Without
+/// a GPU the hardware tests skip and the lock is held for as long as the remaining tests take.
 /// </remarks>
 public sealed class GpuMachineLock : IDisposable
 {
-    private static readonly TimeSpan MaxWait = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan MaxWait = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan SayAfter = TimeSpan.FromSeconds(5);
 
     private readonly FileStream? _held;
@@ -42,7 +46,7 @@ public sealed class GpuMachineLock : IDisposable
             }
             catch (IOException)
             {
-                // Held by another hardware test assembly (a sharing violation), or the file cannot be created.
+                // Held by another test assembly (a sharing violation), or the file cannot be created.
                 var waited = Stopwatch.GetElapsedTime(started);
                 if (waited > MaxWait)
                 {
@@ -53,7 +57,7 @@ public sealed class GpuMachineLock : IDisposable
                 if (!said && waited > SayAfter)
                 {
                     said = true;
-                    Console.Error.WriteLine($"Waiting for another GPU hardware test assembly to finish ({path}).");
+                    Console.Error.WriteLine($"Waiting for another test assembly to finish ({path}).");
                 }
 
                 Thread.Sleep(100);

@@ -37,6 +37,9 @@ public enum WindowEvents
 
     /// <summary>A: follow the signal's SDR/HDR10 state again.</summary>
     FollowPressed = 1 << 8,
+
+    /// <summary>Q: switch the frame generator's quality (Medium and High).</summary>
+    QualityTogglePressed = 1 << 9,
 }
 
 /// <summary>
@@ -189,6 +192,9 @@ public sealed unsafe class SdlWindow : IDisposable
                     break;
                 case SdlNative.EventKeyDown when e.Key == SdlNative.KeycodeA && e.Repeat == 0:
                     result |= WindowEvents.FollowPressed;
+                    break;
+                case SdlNative.EventKeyDown when e.Key == SdlNative.KeycodeQ && e.Repeat == 0:
+                    result |= WindowEvents.QualityTogglePressed;
                     break;
             }
         }

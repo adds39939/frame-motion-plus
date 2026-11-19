@@ -1,4 +1,4 @@
-# Phase 9a: saved settings (and what was left for later)
+# Phase 9a and 9c: saved settings, live quality switching (and what was left for later)
 
 Scope as set on 2026-11-18 (capture card first, forward progress over perfection). The session was cut short by the
 owner at 22:37 ("I want to start using this at 12am, so no 2 hour test please"): the card, the GPU and the screen had to be
@@ -139,6 +139,173 @@ outputs). So a direct-display mode is not reachable from inside the desktop sess
 text console (Ctrl+Alt+F3, log in; KWin gives up DRM master while its VT is in the background), run the app there on the
 HDMI-A-1 TV (VRR, HDR) or DP-3, and switch back with Ctrl+Alt+F1/F2. No mode is built for it yet.
 
+## 4. Live quality switching (Phase 9c, 2026-11-19)
+
+Built at night with the PS5 off and the owner asleep: every run below is `fmp play` of a looping 4K HDR10 file (the dim
+29.97 fps clip `c2160p2997-dim.mp4`, PQ/BT.2020, ordinary video) or a 1440p version of it, published NativeAOT binary,
+scratch `XDG_CONFIG_HOME`, `--no-settings`, no sound. Switches were asked for by the new diagnostic
+`FMP_QUALITY_SWITCH_EVERY_S=<s>` (what Q does; nobody at the keyboard). `fmp capture` uses the same session code but was
+not run with Q on the card.
+
+### What the owner can do
+
+- **Q in the window** (`fmp play` and `fmp capture`; key-down, no repeat) switches VFG between Medium and High (between
+  the start quality and High, or Medium when started with `--quality high`). One line per switch:
+  `quality     now High (Q): the generator switched between two frames, no load` (preformatted: the control thread
+  allocates nothing). A start-up `keys` line lists the keys (capture: Esc, H, A, Q; play: Esc, Q), and a `quality` line
+  says what the second instance cost or why Q does nothing. `--generator blend|repeat|none`, `--no-quality-switch` and a
+  failed second load answer Q with one line (`quality     Q ignored: the blend generator has one quality`).
+- **`--quality-switch` / `--no-quality-switch`** (both commands; both together is a usage error) and the saved setting
+  **`generator.qualitySwitch`** (`fmp settings set generator.qualitySwitch false`). **Default: on.**
+- The summary lists every switch: when, from → to, the generator thread's switch call, how long it was prepared and what D
+  did meanwhile, the estimate it restarted from, and the slots around it (from the first slot decided while it was
+  prepared to 2 s after its first slot at the new quality: slots, missed, late, generated slots skipped, fallbacks); then
+  each quality's real-frame latency, d and D outside the switches; the quality at the end.
+
+### How it works
+
+- **Both instances loaded at start** (`PlaybackSession.Open`, a drained point): `VfgGenerator.Prepare` of the other
+  quality after the first `Configure`. During playback the switch is `VfgGenerator.TryConfigurePrepared`: no load, no CUDA
+  call, the active instance and its configuration published as one object (unchanged since Phase 3).
+- **Where the switch lands:** the pacing thread owns it (`QualitySwitchControl`). A request (Q, any thread) is first
+  *prepared* on the scheduler (`FrameScheduler.PrepareGenerationTimeChange`): for a dearer quality D is budgeted for the
+  new cost at once and rises at its normal slew (50 ms/s, about 100 ms for High's +5 ms); once D is there the decision
+  lead is raised in steps of a quarter refresh per decision, so no decision finds its new time already past. Then it is
+  *committed*: the scheduler's generation-time estimate starts again from a figure for the new quality (what that quality
+  measured the last time it ran, else the start-up table: Medium 1.6 ms, High 6.5 ms), and a `WriteKind.Quality` job is
+  queued behind every write already handed out. The generator thread switches when it reaches that job, between two
+  writes: slots decided before the commit are generated at the old quality with the old lead, every later slot at the new
+  quality with the new lead. A cheaper quality is ready at once; D then falls at its slow slew (5 ms/s). A second press
+  before an up-switch is committed calls it off (counted); the latest wish wins. If no commit is possible within 1 s it
+  is made anyway (counted as "made before D was ready"; never seen).
+- **The first pair after a switch is generated normally** by the new instance: VFG keeps no state across runs (the same
+  pair gives the same output whatever ran before, Phase 3 "Output rebinding"), so no real frame is substituted and nothing
+  is counted for it. Generation times still in flight from the old quality are tagged with the switch epoch and dropped
+  before they reach the new estimate (2 to 5 per run of 8 switches).
+- **Budget:** with Q on the bridge is budgeted for High (192 CUDA operations per write; lead limit still 5).
+- **A failed second load** (video memory short, or any exception; injected in a test) keeps one instance: the start-up line
+  says `Q does nothing: the High instance could not be loaded at start (…); one instance kept`, Q answers with one line.
+- Q during the pre-roll or the variable-refresh probe is applied at the first pacing turn (playback starts at the other
+  quality); during an H colour switch nothing interacts (the generator's format does not change with the colour); on a
+  hold or still picture the switch is committed (no generation runs to hurt); at teardown a queued switch is executed or
+  dropped harmlessly. Both instances are destroyed by `VfgGenerator.Dispose` as before.
+
+### Cost, measured
+
+**Start-up and GPU memory** (warm CUDA JIT cache; the context's free memory around each load, and `nvidia-smi`):
+
+| Size (RGB10A2) | First instance (Medium) | Second instance (High) | Both |
+| --- | --- | --- | --- |
+| 3840x2160 | loaded 23.1 ms, warmed up 11.3 ms, 1,864 MiB | loaded 43.8–47.8 ms, warmed up 45.0–46.8 ms (**+89 to 94 ms**), **+1,540 MiB** (once 1,604) | 3,404 MiB |
+| 2560x1440 | loaded 22.6 ms, warmed up 9.9 ms, 858 MiB | loaded 47.0 ms, warmed up 43.1 ms (**+90 ms**), **+1,286 MiB** | 2,144 MiB |
+
+With an empty JIT cache (a new driver) High's first load is slower (114 ms at 1080p in Phase 3), once.
+
+**An idle second instance does not change Medium** (fullscreen on DP-3, variable refresh, 30 s, same file):
+
+| | d p50 / p99 | Real frame shown after content time (p99) | D p50 | Missed | GC | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| one instance (`--no-quality-switch`) | 1.422 / 1.496 ms | 19.564 ms (19.950) | 18.745 ms | 0 | 0/0/0 | PASS |
+| two instances, High unused (default) | 1.432 / 1.497 ms | 19.585 ms (19.690) | 18.751 ms | 0 | 0/0/0 | PASS |
+
+**Switching every 5 s, 42 s** (8 switches each; final build):
+
+| | Medium: latency (p99), d p50/p99, D | High: latency (p99), d p50/p99, D | Around the 8 switches | Run |
+| --- | --- | --- | --- | --- |
+| fullscreen, variable refresh (DP-3) | 19.496 ms (19.630), 1.417/1.486 ms, 18.690 ms | 24.284 ms (24.630), 6.153/6.394 ms, 23.440 ms | **0 missed, 0 late, 0 generated slots skipped, 0 fallbacks** | 2,399 slots, 0 missed, GC 0, PASS |
+| window 1600x900, fixed 240 Hz (stride 4) | 27.019 ms (27.340), 1.622/1.639 ms, 20.480 ms | 31.851 ms (35.100), 6.823/6.996 ms, 24.740 ms | **0 missed, 0 late** | 9,602 slots, 0 missed, GC 0, PASS |
+
+So High costs about **+4.8 ms of latency** (its +4.7 ms of d, through the lead and D). Per switch: the generator
+thread's call **1.9 to 3.2 µs**, no load, no CUDA call, no GPU memory; an up-switch is prepared for 73 to 95 ms (fixed) or
+174 to 188 ms (variable refresh: D's slew, then the lead's steps) while D rises from 18.7 to 23.4–23.7 ms, invisible but
+for the latency rising; a down-switch is committed within 0.2 to 15 ms and D falls back over about a second.
+
+The first version committed as soon as D was ready, with the lead raised in one step: in 7 up-switches it skipped 1
+generated slot (variable refresh) and made 1 late slot plus 1 miss (fixed 240 Hz), the slots whose decision time the
+raised lead put in the past. The lead now rises in steps before the commit (above); the unit test
+`Committing_at_once_without_raising_D_first_would_skip_slots` keeps the difference visible.
+
+**50+ switches, memory and allocation:** 1440p offscreen on the real clock at 120 Hz, a switch every 0.2 s for 16 s:
+**80 switches**; this process's GPU memory 3,208 MiB at every sample from the first second to the last, the machine back
+to its 1,609 MiB after exit; 0 B allocated on every pipeline thread, GC 0/0/0, 0 missed, teardown clean, PASS. (A JIT
+build's first switch allocated 424 B on the generator thread, first-use work; the generator thread's pre-roll now calls
+the switch once, to the quality it has.)
+
+**Default on, because** the added start-up is about 90 ms (under the 100 ms asked), the idle instance changes neither
+Medium's d nor its latency beyond noise, and GPU memory is the only cost: **+1.5 GB at 4K, +1.3 GB at 1440p** (the owner's
+4K session goes from about 3.1 to about 4.6 GB of the RTX 5090's 32 GB). `--no-quality-switch` or
+`generator.qualitySwitch false` keeps one instance.
+
+**For the owner's command** (`fmp capture --mode 4k30-hdr`, no settings file, no new option) the only differences are
+those: about 90 ms more start-up and 1.5 GB more GPU memory, both on the new `quality` start-up line, a `keys` line, and
+the bridge budget printed as 192 operations per write (its lead limit is 5 either way). Not run on the card tonight.
+
+### Tests
+
+- Unit (no GPU): `QualitySwitchControlTests` (Pipeline, 9: a model generator whose cost follows the commits in queue
+  order against the real scheduler; up and down with no late or skipped slot in variable and fixed refresh; the naive
+  commit does skip; presses taken back, rapid presses, a press before playback, the estimate restarting from what the
+  quality measured, allocation-free polling); `GenerationTimeChangeTests` (Core, 2: the tuner's restart; D raised before
+  the commit and the lead after it).
+- Hardware: `QualitySwitchPlaybackTests` (Pipeline): VFG switched Medium → High → Medium mid-run on the virtual clock
+  with the true middle frame of every pair known: every presented frame checked, the generated frames beat the blend, High's
+  d over 1.5 times Medium's, 0 misses, 0 fallbacks (Vfx); a second instance whose load throws leaves one and plays on
+  (Vfx); a model generator on the real clock: Q before playback and mid-run, the switch calls on the generator thread in
+  order, frames keep coming, nothing missed (Gpu).
+- CLI: `Quality_switching_is_an_option_of_both_commands_and_a_saved_setting` (Core): default, both options, contradiction,
+  the setting's check, apply and override, `show`, `--help`.
+
+## 5. Whole-solution test runs (Phase 9c)
+
+**What was wrong.** Seven test assemblies queued behind the cross-process machine lock (`tests/Shared/GpuMachineLock.cs`:
+Cuda, Gpu, Pipeline, Sources.File, Sources.V4l2, Vfx, Vulkan); **Core, Platform and Audio did not**. So in a
+`dotnet test FrameMotionPlus.slnx` run Core's scheduler sweeps and stress tests (every core busy) and Platform's timer
+tests ran at the start beside whichever hardware suite held the lock, and the Audio suite (PipeWire loopback through a
+delay line on a thread that is not real-time) always ran beside one, which is how the real-clock windows of
+`SimulatedDisplayTests` (latch 1.9–2.7 ms, lead 3.9–4.7 ms), `PipeWireLoopbackTests` and `ReviewWindowRegressionTests`
+failed in whole-solution runs and passed alone.
+
+**Fix.** Every one of the ten test assemblies now holds the same lock (Audio, Core and Platform compile it in too), so
+none runs beside another; the wait limit is 30 minutes (the last of ten can wait longer than the old 10). Core takes 4 s,
+so the wall time barely moves. CI is unaffected (no GPU or audio server: those tests skip, the lock is held briefly).
+`WindowedTests`' zero-miss tests now use the rule their sibling `A_short_starting_lead_adapts_and_the_misses_stop` uses:
+skipped only when every miss counted as the pipeline's is cleared by its own timestamps (handed over at least 1 ms before
+the latch, or within 4 refreshes of a miss of the display's); any other miss fails (`WindowedTests.JudgeMisses`).
+
+**Results** (`dotnet test FrameMotionPlus.slnx -c Release`, three times in a row, 05:22 to 05:54; each run 10 min 20 s,
+about what one took before):
+
+| Run | Result |
+| --- | --- |
+| 1 | all green: Core 708, Platform 100 + 1 skip, Audio 75, Cuda 144, Vulkan 108, Gpu 129, Vfx 92 + 1 skip, Sources.File 154, Pipeline 156 + 1 skip, Sources.V4l2 86 + 35 skips |
+| 2 | all green (Vfx 93 + 1 skip: the new Vfx test was in from run 2) |
+| 3 | **one failure: `SinkGuardTests.A_pulseaudio_monitor_of_the_stream_is_left_alone` (Audio)**; everything else green |
+
+The Pipeline skip in every run is `WindowedTests.A_present_lead_too_short_for_this_compositor_is_counted_as_the_pipelines`
+(the compositor took the presents handed over 1.5 ms before their refresh: nothing late to judge; its own rule, unchanged).
+`SimulatedDisplayTests`, `PipeWireLoopbackTests`, `WindowedTests` and `ReviewWindowRegressionTests` passed in all three.
+
+**The remaining failure is not a timing one and not this phase's** (no Audio source changed): afterwards the test failed
+alone too, 4 of 7 times, then passed 12 times in a row. Each failure had the `parec --monitor-stream` node at a recycled
+low id (127; the run-3 one at 129) that the **test's own registry connection** reported as not announced, while the guard's
+connection had classified the same node as a recorder ("1 recorder(s) take a copy of the sound (parec,
+Stream/Input/Audio): left alone"); a `pw-mon` trace showed a pulse client object holding id 127 being removed and made
+again around the moment parec's node was created. So it looks like a node id recycled while a registry still held (or
+received late) a removal for the id's previous object: `PwConnection` keys everything by id and its `global_remove` drops
+whatever has that id. If the guard's own connection ever met the same, it would see a link to an unannounced node, which
+it treats as wrong (mute and cut), a real risk for a screen share's stream; matching objects by `object.serial` (which
+PipeWire never reuses) would remove it. Not fixed here: the test now says which peers it saw, how its registry described
+them and whether the recorder was announced later (`SinkGuardTests.cs`, `Rig.Describe`), so the next failure tells.
+
+Two more runs afterwards (06:01 to 06:22): **run 4 failed one test, run 5 was all green.** Run 4's failure was
+`DecodeTests.A_buffer_is_not_overwritten_until_its_release_point(releaseWithReader: False)` (Sources.File, running alone
+under the lock): its *control* case expects the decoder to overwrite a released buffer within a 300 ms GPU delay kernel,
+and once the decoder's work did not get the GPU in time. The real case (released with the reader's signal: never
+overwritten early) is unchanged; the control now takes up to three tries (`DecodeTests.cs`, `DelayedCopySeesTheFrame`),
+passed 3 of 3 alone afterwards. Then two more whole-solution runs with that change (06:23 to 06:44): **all green**.
+So runs 5, 6 and 7 are three in a row with no failure (10 min 20 s each); the Audio test above did not fail again in
+them, but it is not fixed.
+
 ## Known issues / not done
 
 1. **The two-hour soak**: done as the owner's session (1c); the RSS creep of 1b levelled off. Nothing in the summary
@@ -152,32 +319,33 @@ HDMI-A-1 TV (VRR, HDR) or DP-3, and switch back with Ctrl+Alt+F1/F2. No mode is 
    ```
    Judge: GC 0 in the measured window, the latency line at the end against the start, audio drift and underruns, RSS,
    GPU memory and descriptor counts flat after the first minutes, a clean exit (PASS, teardown clean).
-2. **Live quality switching (Q) is not built.** What is known: `VfgGenerator` already supports loading a second instance
-   at a drained point (`Prepare`) and switching to it during playback without any CUDA call (`TryConfigurePrepared`,
-   published whole between two `Enqueue` calls, covered by `A_prepared_only_switch_never_loads`); loading during
-   playback is not an option, because `NvVFX_Load` synchronises the whole CUDA context and stalls the capture's uploads
-   and the generator for the load and warm-up (Phase 3: High loads in about 42 ms warm, 114 to 217 ms cold, and an
-   instance takes 140 MB to 1.9 GB). The plan: load the other instance at start-up behind an opt-in option (so the default
-   `fmp capture --mode 4k30-hdr` keeps its start-up time and memory), Q on the control thread calling
-   `TryConfigurePrepared`, the bridge budgeted for High's 192 operations per write (lead still 5), the scheduler's d
-   estimate following the step within two samples and D rising at 50 ms/s (about 90 ms for High's +4.6 ms), so latency
-   about +5 ms on High. The switch cost was not measured on hardware.
+2. **Live quality switching**: built (section 4). Not run on the capture card (the PS5 was off); a hold on the card while
+   switching, and Q on the owner's TV under variable refresh, are untested on hardware.
 3. **Soak figures in the summary are not built** (RSS, GPU memory per process via NVML, descriptor and thread counts at
    start, after the warm-up and at the end, growth per hour, latency drift by minute). A first allocation-free sampler
    (procfs with `pread`, `getdents64`, NVML process lists) was written and removed unfinished when the session was cut;
    the existing summary already carries GC counts for the measured window, D and latency at the end, and the audio drift
    correction, underruns, overruns and the delay's excursions.
-4. Keys are not printed once at start; no Q key.
+4. Keys: printed once at start (`keys` line); Q added.
 5. Leftovers not done: the switch notice going stale after 64 switches (`PlaybackSession.cs`, the source keeps only the
    first 64 in its log); the HDR check's "PQ codes kept" line that cannot fail (`HdrCheck.cs:110`, needs a measured
    tolerance); offscreen colour switches allocating on the present thread (`OffscreenTarget.cs:157`).
 6. `fmp capture --list` with `--settings` is refused ("--list takes no other option"), as before.
 7. Direct display: only the probe above.
+8. **The audio guard's loopback hole** (phase8-audio.md, "Screen shares and recorders"): not done in Phase 9c (time).
+9. **`SinkGuardTests.A_pulseaudio_monitor_of_the_stream_is_left_alone` fails intermittently** (section 5): the test's
+   registry connection loses a recorder node at a recycled id; suspected id reuse against `PwConnection`'s id-keyed maps
+   (`object.serial` would be the fix), which could also make the guard itself take a recorder for a wrong link.
+10. Quality switching, not done or not measured: Q on the capture card (PS5 off); switching during a hold or a cut on the
+   card; Q under variable refresh on the owner's 119.88 Hz TV (only DP-3 was used); the per-switch window counts the live
+   accounting's misses, not the verifier's; a switch made while the scheduler makes no decisions (a long hold) waits 1 s
+   and is then committed without D ready (counted, never seen).
 
 ## What should change in `docs/implementation-plan.md` (not edited here)
 
 Under Phase 9: saved settings done (CLI, no window); the two-hour soak done (the owner's session, 1c); hitch-free
-quality switching and the soak instrumentation still open; the direct-display finding above (KWin leases no desktop connector: a TTY is needed).
+quality switching done (section 4: Q, on by default, +90 ms start-up and +1.5 GB at 4K, 0 missed around 16 switches;
+the whole solution's test assemblies all queue behind one machine lock, section 5); the soak instrumentation still open; the direct-display finding above (KWin leases no desktop connector: a TTY is needed).
 
 ## Found by the independent review (2026-11-18)
 
@@ -197,4 +365,29 @@ cannot be created. Not fixed:
 - JSON errors give a zero-based line number and .NET type names.
 - Test isolation redirects `XDG_CONFIG_HOME` for the whole test process, so PipeWire or Vulkan loader configuration
   under `~/.config` would be ignored by tests on a machine that has any.
+
+## Found by the independent review of live quality switching (2026-11-19)
+
+Approved with no must-fix. Measured back to back on the published binary, the idle second instance changed nothing:
+fullscreen variable refresh 19.60 / 19.52 ms without it and 19.52 / 19.50 ms with it; 0 missed, 0 B, no collections.
+The bridge budget printed as 192 operations is a declared figure only: the lead limit is 5 either way. Fixed
+afterwards: the windowed tests' skip rule could clear every miss when no slot made its refresh. Not fixed:
+
+- **Recycled node ids and the audio guard:** the intermittent failure of `SinkGuardTests.A_pulseaudio_monitor_of_
+  the_stream_is_left_alone` did not reproduce in 106 attachments with every registry event logged (1,810 id reuses,
+  none mis-tracked), and the suspected ordering fault is contradicted by that evidence. Sound reaching an unchosen
+  device through id reuse is not reachable by reading. A wrong mute needs a lost node announcement, which could not
+  be produced; the cause of the original failures is unknown. To do: before cutting a stream for an unannounced
+  peer, enumerate again with a fresh registry proxy and rebuild the maps; count what the catch at
+  `PwConnection.cs:396-399` swallows; have the test dump the registry events when it fails.
+- **The test lock's fallback is invisible:** `dotnet test` does not show the hosts' stderr, so an assembly that
+  gives up waiting after 30 minutes runs unlocked with nothing to say why its timing tests then fail.
+- **High's generation time is seeded at 6.5 ms** whatever the size or GPU (`PlaybackSession.cs:1603-1608`); the
+  measured windowed p99 is 6.996 ms, covered only by the 0.5 ms margin. Seed it from the second instance's warm-up.
+- **Video memory short:** a second load that fails falls back to one instance; one that succeeds and starves a
+  later allocation would break a start that one instance survived (not tested; nor a cold CUDA JIT cache).
+- **Q is silent in fullscreen:** a stray Q with the window focused moves to High (about 4.8 ms more latency) with
+  only a line in the terminal to show it.
+- 60 fps at 4x on fixed 240 Hz drops to stride 2 with 6 starved slots at an up-switch (simulated).
+- Not exercised: Q on the capture card, during a hold or a cut, and H while a switch is pending.
 

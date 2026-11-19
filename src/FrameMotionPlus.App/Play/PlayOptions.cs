@@ -28,6 +28,16 @@ internal sealed record PlayOptions
 
     public FrameGenQuality Quality { get; init; } = FrameGenQuality.Medium;
 
+    /// <summary>
+    /// Whether VFG loads its second quality at start for Q when neither <c>--quality-switch</c> nor
+    /// <c>--no-quality-switch</c> (nor the setting <c>generator.qualitySwitch</c>) says: see docs/benchmarks/phase9-polish.md,
+    /// "Live quality switching", for what it costs.
+    /// </summary>
+    public const bool QualitySwitchDefault = true;
+
+    /// <summary>VFG: load the other quality too at start, so Q switches live (<c>--quality-switch</c> / <c>--no-quality-switch</c>).</summary>
+    public bool QualitySwitch { get; init; } = QualitySwitchDefault;
+
     public int Multiplier { get; init; } = 2;
 
     /// <summary>Asked for as an output rate (Hz) instead of a multiplier: the multiplier is this over the file's rate.</summary>
@@ -81,7 +91,7 @@ internal sealed record PlayOptions
 
     public static readonly IReadOnlySet<string> Flags = new HashSet<string>(StringComparer.Ordinal)
     {
-        "loop", "fullscreen", "offscreen", "realtime", "validate", "gate",
+        "loop", "fullscreen", "offscreen", "realtime", "validate", "gate", "quality-switch", "no-quality-switch",
     };
 
     public static PlayOptions Parse(IReadOnlyList<string> args)
@@ -102,6 +112,7 @@ internal sealed record PlayOptions
             Gate = gate,
             Generator = ParseGenerator(r.String("generator")),
             Quality = r.String("quality") is { } quality ? Vfg.VfgBenchOptions.ParseMode(quality) : FrameGenQuality.Medium,
+            QualitySwitch = ParseQualitySwitch(r),
             Multiplier = (int)r.Int64("multiplier", 2, 1, 8),
             OutputHz = r.Has("output-hz") ? r.Double("output-hz", 0, 1, 1000) : null,
             Loop = r.Flag("loop"),
@@ -177,6 +188,19 @@ internal sealed record PlayOptions
         }
 
         return o;
+    }
+
+    /// <summary><c>--quality-switch</c> / <c>--no-quality-switch</c> (both: a usage error); neither: the default.</summary>
+    internal static bool ParseQualitySwitch(ArgumentReader r)
+    {
+        var on = r.Flag("quality-switch");
+        var off = r.Flag("no-quality-switch");
+        if (on && off)
+        {
+            throw new UsageException("'--quality-switch' and '--no-quality-switch' contradict each other.");
+        }
+
+        return on || (!off && QualitySwitchDefault);
     }
 
     /// <summary>The multiplier cap: <see cref="Multiplier"/>, or <see cref="OutputHz"/> over the file's rate.</summary>

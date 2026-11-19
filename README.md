@@ -264,6 +264,7 @@ fmp play clip-1440p60.mp4 --loop                       # VFG Medium, 2x (60 → 
 fmp play clip-1440p60.mp4 --loop --multiplier 4        # 4x where the display allows (every refresh at 240 Hz)
 fmp play clip-1440p60.mp4 --generator blend --csv play.csv   # blend, per-slot timeline as CSV
 fmp play clip-1440p60.mp4 --fullscreen                 # borderless fullscreen on the window's output (variable refresh)
+fmp play clip-1440p60.mp4 --loop --no-quality-switch   # one VFG instance: Q does nothing, 1.3-1.5 GB less GPU memory
 fmp play clip-1440p60.mp4 --gate                       # the Phase 4 gate: 10 minutes VFG Medium 2x, no miss of the pipeline's
 fmp play clip.mkv --offscreen --generator blend --duration-s 5   # no window: offscreen on a virtual clock
 fmp verify play.csv                                    # recompute a run's verdict from its telemetry CSV alone
@@ -275,7 +276,19 @@ fmp bench present --test vrr --fullscreen              # whether first pixels fo
 A 60 fps file at `--multiplier 2` shows a new image every refresh of a 120 Hz display and every other refresh of a
 240 Hz one (each image then shows for two refreshes); `--multiplier 4` gives every refresh at 240 Hz. Window close,
 Escape, Ctrl+C and SIGTERM stop it cleanly with its summary, during the start-up too; if GPU work never finishes, it
-stops, says what its teardown had to leave and ends the process. A published binary outside a checkout does not find
+stops, says what its teardown had to leave and ends the process.
+
+**Q switches VFG's quality while playing** (`fmp play` and `fmp capture`, in the window; key-down only): between the
+quality it started at and High (Medium and High by default; Medium and High also when started with `--quality high`; Low
+and High with `--quality low`). Both instances are loaded at start, so the switch is a pointer
+swap on the generator thread between two frames, with no load (loading during playback would stall the whole GPU for
+50 to 200 ms). Going up, the pipeline delay D first rises by High's extra cost (about 5 ms at 4K, in about 100 ms) and the
+decisions move earlier step by step, then the generator switches, so no slot is late; going down it switches at once and D
+falls back over about a second. Each switch prints one line; the summary lists every switch (when, what it cost, the
+slots around it) and each quality's latency and generation time. The cost of having it: about 90 ms more start-up and
+the second instance's GPU memory (High: about 1.5 GB at 4K, 1.3 GB at 1440p; printed at start); `--no-quality-switch`
+(or `fmp settings set generator.qualitySwitch false`) keeps one instance. Measured in
+[`docs/benchmarks/phase9-polish.md`](docs/benchmarks/phase9-polish.md), "Live quality switching". A published binary outside a checkout does not find
 the VFX SDK in `lib/VideoFX`: set `$FMP_VFX_SDK` (or `--vfx-sdk`). See `fmp --help` for every option.
 
 ## Capturing from a capture card
@@ -311,7 +324,8 @@ not yet seen) SDR (BT.709).
 The HDR side of that rule is measured; the SDR side is not yet (the console stayed in HDR while this was built): if a
 console in SDR is still shown as HDR10, press **H** in the window, which switches between SDR and HDR10 by hand at the
 next frame (the output is rebuilt with it, within a frame or two; on 10-bit captures only); **A** follows the signal
-again. Keys act when pressed, not while held: Esc stops, H and A as above. `--hdr on|off` fixes it
+again. Keys act when pressed, not while held: Esc stops, H and A as above, Q switches VFG's quality as in `fmp play`
+(the start-up's `keys` line lists them). `--hdr on|off` fixes it
 for the run. The NV12 modes (`-sdr`) are SDR: the card fits an HDR signal into SDR itself for its 8-bit formats.
 `--hdr-peak-nits` (and `--hdr-max-cll`, `--hdr-max-fall`) set the HDR metadata sent with the picture, since the card
 carries none: best the peak the PS5's own HDR calibration was done for. At the start `fmp capture` says what the signal is
@@ -341,6 +355,7 @@ such as `--size` against a saved mode, or `--audio off` against a saved sink) wi
 print one `settings` line naming the file and every value taken from it, and what was not used and why. A malformed file
 stops the command with one error naming the file and the line; a key this fmp does not know is reported and skipped. The
 keys are `capture.device`, `capture.mode`, `generator.backend`, `generator.quality`, `generator.multiplier`,
+`generator.qualitySwitch` (true or false: `--quality-switch` / `--no-quality-switch`),
 `display.clock`, `display.fullscreen` (true or false), `display.window` (the window's size when windowed), `audio.mode`,
 `audio.sink`, `audio.source`, `audio.offsetMs`, `hdr.mode`, `hdr.peakNits`, `hdr.maxCll`, `hdr.maxFall` and
 `generator.vfxSdkDirectory` (`fmp --help`, "saved settings"). `set` writes the file atomically and keeps the other keys

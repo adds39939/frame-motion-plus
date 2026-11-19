@@ -37,9 +37,10 @@ internal static unsafe partial class SdlNative
 
     public const uint KeycodeEscape = 0x1B;
 
-    /// <summary>SDLK_H and SDLK_A (SDL3 keycodes of letter keys are their lower-case characters).</summary>
+    /// <summary>SDLK_H, SDLK_A and SDLK_Q (SDL3 keycodes of letter keys are their lower-case characters).</summary>
     public const uint KeycodeH = 0x68;
     public const uint KeycodeA = 0x61;
+    public const uint KeycodeQ = 0x71;
 
     static SdlNative()
     {

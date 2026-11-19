@@ -129,6 +129,15 @@ public sealed class SinkGuardTests
             }
         }
 
+        /// <summary>"id name (media.class)" as this connection's registry knows the node, or "id not announced".</summary>
+        public string Describe(uint id)
+        {
+            using (Test.Lock())
+            {
+                return Test.TryNodeKindLocked(id, out var name, out var mediaClass) ? $"{id} {name} ({mediaClass ?? "no media.class"})" : $"{id} not announced";
+            }
+        }
+
         public List<uint> PlaybackPeers()
         {
             var node = Delay.PlaybackNodeId;
@@ -374,12 +383,25 @@ public sealed class SinkGuardTests
         reader.Start();
         Thread.Sleep(3000);
         var peers = rig.PlaybackPeers();
+        var described = string.Join(", ", peers.Select(rig.Describe));
+        var announcedAfterMs = -1L;
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        while (!rig.PlaybackPeers().Any(rig.IsRecorder) && watch.ElapsedMilliseconds < 5000)
+        {
+            Thread.Sleep(20);
+        }
+
+        if (rig.PlaybackPeers().Any(rig.IsRecorder))
+        {
+            announcedAfterMs = watch.ElapsedMilliseconds;
+        }
+
         var report = rig.Delay.Report();
         var muted = rig.Delay.Line.Muted;
         monitor.Kill();
         monitor.WaitForExit(2000);
         reader.Join(2000);
-        Assert.Contains(peers, rig.IsRecorder);
+        Assert.True(peers.Any(rig.IsRecorder), $"no recorder among the playback stream's peers after 3 s: {described}; one announced {announcedAfterMs} ms later (-1: not within 5 s); muted {muted}, wrong links {report.WrongSinkLinks}; events: {rig.Events}");
         Assert.True(peak > ClickGenerator.Height / 2, $"the monitor's peak {peak} over {bytes} B; events: {rig.Events}");
         Assert.Equal(0, report.WrongSinkLinks);
         Assert.False(muted, $"muted with a monitor attached; events: {rig.Events}");

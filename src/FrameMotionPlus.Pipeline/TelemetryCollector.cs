@@ -1,3 +1,4 @@
+using FrameMotionPlus.Core.Abstractions;
 using FrameMotionPlus.Core.Scheduling;
 using FrameMotionPlus.Core.Telemetry;
 
@@ -396,6 +397,7 @@ internal sealed class TelemetryCollector
             FirstShownFrame = d.Decision.FrameA;
         }
 
+        TrackQuality(d);
         e = default;
         e.SlotIndex = slot;
         e.Decision = d;
@@ -408,6 +410,116 @@ internal sealed class TelemetryCollector
         e.ScheduledImage = _lastScheduledImage;
         _newestSlot = Math.Max(_newestSlot, slot);
         TryComplete(ref e);
+    }
+
+    private FrameGenQuality _lastQuality = FrameGenQuality.Default;
+    private bool _awaitingBoundary;
+    private bool _switchOpen;
+    private long _switchFromNs = long.MaxValue;
+    private long _switchToNs = long.MinValue;
+
+    /// <summary>
+    /// Quality switches, from the decisions (in slot order): the first slot decided while a switch is prepared opens its
+    /// window (a dearer quality's D rises then), the first slot decided at the new quality fixes its boundary, and the
+    /// window lasts <see cref="PlaybackStatistics.SwitchWindowNs"/> after that; a switch called off drops its window. Slots
+    /// in a window are counted for it and kept out of the per-quality latency and D.
+    /// </summary>
+    private void TrackQuality(in DecisionRecord d)
+    {
+        if (d.Quality == FrameGenQuality.Default)
+        {
+            return;
+        }
+
+        var measured = _measureFromNs != long.MaxValue && d.RefreshNs >= _measureFromNs;
+        if (d.SwitchPending && !_awaitingBoundary && measured)
+        {
+            _ = Statistics.OpenSwitch(d.QualityEpoch + 1, d.Quality, FrameGenQuality.Default, d.RefreshNs - _originNs, long.MinValue, out _switchOpen);
+            _awaitingBoundary = true;
+            _switchFromNs = d.RefreshNs;
+            _switchToNs = long.MaxValue;
+        }
+
+        if (_lastQuality != FrameGenQuality.Default && d.Quality != _lastQuality && measured)
+        {
+            if (!_awaitingBoundary)
+            {
+                // Committed in the turn it was asked for (a cheaper quality): no slot was decided while it was prepared.
+                _ = Statistics.OpenSwitch(d.QualityEpoch, _lastQuality, d.Quality, d.RefreshNs - _originNs, d.RefreshNs - _originNs, out _switchOpen);
+                _switchFromNs = d.RefreshNs;
+            }
+
+            if (_switchOpen)
+            {
+                ref var w = ref Statistics.LastSwitch;
+                w.Epoch = d.QualityEpoch;
+                w.To = d.Quality;
+                w.BoundaryNs = d.RefreshNs - _originNs;
+            }
+
+            _awaitingBoundary = false;
+            _switchToNs = d.RefreshNs + PlaybackStatistics.SwitchWindowNs;
+        }
+        else if (_awaitingBoundary && !d.SwitchPending)
+        {
+            // Called off (Q again before it was made): no switch, no window.
+            if (_switchOpen)
+            {
+                Statistics.DropLastSwitch();
+            }
+
+            _awaitingBoundary = false;
+            _switchOpen = false;
+            _switchFromNs = long.MaxValue;
+            _switchToNs = long.MinValue;
+        }
+
+        _lastQuality = d.Quality;
+    }
+
+    /// <summary>A measured slot into the quality statistics: its switch window, or its quality's latency and D.</summary>
+    private void CountQuality(in Entry e, bool missed)
+    {
+        var d = e.Decision;
+        if (d.Quality == FrameGenQuality.Default)
+        {
+            return;
+        }
+
+        var s = Statistics;
+        var refresh = d.RefreshNs;
+        if (e.HasWrite && e.Write.Outcome == WriteOutcome.Generated && e.Write.GpuNs > 0)
+        {
+            s.GenerationTimesAt(e.Write.Quality).Add(e.Write.GpuNs);
+        }
+
+        var inWindow = refresh >= _switchFromNs && refresh < _switchToNs;
+        if (inWindow)
+        {
+            if (_switchOpen)
+            {
+                ref var w = ref s.LastSwitch;
+                w.Slots++;
+                w.Real += d.Decision.Kind == SlotKind.Real ? 1 : 0;
+                w.Generated += d.Decision.Kind == SlotKind.Generated ? 1 : 0;
+                w.Missed += missed ? 1 : 0;
+                w.LateDecisions += d.Decision.Reason == SlotReason.Late ? 1 : 0;
+                w.VrrSkipped += Vrr ? d.Decision.SkippedSlots : 0;
+                w.Fallbacks += e.HasWrite && e.Write.Outcome == WriteOutcome.Fallback ? 1 : 0;
+            }
+
+            return;
+        }
+
+        if (d.Decision.Kind != SlotKind.Empty)
+        {
+            s.PipelineDelaysAt(d.Quality).Add(d.Decision.PipelineDelayNs);
+        }
+
+        if (d.Decision.Kind == SlotKind.Real && e.HasPresent && e.Present is { Outcome: PresentOutcome.Shown, ShownNs: > 0, Untimed: false } p)
+        {
+            s.RealFrameLatencyAt(d.Quality).Add(p.ShownNs - d.Decision.ContentTimeNs);
+        }
     }
 
     private void TryComplete(ref Entry e)
@@ -578,6 +690,11 @@ internal sealed class TelemetryCollector
                     Statistics.StrideDelay.Add(p.ShownNs - d.ContentTimeNs - e.Decision.PresentLeadNs - d.PipelineDelayNs);
                 }
             }
+        }
+
+        if (measured)
+        {
+            CountQuality(e, missed);
         }
 
         var w2 = e.Write;

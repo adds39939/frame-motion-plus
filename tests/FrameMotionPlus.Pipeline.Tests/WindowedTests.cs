@@ -101,34 +101,8 @@ public class WindowedTests
             var s = report.Statistics;
             var half = s.LastMeasuredNs > s.FirstMeasuredNs ? (s.LastMeasuredNs - s.FirstMeasuredNs) / 2 : 0;
             var judgedFrom = half + 300_000_000;
-            var period = report.DisplayRate.IsValid ? (long)report.DisplayRate.PeriodNs : 0;
 
-            // The live misses and the CSV's missed slots are the same set, in the same order: pair them, and read each
-            // miss's hand-over lead (refresh − the later of submission and content written) from its slot.
-            var rows = ShortLeadRow.Read(csv);
-            var missedRows = rows.Where(r => r.Missed).OrderBy(r => r.TargetNs).ToList();
-            var events = s.MissEvents.ToArray().OrderBy(m => m.AtNs).ToList();
-            var paired = missedRows.Count == events.Count;
-            var latchUpper = rows.Where(r => !r.Missed && r.ActualNs > 0 && r.SubmitNs > 0).Select(r => r.HandoverLeadNs).Order().ToList() is { Count: > 0 } ok
-                ? ok[ok.Count / 20]
-                : long.MaxValue;
-            var display = events.Where(m => m.Kind is MissKind.DisplayLate or MissKind.Discarded or MissKind.CatchUp).Select(m => m.AtNs).ToList();
-            var pipeline = 0;
-            var excused = 0;
-            for (var i = 0; i < events.Count; i++)
-            {
-                var m = events[i];
-                if (m.AtNs <= judgedFrom || m.Kind is not (MissKind.LatePresent or MissKind.Dropped or MissKind.NotShown or MissKind.SkippedVblank or MissKind.Early))
-                {
-                    continue;
-                }
-
-                pipeline++;
-                var aheadOfLatch = paired && missedRows[i].HandoverLeadNs >= latchUpper + 1_000_000;
-                var nearDisplay = period > 0 && display.Any(t => Math.Abs(t - m.AtNs) <= 4 * period);
-                excused += aheadOfLatch || nearDisplay ? 1 : 0;
-            }
-
+            var (pipeline, excused, latchUpper, paired) = JudgeMisses(report, csv, judgedFrom);
             Log.WriteLine($"{Playback.Describe(report)}; lead raised {report.LeadRaises}x to {report.FinalLeadNs / 1e6:0.000} ms; latch at most {latchUpper / 1e6:0.000} ms " +
                           $"(on-time hand-overs, p5); second half: pipeline misses {pipeline}, of them cleared by their timestamps {excused}; misses paired with slots {paired}");
             RequireFixedGrid(report);
@@ -149,6 +123,45 @@ public class WindowedTests
         {
             File.Delete(csv);
         }
+    }
+
+    /// <summary>
+    /// The rule for a windowed run on a live desktop: the misses counted as the pipeline's after <paramref name="judgedFrom"/>
+    /// (ns after the start), and how many of them their own timestamps clear as the display's: handed over at least 1 ms
+    /// before the latch (the p5 hand-over lead of the slots shown on time), or within 4 refreshes of a miss of the
+    /// display's. The live misses and the CSV's missed slots are the same set in the same order (paired to read each
+    /// miss's hand-over lead); only the kinds a late hand-over can explain can be cleared.
+    /// </summary>
+    private static (int Pipeline, int Excused, long LatchUpper, bool Paired) JudgeMisses(PlaybackReport report, string csv, long judgedFrom)
+    {
+        var s = report.Statistics;
+        var period = report.DisplayRate.IsValid ? (long)report.DisplayRate.PeriodNs : 0;
+        var rows = ShortLeadRow.Read(csv);
+        var missedRows = rows.Where(r => r.Missed).OrderBy(r => r.TargetNs).ToList();
+        var events = s.MissEvents.ToArray().OrderBy(m => m.AtNs).ToList();
+        var paired = missedRows.Count == events.Count;
+        var latchUpper = rows.Where(r => !r.Missed && r.ActualNs > 0 && r.SubmitNs > 0).Select(r => r.HandoverLeadNs).Order().ToList() is { Count: > 0 } ok
+            ? ok[ok.Count / 20]
+            : long.MaxValue;
+        var display = events.Where(m => m.Kind is MissKind.DisplayLate or MissKind.Discarded or MissKind.CatchUp).Select(m => m.AtNs).ToList();
+        var pipeline = 0;
+        var excused = 0;
+        for (var i = 0; i < events.Count; i++)
+        {
+            var m = events[i];
+            if (m.AtNs <= judgedFrom || m.Kind is not (MissKind.LatePresent or MissKind.Dropped or MissKind.NotShown or MissKind.SkippedVblank or MissKind.Early))
+            {
+                continue;
+            }
+
+            pipeline++;
+            // No slot made its refresh: there is no latch to be ahead of (long.MaxValue must not wrap into clearing every miss).
+            var aheadOfLatch = paired && latchUpper != long.MaxValue && missedRows[i].HandoverLeadNs >= latchUpper + 1_000_000;
+            var nearDisplay = period > 0 && display.Any(t => Math.Abs(t - m.AtNs) <= 4 * period);
+            excused += aheadOfLatch || nearDisplay ? 1 : 0;
+        }
+
+        return (pipeline, excused, latchUpper, paired);
     }
 
     /// <summary>One slot of the telemetry CSV, as much as the short-lead test needs.</summary>
@@ -181,7 +194,20 @@ public class WindowedTests
 
     private static PlaybackReport Windowed(Cuda.CudaContext cuda, GeneratorKind generator)
     {
-        var report = Run(cuda, generator, -1, adaptive: true, 3_500_000_000, 1_000_000_000);
+        var csv = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"fmp-windowed-{Environment.ProcessId}-{Environment.TickCount64}.csv");
+        try
+        {
+            return Windowed(cuda, generator, csv);
+        }
+        finally
+        {
+            File.Delete(csv);
+        }
+    }
+
+    private static PlaybackReport Windowed(Cuda.CudaContext cuda, GeneratorKind generator, string csv)
+    {
+        var report = Run(cuda, generator, -1, adaptive: true, 3_500_000_000, 1_000_000_000, csvPath: csv);
         Log.WriteLine(Playback.Describe(report));
         RequireFixedGrid(report);
 
@@ -206,6 +232,17 @@ public class WindowedTests
         {
             Assert.Skip($"environment: the compositor skipped {environment} refresh(es) with a present queued (pipeline misses {s.PipelineMisses}); " +
                         $"{shown:0.0} presents/s on a {rate:0.###} Hz output");
+        }
+
+        // The sibling's rule (A_short_starting_lead_adapts_and_the_misses_stop): skipped only when every miss counted as the
+        // pipeline's is cleared by its own timestamps as the display's; any other fails.
+        var (pipeline, excused, latchUpper, paired) = JudgeMisses(report, csv, long.MinValue);
+        Log.WriteLine($"pipeline misses {s.PipelineMisses}: {pipeline} of a kind a late hand-over explains, {excused} of them cleared by their timestamps " +
+                      $"(latch at most {latchUpper / 1e6:0.000} ms; misses paired with slots {paired})");
+        if (s.PipelineMisses > 0 && pipeline == s.PipelineMisses && excused == pipeline)
+        {
+            Assert.Skip($"environment: all {pipeline} misses counted as the pipeline's were handed over well before the latch or next to a miss of the display's " +
+                        $"({shown:0.0} presents/s on a {rate:0.###} Hz output)");
         }
 
         Assert.Equal(0, s.PipelineMisses);

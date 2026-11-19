@@ -79,6 +79,13 @@ public sealed record PlaybackOptions
     public FrameGenQuality Quality { get; init; } = FrameGenQuality.Medium;
 
     /// <summary>
+    /// VFG only: load the other quality's instance too (High, or Medium when <see cref="Quality"/> is High) at start, so Q
+    /// in the window (<see cref="PlaybackSession.RequestQualityToggle"/>) switches between the two during playback without
+    /// a load. Costs that instance's start-up time and GPU memory. A failed load keeps one instance (said once).
+    /// </summary>
+    public bool QualitySwitch { get; init; }
+
+    /// <summary>
     /// The cap on output frames per source frame (the scheduler's maximum multiplier). The scheduler picks the largest
     /// ratio up to this the display allows: a 60 fps file at 2 on a 120 Hz panel shows a new frame every refresh, on a
     /// 240 Hz panel every other refresh; at 4 on the 240 Hz panel every refresh. 1 shows real frames only.
