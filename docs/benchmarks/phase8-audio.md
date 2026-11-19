@@ -126,8 +126,9 @@ Two findings about the stack that shaped the design:
   desktop's per-application move outright ("Invalid argument"), with or without `dont-move`, as long as `dont-reconnect`
   is set, so that move cannot be honoured without giving up the pin. When the sink goes, the stream ends in error and is
   linked nowhere; the supervisor makes it again when a sink of that name is back. Behind all of that, the guard mirrors
-  the capture side: **silence unless the playback stream is linked to exactly the chosen sink**; a link to anything else
-  mutes at once and the stream is cut and made again (back-off 250 ms doubling to 2 s); the sound being muted for that
+  the capture side: **silence unless the playback stream feeds the chosen sink and no other output device** (changed
+  2026-11-19, see "Screen shares" below: it was "exactly the chosen sink"); a link to another output device (another
+  sink, a null sink, a duplex device, a link made by hand) or to a node the registry has not announced mutes at once and the stream is cut and made again (back-off 250 ms doubling to 2 s); the sound being muted for that
   reason and resuming are each said once on stderr. Without `--audio-sink`, when the owner selects another default output
   mid-run the stream is re-pinned there, guarded the same way (the line mutes and fades in on target). WirePlumber's own
   fallback default is never followed.
@@ -291,6 +292,54 @@ The timestamps put the sound on the picture as the host sees both. What they can
 If the sound is also heard another way (the TV on the card's HDMI passthrough, a headset on the DualSense), that sound
 is not delayed and arrives about one video latency before the picture: mute it there, or it will sound like an echo.
 
+## Screen shares and recorders (2026-11-19)
+
+Found in the owner's 2 h 16 min session while streaming on Discord: Discord's Linux client takes an application's sound
+by listing the sink inputs (PulseAudio API) and linking a recording stream to the application's playback node (seen in the
+graph: `discord_capture`, `media.class = Stream/Input/Audio`, `media.name = "game capture"`,
+`application.process.binary = Discord`, `target.object` = fmp's playback node, linked from `fmp-audio-playback`'s
+outputs). The guard took that for a wrong link: it muted, cut and re-made the stream, Discord linked again, and it looped
+(no sound for the owner or the stream). The rule now (`PipeWireAudioDelay.ClassifyPlaybackPeers`), for each node the
+playback stream's outputs are linked to:
+
+| Peer | Treated as |
+| --- | --- |
+| the chosen sink | linked: the sound plays |
+| another output device: `Audio/Sink*` (a sink, a null sink, an equaliser's or EasyEffects' virtual sink, a combined sink), `Audio/Duplex` | **wrong**: muted at once, cut, the stream made again to the chosen sink (as before) |
+| a node the registry has not announced | **wrong** as well (where the sound goes is unknown). The registry announces a node before any link to it (the server registers a node before its ports and links), so this is no race with a recorder appearing |
+| any other node: a capture stream (`Stream/Input/Audio`: a screen share's sound, OBS, `pw-record` aimed at the stream, `parec --monitor-stream`), a virtual source | a recorder taking a copy: left alone. Said once on stderr ("N recorder(s) take a copy of the sound (...): left alone") |
+
+A recorder attaching changes nothing on the sound's path to the sink: no mute, no re-made stream, no re-lock beyond what
+a change of the graph's quantum makes the delay line do (the owner's run: re-locks 2, path changes 1). The playback stream
+also carries `application.process.id` and `application.process.binary`, by which a screen share matches a stream to the
+process it shares.
+
+**Each recorder attaching or leaving changes the path** (measured after review): a `pw-record` attach raised the path
+latency by 2.7 ms; 40 attach/detach cycles in 5 s gave 80 path changes and 40 re-locks (cross-faded), with 0 mutes,
+restarts, underruns or wrong links. A share that is toggled often would be heard as cross-fades. Recorder lines may fill
+at most 48 of the summary's 64 event lines, so a later wrong-link line is always kept.
+
+**"Recorder" is wider than recording streams:** any node that is not `Audio/Sink*` or `Audio/Duplex` and is announced is
+left alone: a virtual microphone (`Audio/Source/Virtual`, confirmed in review) and, by reading, nodes without a media
+class (JACK clients) too. Something has to link to fmp's stream for that: a patchbay restoring saved connections
+(qpwgraph, Helvum), or OBS's application-audio capture with monitoring on, could then pass the sound on to an output.
+The fix is the same as for the loopback below: bind stream peers and read `node.link-group` (and what they feed).
+
+**Not caught, deliberately for now:** a loopback or filter whose capture half is a plain stream and whose playback half
+plays to another sink (`pw-loopback`, `module-loopback`, a filter-chain with a `Stream/Input/Audio` capture) linked to
+fmp's stream by hand or by its target: its two halves are not linked in the graph, and the registry's global properties
+do not carry `node.link-group` (checked on PipeWire 1.6: only `client.id` and `factory.id` are shared, and a recorder
+such as Discord's shares its client with the application's own voice playback, so the client cannot be the test).
+Catching it needs each stream peer bound to read its `node.link-group` from the node's info; someone has to set such a
+loopback up on fmp's stream on purpose. Filters that show themselves as a sink are output devices and are caught.
+
+Tests (real server, null sinks only, `SinkGuardTests`): a capture stream aimed at the playback node → the clicks keep
+arriving on the chosen sink, the recorder receives them, 0 wrong links, no restart, not muted; `parec --monitor-stream`
+on the stream's sink-input index → the monitor receives the clicks (peak above half the click height), 0 wrong links, not
+muted; a recorder and a hand-made link to another null sink at once → muted and cut (wrong links ≥ 1), back on the chosen
+sink only, at most one click on the other sink; the rule itself without a server (chosen, other sink, duplex, virtual
+sink, unannounced node, recorder, recorder plus another sink, the chosen sink gone).
+
 ## Known issues / not done
 
 1. **Card and TV alignment unmeasured** (section 6): the owner should check by eye and ear once and set
@@ -345,6 +394,13 @@ Found by the re-check of the output-device fix, not fixed:
 - If the selected default output is not present at the start (plausibly the HDMI output with the TV off), the sound
   starts on the system's current default instead, pinned there, and moves to the selected one when it appears. The
   start-up line says so. Read from the code, not reproduced.
+- **Sound for a Discord screen share: verified by the owner's ears only** (2 h 16 min to the headset with Discord's
+  recorder attached: no "linked to another node" line, 0 underruns, re-locks 2 (path changes 1)). The tests above use
+  a capture stream and `parec --monitor-stream` in Discord's place; Discord itself was not run here.
+- A loopback or filter with a plain-stream capture half, or any other non-sink node (a virtual microphone, a JACK
+  client, a patchbay's restored link to something that plays on), linked to fmp's stream and passing the sound to
+  another output, is not caught by the guard (see "Screen shares and recorders").
+- Each recorder attach or detach is a path change and usually a cross-faded re-lock: a share toggled often is heard.
 - On a change of the selected default, a spurious "linked to another node" line and a wrong-link count follow the
   "your selected default output is now…" line, because the old stream's link is judged against the new sink.
 - If no real frame is ever shown with timing, the sound stays silent for the whole run and the summary says only

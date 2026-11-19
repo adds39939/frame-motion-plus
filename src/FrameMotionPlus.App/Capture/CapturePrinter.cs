@@ -71,7 +71,7 @@ internal static class CapturePrinter
             return;
         }
 
-        o.WriteLine($"audio sinks (PipeWire {graph.LibraryVersion}): the sound goes to your selected default output, or to --audio-sink <name or part of one>, and nowhere else:");
+        o.WriteLine($"audio sinks (PipeWire {graph.LibraryVersion}): the sound goes to your selected default output, or to --audio-sink <name or part of one>, and to no other output device (a recorder may take a copy):");
         foreach (var sink in graph.Sinks)
         {
             o.WriteLine($"  {sink.Name}{(sink.IsDefault ? "  [your selected default output]" : "")}" +

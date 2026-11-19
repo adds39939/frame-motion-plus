@@ -170,8 +170,14 @@ internal sealed partial class PresentLoop
 
     /// <summary>
     /// A slot shown under variable refresh: judged against its own time (half the shortest refresh period either way).
-    /// Late is the display's when it was handed over at least the expected delay before its target (the compositor was
-    /// slow), else the pipeline's. Its delay from hand-over to first pixel feeds the expected delay (the lead,
+    /// A late show is the pipeline's when its hand-over was late (handed over later than its target less the expected delay
+    /// to the first pixel) by more than the display's excess (how much longer than that expected delay the first pixel took
+    /// after the hand-over), or by more than a quarter of the tolerance (an eighth of the shortest refresh period: 1.04 ms at
+    /// 119.88 Hz); otherwise the display's. The floor matters because a show is late only when the two add up to more than
+    /// the tolerance: a hand-over 2 ms late at 119.88 Hz is late only with a display over 2.17 ms slow, the larger share,
+    /// yet a pipeline 2 ms behind is a fault the gate must see. (Until 2026-11-19 any hand-over later than the expected
+    /// delay made a late show the pipeline's: hand-overs ran 0.3 ms behind it on HDMI-A-1, so the display's late shows of
+    /// a two-hour run, 3.75 ms or more over the expected delay, were all labelled "late present".) Its delay from hand-over to first pixel feeds the expected delay (the lead,
     /// <see cref="UpdateVrrLead"/>), sent to the pacing thread when it moves.
     /// </summary>
     private void OnShownVrr(in InFlight entry, long reportedNs, long shownNs, bool timed, bool untimed)
@@ -199,7 +205,9 @@ internal sealed partial class PresentLoop
                     if (deviation > half)
                     {
                         isMiss = true;
-                        miss = handoverLead >= _vrrLeadNs ? MissKind.DisplayLate : MissKind.LatePresent;
+                        var handoverLateness = Math.Max(0, _vrrLeadNs - handoverLead);
+                        var displayExcess = shownNs - handover - _vrrLeadNs;
+                        miss = handoverLateness > displayExcess || handoverLateness > half / 4 ? MissKind.LatePresent : MissKind.DisplayLate;
                         Volatile.Write(ref _lateShows, _lateShows + 1);
                     }
                     else if (deviation < -half)

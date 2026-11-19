@@ -79,7 +79,7 @@ internal sealed unsafe class ClickGenerator(PwConnection connection, string name
 /// parabola through the peak and its neighbours), each with its capture time from the stream's timing (as the delay
 /// line's capture side computes it). Allocation-free on the data thread.
 /// </summary>
-internal sealed unsafe class ClickRecorder(PwConnection connection, string name, string sink)
+internal sealed unsafe class ClickRecorder(PwConnection connection, string name, string sink, bool captureSink = true)
     : PwStream(connection, name,
     [
         new(PwKeys.MediaType, "Audio"),
@@ -87,7 +87,7 @@ internal sealed unsafe class ClickRecorder(PwConnection connection, string name,
         new(PwKeys.NodeName, name),
         new(PwKeys.TargetObject, sink),
         new(PwKeys.NodeLatency, "128/48000"),
-        new(PwKeys.StreamCaptureSink, "true"),
+        new(PwKeys.StreamCaptureSink, captureSink ? "true" : "false"),
         new(PwKeys.NodeDontReconnect, "true"),
         new("state.restore-props", "false"),
         new("state.restore-target", "false"),

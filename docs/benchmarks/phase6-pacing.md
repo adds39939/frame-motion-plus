@@ -502,6 +502,83 @@ Priority by priority (the brief's order), then the backlogs.
    fixed clock (the ceiling rule, or `--clock fixed`) KWin's VRR is still on: the latch sweep cannot bracket (every probe
    made its refresh) and the lead stays at 1.5 refreshes (final binary, HDMI-A-1 fullscreen 60 → 120: no miss, real frames
    29.3 ms after their content time where the windowed run had 14.3); the VRR probe's delay would be the right lead there.
+3b. **Variable refresh on HDMI-A-1: the owner's two-hour run "missed" 7.6% of its slots (2026-11-19).** 8,146 s measured,
+   487,483 slots, 37,201 missed (36,930 "late present", 270 "display late"), verdict FAIL, while the intervals were even
+   (mean 16.711 ms, p99 17.140) and the owner saw nothing wrong. What is **established** (from the code and the run's own
+   numbers):
+   - Both accountings use one definition under variable refresh: a slot is late when its first pixel comes more than half
+     the shortest refresh period (8.342 / 2 = 4.17 ms) after its time (`PresentLoop.OnShownVrr`, `TelemetryVerifier`).
+     They **agreed on every one** of the 277,908 slots the verifier's buffer held (the first 77 minutes; 3,929 missed
+     there): the printed disagreement, 209,575, is exactly the number of slots beyond its buffer. The FAIL was that
+     bookkeeping; 3,929 against 36,930 compares 77 minutes with 136. Fixed: the comparison covers the slots the verifier
+     judged, the rest is said to be the live counters' alone, and a run without a duration reserves 4 hours of rows.
+   - The label was wrong: a late show counted as the pipeline's whenever the hand-over came later than the expected
+     display delay (the lead, 0.85 ms) before its time. Hand-overs ran 0.43 ms (p1) to 0.56 ms (p50) before their time,
+     0.3 ms behind the lead, so virtually every late show was "the pipeline's" although handed over in time. Now (after
+     review) a late show is the pipeline's when its hand-over was late by more than the display's excess over its
+     expected delay, or by more than a quarter of the tolerance (1.04 ms at 119.88 Hz); otherwise the display's. The
+     owner's run (0.3 to 0.42 ms late against an excess of 3.75 ms or more) goes to the display; simulated at 119.88 Hz
+     with the display's delay varying 0.4–3.1 ms, every hand-over held 2 ms late: 19 of 330 missed, all the pipeline's;
+     3.5 ms late: 217, all the pipeline's; hand-overs in time and one show in ten 6 ms slow: 40, all the display's
+     (`SimulatedDisplayTests.A_late_show_under_variable_refresh_is_blamed_on_a_late_hand_over_or_a_slow_display`). The
+     floor exists because a show is late only when the two add up to more than the tolerance: a hand-over 2 ms late is
+     late only with a display over 2.17 ms slow, the larger share, yet a pipeline 2 ms behind must fail the gate. Why the hand-over trailed the lead by 0.3 ms in that capture run is not
+     investigated (in the file runs on the TV below it matched the lead: p50 0.82–0.89 ms against 0.85–1.01).
+   - These presents were handed over at least 0.43 ms before their time in 99% of cases and shown more than 4.17 ms after
+     it: 4.6 ms or more from hand-over to first pixel, beyond the 3.1 ms the pre-roll probe saw at most.
+   - With a p99 interval of 17.14 ms (0.47 ms above the mean), at most about 1% of intervals can be uneven, while an
+     isolated late slot makes two uneven intervals. So nearly all the late slots came **in runs of consecutive late slots
+     at an even cadence**: a steady extra latency of 4–8 ms while a run lasted, not a judder. Only each run's first and
+     last interval is uneven. The event list agrees (9.501, 9.568, 9.584, 9.601 … s: consecutive slots).
+
+   **Measured on HDMI-A-1 afterwards (2026-11-19, night, the PS5 off):** `fmp play` of a 4K HDR10 clip at the console's
+   29.97 fps (ffmpeg's moving test picture, dimmed to a 65-nit peak), looped, VFG 2x, fullscreen, the default clock
+   (the probe chose variable refresh each time: 41 to 44 of 45 pairs following the presents), the window put on the TV
+   with the KWin script above:
+
+   | Run | Slots | Missed (live / verifier) | First pixel − slot time: p50 / p99 / max | Hand-over before its time: p1 / p50 |
+   | --- | --- | --- | --- | --- |
+   | 120 s | 7,072 | 0 / 0, agree | +0.06 / +0.36 / +1.95 ms | 0.69 / 0.82 ms |
+   | 150 s | 8,871 | 0 / 0, agree | +0.05 / +0.38 / +2.18 ms | 0.65 / 0.83 ms |
+   | 120 s, a 1080p60 NVENC encode running beside it (a stream encoder's GPU load) | 7,072 | 0 / 0, agree | +0.05 / +0.32 / +2.04 ms | 0.76 / 0.89 ms |
+
+   Hand-over to first pixel over all 23,014 shows: p50 0.91 ms, p99 1.16, max 2.99; **none above 3 ms**, where each of the
+   owner's late slots needed at least 4.6 ms. So the TV, KWin and variable refresh do not make these late slots from a
+   steady source, with or without an encoder's load. What the owner's session had and these runs did not: the capture
+   source (USB delivery jitter, the game's holds and loading screens, D re-converging after them: its max was 84.6 ms),
+   and **a Discord screen share running the whole time** (KWin capturing the screen for it). The owner's own probe before
+   playback already saw first pixels up to 3.13 ms after the present, against at most 1.08 ms in these runs: the display
+   path was slower in that session before the first slot. That points at the session's environment, most likely the
+   screen share; it could not be reproduced here (Spectacle's background recording exits at once without recording; a
+   portal screen cast needs its dialog answered) and the capture source cannot run without the console.
+
+   Still **inference**: that the late slots came in runs of a steady 4–8 ms offset (from the interval percentiles above,
+   no CSV); the simulated display shows that a stretch where presents wait for a fixed 119.88 Hz grid gives exactly that
+   (`SimulatedDisplayTests.Variable_refresh_on_a_119_88_Hz_output_with_a_varying_display_delay…`: a delay varying 0.4–3.1
+   ms misses nothing, 0 of 211; on a fixed grid after 2 s, 147 of 269 judged slots late, the live counters and the
+   verifier count the same 147, all the display's; the model's file runs at 30.000 fps against the grid's 59.94, so its
+   intervals are less even than a locked console's would be).
+
+   On DP-3 (240 Hz, a 30 fps clip, 60 s, `--clock vrr`): 3,480 slots, 5 late (2.3 to 3.5 ms after their time against a
+   tolerance of 2.08 ms, each alone, handed over 0.5–0.9 ms before; the display took 2.9 to 4.2 ms), live and verifier
+   agree.
+
+   For the owner, on the TV with the console on and a game moving (2 minutes each, silent), once **with the Discord
+   screen share running** and once without it, then send back the whole output of all four commands:
+   ```sh
+   fmp capture --mode 4k30-hdr --audio off --duration-s 120 --csv tv-share.csv > tv-share.log 2>&1
+   fmp verify tv-share.csv --vrr --rate 119.88
+   fmp capture --mode 4k30-hdr --audio off --duration-s 120 --csv tv-noshare.csv > tv-noshare.log 2>&1
+   fmp verify tv-noshare.csv --vrr --rate 119.88
+   ```
+   `fmp verify` now prints a `lateness` line: a histogram of how late the late slots were (0.3 ms is bookkeeping, 8 ms a
+   refresh) and how many runs of consecutive late slots against slots late alone. Runs with lateness spread up to 8.3 ms
+   confirm fixed-refresh stretches. `fmp verify --vrr` needs `--rate` with the output's fastest rate: without it the period
+   is the median interval (16.7 ms at 60 fps), which halves nothing like the right tolerance.
+
+   Generated slots skipped under variable refresh (the next real frame came too late for them): 767 in 8,146 s, one every
+   10.6 s.
+
 4. **Fixed refresh.** Gate-length runs: DP-3 0 missed; HDMI-A-1 4 missed in one host stall (38 s, the pipeline's by the
    rule; the owner accepts a handful in 10 minutes for now, so not chased): the shorter lead leaves about 3 ms for a stall
    where 12.5 ms left 11. One run per output, not repeated; the strict gate (zero of the pipeline's) is not shown met on
@@ -546,3 +623,20 @@ the release binary): not done.
 
 Other: the "decode thread allocated 32 B" failure seen in fullscreen runs of the JIT build (`dotnet build`'s `fmp`, not the
 NativeAOT binary) was not chased; NativeAOT runs here allocate nothing on any thread.
+
+## Found by the re-check of the variable-refresh blame rule (2026-11-19), not fixed
+
+- With the hand-over more than a quarter of the tolerance late (1.04 ms at 119.88 Hz), a show the display alone
+  would have made late (its excess over the whole tolerance) is still given to the pipeline: 38 of 38 in the
+  reviewer's run with hand-overs 1.3 ms late and one show in ten 6 ms slow. It errs towards showing pipeline
+  lateness. If unwanted: give a show to the display when its excess alone exceeds the tolerance, and keep the
+  floor for the jointly caused case.
+- The floor scales with the output: at 240 Hz it is 0.52 ms, close to the 0.3 to 0.42 ms by which hand-overs
+  trailed the expected display delay in the owner's capture run, so late shows the display caused on DP-3 could be
+  given to the pipeline. Not tested.
+- In a fixed-refresh run longer than the verifier's buffer, the one gap straddling the buffer's end can still count
+  as a disagreement if a missed slot after the end explains its later part (by reading).
+- `SimulatedDisplayTests.The_present_lead_starts_from_the_latch_measured_before_playback` asserts real-clock windows
+  (latch 1.9 to 2.7 ms, lead 3.9 to 4.7 ms, no misses) and failed once when the whole solution's test assemblies
+  ran at once; it passed 6 of 6 alone. This change does not reach it (it runs fixed refresh).
+

@@ -641,6 +641,27 @@ playback audio is left for later and Remote Play is left out entirely (both are 
     whole-solution run (it runs beside the other assemblies with an audio thread that is not
     real-time) and passed three times alone.
 
+- **After the owner's first long session (2026-11-19, 2 h 16 min, 4K HDR 30 to 60 on the 119.88 Hz
+  output with variable refresh, streamed on Discord):**
+  - **The two-hour soak is done** (`docs/benchmarks/phase9-polish.md`, 1c): process memory level
+    (481 to 493 MB at 118 minutes; the creep seen in the 10-minute run was warm-up), threads and open
+    files unchanged, no collection during play, nothing allocated on the hot threads, 244,488 frames
+    captured with none dropped by the driver, audio error 0.01 ms mean with no underruns, clean
+    teardown.
+  - **A screen share's sound works:** the audio guard cut off Discord's recording stream and muted
+    the sound in a loop. It now objects only to another output device; a recorder taking a copy is
+    left alone (`docs/benchmarks/phase8-audio.md`, "Screen shares and recorders"). Not detected: a
+    loopback that takes the sound as a recorder and replays it to another device.
+  - **A long run no longer fails for running long:** the verifier's buffer held 77 minutes and every
+    later slot counted as a disagreement. The 7.6% "late" in that run was real late shows (first
+    pixel more than half the shortest refresh period after its time), in runs at an even cadence,
+    wrongly labelled the pipeline's; the two accountings agreed on every slot both judged. File
+    runs on the same output afterwards had none late in 23,014 shows, so the cause in the session
+    (the capture source or the screen share) is not established: it needs two 120 s runs with
+    `--csv` from the owner, with and without the share (`docs/benchmarks/phase6-pacing.md`, 3b).
+  - 767 generated slots skipped in 8,146 s under variable refresh, one every 10.6 s (the known
+    late-capture-frame item).
+
 ### Phase 10: Windows portability
 
 *Design doc: milestone 7.* **Left for now by the owner on 2026-11-18** (listed under "Deferred"). The

@@ -108,7 +108,7 @@ internal sealed class CaptureAudio : IDisposable
         o.WriteLine($"  audio       {s.SourceDescription ?? s.Source} ({s.Source}) → {sink}" +
             $"{(s.AbsentSelectedDefault is { } absent ? $": the system's current default output, because the one you selected ({absent}) is not present; the sound moves to it when it appears"
                 : s.FromDefault ? ": your selected default output (select another and the sound follows)" : ": as --audio-sink asked")}; " +
-            $"it plays only there: muted (and said) if it goes away, never moved elsewhere{(s.SinkLinked ? "" : "; NOT linked to it yet")}");
+            $"it plays to no other output device (a recorder such as a screen share may take a copy): muted (and said) if it goes away, never moved elsewhere{(s.SinkLinked ? "" : "; NOT linked to it yet")}");
         o.WriteLine(string.Create(Ic,
             $"              F32 stereo 48 kHz through PipeWire {s.LibraryVersion} (it converts the card's own format); {(s.Streaming ? "streaming" : "NOT streaming yet")}; " +
             $"quantum {s.Quantum} frames ({s.Quantum / 48.0:0.0} ms); reported latency: capture {Ms(s.CaptureLatencyNs)} ms, sink {Ms(s.SinkLatencyNs)} ms " +
@@ -161,7 +161,7 @@ internal sealed class CaptureAudio : IDisposable
             $"  audio       {played:0.0} s played from {r.Setup.SourceDescription ?? r.Setup.Source} to {r.FinalSink ?? r.Setup.Sink ?? "no sink"}" +
             $"{(r.SinkChanges > 0 ? $" (moved {r.SinkChanges}x as you selected another default output)" : "")}" +
             $"{(r.SinkLosses > 0 ? $"; the sink went away {r.SinkLosses}x (muted until it was back)" : "")}" +
-            $"{(r.WrongSinkLinks > 0 ? $"; linked to another node {r.WrongSinkLinks}x (muted and cut each time)" : "")}"));
+            $"{(r.WrongSinkLinks > 0 ? $"; linked to another output device {r.WrongSinkLinks}x (muted and cut each time)" : "")}"));
         if (s.MeasuredBlocks == 0)
         {
             o.WriteLine("              nothing measured (the run ended before the sound had followed the video's latency for 6 s)");

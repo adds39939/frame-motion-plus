@@ -120,7 +120,7 @@ public class CatchUpTests
         public VerificationResult Verify()
         {
             Collector.Flush();
-            _ = Collector.ExplainGaps(Collector.MeasureFromNs, Collector.Statistics.LastMeasuredNs);
+            _ = Collector.ExplainGaps(Collector.MeasureFromNs, Collector.Statistics.LastMeasuredNs, Collector.Statistics.LastMeasuredNs, out _);
             return TelemetryVerifier.Verify(Collector.VerifierRows, P, Collector.MeasureFromNs, Collector.Statistics.LastMeasuredNs);
         }
     }

@@ -370,8 +370,11 @@ it dims the desktop's SDR content too). This follows from what KWin and the driv
 device (`fmp capture --list` shows which), delayed by the video latency the pipeline measures, so the sound is heard when
 its picture is seen. It goes to **the default output you selected** in the desktop's sound settings, and moves with it when
 you select another; or to `--audio-sink`, any output (the headset too), named by its node name or a part of its name or
-description. It plays only there: if that device goes away the sound is muted (and `fmp` says so) until it is back; it is
-never moved to another device by PipeWire's own fallback, and a link anywhere else is muted and cut. (The desktop's
+description. It plays to no other output device: if that device goes away the sound is muted (and `fmp` says so) until it
+is back; it is never moved to another device by PipeWire's own fallback, and a link to another output device (another sink,
+a null sink, a link made by hand) is muted and cut. A recorder that takes a copy of the sound is left alone: a screen
+share's sound (Discord's takes an application's sound by linking a recording stream to its playback stream, which it finds
+by `application.process.binary`, here the binary's name), OBS, `parec --monitor-stream`. (The desktop's
 per-application "move to" is refused for this stream: change the output with the default device or `--audio-sink`.) The delay follows that measurement
 slowly (a change is resampled away at no more than 2 ms per second, a pitch change of at most 3.5 cents) and the drift
 between the card's and the sink's sample clocks is corrected continuously. At the start it prints the source, the sink

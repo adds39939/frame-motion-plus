@@ -8,8 +8,6 @@ public readonly record struct VerifierRow
     /// <summary>The slot (-1: a filler the present thread put in).</summary>
     public long Slot { get; init; }
 
-    public VerifierKind Kind { get; init; }
-
     /// <summary>The refresh the slot was scheduled for, ns.</summary>
     public long TargetNs { get; init; }
 
@@ -18,6 +16,9 @@ public readonly record struct VerifierRow
 
     /// <summary>When its present was submitted, ns; 0 when it was never presented.</summary>
     public long SubmitNs { get; init; }
+
+    // The one-byte fields last: 40 B a row (a long run keeps millions).
+    public VerifierKind Kind { get; init; }
 
     /// <summary>The live accounting's verdict (the CSV's <c>missed</c>): compared with the verifier's, never used by it.</summary>
     public bool LiveMiss { get; init; }
@@ -87,6 +88,9 @@ public sealed class VerificationResult
 
     /// <summary>Slots the verifier counts as missed and the live accounting did not (or the other way round).</summary>
     public int Disagreements { get; set; }
+
+    /// <summary>Of the slots judged: those the live accounting counted as missed (its count over the same slots).</summary>
+    public int LiveMisses { get; set; }
 
     public int EarlySlots => Count(VerifierFinding.Early);
 
@@ -316,6 +320,7 @@ public static class TelemetryVerifier
             }
 
             result.Judged++;
+            result.LiveMisses += s.LiveMiss ? 1 : 0;
             var miss = IsMiss(f);
             var unjudged = (f & VerifierFinding.Unjudged) != 0;
             result.Misses += miss ? 1 : 0;

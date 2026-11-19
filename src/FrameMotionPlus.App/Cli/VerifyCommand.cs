@@ -69,6 +69,7 @@ internal static class VerifyCommand
         output.WriteLine(string.Create(CultureInfo.InvariantCulture,
             $"  refreshes   {result.Gaps.Count} interval(s) of two refreshes or more ({result.Gaps.Sum(g => g.Refreshes)} refresh(es) without a new present), {result.UnexplainedRefreshes} unexplained"));
         output.WriteLine($"  live        {result.Disagreements} slot(s) where the live accounting disagrees");
+        output.WriteLine(Lateness(rows, result, from));
         if (result.Slots.Count > 0)
         {
             output.WriteLine($"  findings    {result.Describe(24)}");
@@ -89,6 +90,50 @@ internal static class VerifyCommand
 
         output.WriteLine(result.Clean ? "  verdict     PASS" : "  verdict     FAIL");
         return result.Clean ? CommandDispatcher.ExitOk : CommandDispatcher.ExitCheckFailed;
+    }
+
+    /// <summary>
+    /// How late the late slots were (first pixel less the slot's time, a histogram) and how they came: in runs of
+    /// consecutive late slots (a steady offset: the intervals stay even, only the latency grows) or alone (a visible
+    /// judder: one long interval and one short).
+    /// </summary>
+    private static string Lateness(List<VerifierRow> rows, VerificationResult result, long from)
+    {
+        var late = result.Slots.Where(x => (x.Finding & VerifierFinding.Late) != 0).Select(x => x.Slot).ToHashSet();
+        var bounds = new[] { 0.5, 1, 2, 3, 4, 5, 6, 8, 12, 17, double.MaxValue };
+        var counts = new int[bounds.Length];
+        int runs = 0, alone = 0, longest = 0, current = 0;
+        foreach (var r in rows.Where(r => r.Slot >= 0 && r.Kind is VerifierKind.Real or VerifierKind.Generated && r.TargetNs >= from).OrderBy(r => r.Slot))
+        {
+            if (!late.Contains(r.Slot))
+            {
+                runs += current > 1 ? 1 : 0;
+                alone += current == 1 ? 1 : 0;
+                current = 0;
+                continue;
+            }
+
+            current++;
+            longest = Math.Max(longest, current);
+            var ms = (r.ActualNs - r.TargetNs) / 1e6;
+            counts[Array.FindIndex(bounds, b => ms < b)]++;
+        }
+
+        runs += current > 1 ? 1 : 0;
+        alone += current == 1 ? 1 : 0;
+        var parts = new List<string>();
+        for (var i = 0; i < bounds.Length; i++)
+        {
+            if (counts[i] > 0)
+            {
+                parts.Add(string.Create(CultureInfo.InvariantCulture, $"{(i == 0 ? "<" : $"{bounds[i - 1]:0.#}-")}{(bounds[i] == double.MaxValue ? "" : $"{bounds[i]:0.#}")}{(bounds[i] == double.MaxValue ? "+" : "")} ms {counts[i]}"));
+            }
+        }
+
+        return late.Count == 0
+            ? "  lateness    no late slot"
+            : string.Create(CultureInfo.InvariantCulture,
+                $"  lateness    {late.Count} late slot(s), first pixel after the slot's time: {string.Join(", ", parts)}; {runs} run(s) of consecutive late slots (the longest {longest}), {alone} alone");
     }
 
     private static long MedianInterval(List<VerifierRow> rows)

@@ -15,6 +15,10 @@ internal sealed record PwNode(uint Id, ulong Serial, string Name, string? Descri
 {
     public bool IsSink => MediaClass is "Audio/Sink" or "Audio/Duplex";
 
+    /// <summary>A node that plays sound out (a sink of any kind, a duplex device): what a stream may feed only when chosen.</summary>
+    public static bool IsOutputDevice(string? mediaClass) =>
+        mediaClass is not null && (mediaClass.StartsWith("Audio/Sink", StringComparison.Ordinal) || mediaClass == "Audio/Duplex");
+
     public bool IsSource => MediaClass is "Audio/Source" or "Audio/Source/Virtual" or "Audio/Duplex";
 }
 
@@ -34,6 +38,9 @@ internal sealed unsafe class PwConnection : IDisposable
     private static readonly delegate* unmanaged<nint, uint, byte*, byte*, byte*, int> MetadataProperty = &OnMetadataProperty;
 
     private readonly Dictionary<uint, PwNode> _nodes = [];
+
+    // Every node the registry announced (streams too), by id: its name and media.class (null when it has none).
+    private readonly Dictionary<uint, (string Name, string? MediaClass)> _allNodes = [];
     private readonly Dictionary<uint, (uint Output, uint Input)> _links = [];
     private GCHandle _self;
     private nint _loop;
@@ -211,6 +218,19 @@ internal sealed unsafe class PwConnection : IDisposable
     /// <summary>The nodes <paramref name="node"/>'s outputs are linked to (where its sound goes), loop locked.</summary>
     public List<uint> PeersOutOfLocked(uint node) => [.. _links.Values.Where(l => l.Output == node).Select(l => l.Input).Distinct()];
 
+    /// <summary>Any node the registry announced (a stream too): its name and media.class; false when none has that id. Loop locked.</summary>
+    public bool TryNodeKindLocked(uint id, out string name, out string? mediaClass)
+    {
+        if (_allNodes.TryGetValue(id, out var k))
+        {
+            (name, mediaClass) = k;
+            return true;
+        }
+
+        (name, mediaClass) = ($"node {id}", null);
+        return false;
+    }
+
     /// <summary>Creates a node from a factory (tests: a null sink); owned by this connection. Loop locked.</summary>
     public nint CreateNodeLocked(string factory, IReadOnlyList<KeyValuePair<string, string>> properties)
     {
@@ -352,6 +372,7 @@ internal sealed unsafe class PwConnection : IDisposable
             else if (NativeText.Equals(type, "PipeWire:Interface:Node"u8))
             {
                 var mediaClass = NativeText.Lookup(props, "media.class"u8);
+                c._allNodes[id] = (NativeText.ToManaged(NativeText.Lookup(props, "node.name"u8)) ?? $"node {id}", NativeText.ToManaged(mediaClass));
                 if (mediaClass != null && NativeText.ToManaged(mediaClass) is { } cls && cls.StartsWith("Audio/", StringComparison.Ordinal))
                 {
                     _ = NativeText.TryParseUInt64(NativeText.Lookup(props, "object.serial"u8), out var serial);
@@ -425,7 +446,7 @@ internal sealed unsafe class PwConnection : IDisposable
             return;
         }
 
-        var changed = c._links.Remove(id) | c._nodes.Remove(id);
+        var changed = c._links.Remove(id) | c._nodes.Remove(id) | c._allNodes.Remove(id);
         if (id == c._metadataId && c._metadata != 0)
         {
             PwNative.ProxyDestroy(c._metadata);

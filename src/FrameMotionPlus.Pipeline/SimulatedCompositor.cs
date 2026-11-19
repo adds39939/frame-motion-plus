@@ -58,6 +58,9 @@ internal sealed class SimulatedCompositor
     /// <summary>Variable refresh: hand-over to first pixel, ns (measured here: 0.6 to 0.9 ms).</summary>
     public long VrrDelayNs { get; init; } = 750 * Nanoseconds.PerMicrosecond;
 
+    /// <summary>Variable refresh: hand-over to first pixel as a function of the hand-over time, ns (null: <see cref="VrrDelayNs"/>).</summary>
+    public Func<long, long>? VrrDelayAt { get; init; }
+
     private long _vrrLastShown = long.MinValue;
 
     public long ReportDelayNs { get; init; } = Nanoseconds.PerMillisecond;
@@ -131,8 +134,9 @@ internal sealed class SimulatedCompositor
             while (_oldestPending <= _newestSeen)
             {
                 var i = (int)(_oldestPending % Capacity);
-                var shown = Math.Max(_handover[i] + VrrDelayNs, _vrrLastShown == long.MinValue ? long.MinValue : _vrrLastShown + (long)PeriodNs);
-                if (shown - VrrDelayNs > now)
+                var delay = VrrDelayAt?.Invoke(_handover[i]) ?? VrrDelayNs;
+                var shown = Math.Max(_handover[i] + delay, _vrrLastShown == long.MinValue ? long.MinValue : _vrrLastShown + (long)PeriodNs);
+                if (shown - delay > now)
                 {
                     return; // decided once its time has come (a newer present cannot change it under FIFO)
                 }

@@ -134,9 +134,10 @@ internal static class PlayPrinter
                 $"min {Ms(iv.Min)} ms over {iv.Count}{(period > 0 ? $" (refresh period {Ms(period)} ms)" : "")}; " +
                 $"{s.OffGridIntervals} of {s.TimedIntervals} timed intervals more than a quarter refresh off the grid{offGrid}"));
         var total = s.TotalMisses;
-        var against = r.Verification is { } vv
-            ? string.Create(Ic, $" (the verifier, from the telemetry alone: {vv.Misses}; {(vv.Disagreements == 0 ? "agrees" : $"DISAGREES on {vv.Disagreements}")})")
-            : " (the verifier did not run)";
+        var against = r.Verification is not { } vv ? " (the verifier did not run)"
+            : r.VerifierRowsDropped > 0
+                ? string.Create(Ic, $" (over the first {vv.Judged} slots, all its buffer held: the verifier {vv.Misses}, the live counters {vv.LiveMisses}; {(vv.Disagreements == 0 ? "agrees" : $"DISAGREES on {vv.Disagreements}")}; the {r.VerifierBeyondSlots} after them are the live counters' alone)")
+                : string.Create(Ic, $" (the verifier, from the telemetry alone: {vv.Misses}; {(vv.Disagreements == 0 ? "agrees" : $"DISAGREES on {vv.Disagreements}")})");
         o.WriteLine(string.Create(Ic,
             $"  missed      {total} slot(s){against}; the pipeline's {s.PipelineMisses}: late present {s.MissCount(MissKind.LatePresent)}, early {s.MissCount(MissKind.Early)}, " +
             $"dropped {s.MissCount(MissKind.Dropped)}, untimed and its refresh taken {s.MissCount(MissKind.NotShown)}, refresh without a new present {s.MissCount(MissKind.MissedRefresh)}, " +
@@ -153,7 +154,7 @@ internal static class PlayPrinter
                 $"not shown {v.Count(VerifierFinding.NotShown)}, untimed with its refresh taken {v.Count(VerifierFinding.RefreshTaken)}, wrong image {v.Count(VerifierFinding.WrongImage)}, " +
                 $"out of order {v.Count(VerifierFinding.OutOfOrder)}), {v.Unjudged} unjudged, {v.Gaps.Sum(g => g.Refreshes)} refresh(es) without a new present " +
                 $"({v.UnexplainedRefreshes} unexplained); {(v.Disagreements == 0 ? "agrees with the live counters" : $"DISAGREES with the live counters on {v.Disagreements}")}" +
-                $"{(r.VerifierRowsDropped > 0 ? $"; {r.VerifierRowsDropped} slot(s) beyond its buffer not judged" : "")}"));
+                $"{(r.VerifierRowsDropped > 0 ? $"; its buffer held the first {r.VerifierJudgedNs / 1e9:0} s of the measured window: the {r.VerifierBeyondSlots} slot(s) after that were judged by the live counters alone (not compared, not a disagreement)" : "")}"));
             if (v.Slots.Count > 0)
             {
                 o.WriteLine($"              {v.Describe(10)}");

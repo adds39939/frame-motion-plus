@@ -165,6 +165,9 @@ public sealed record PlaybackOptions
     /// <summary>Per-slot timeline records kept for the CSV and the summary between collector passes.</summary>
     public int TelemetryCapacity { get; init; } = 8192;
 
+    /// <summary>Tests only: the verifier's buffer in rows (0: sized from the duration and the display's rate).</summary>
+    internal int VerifierRows { get; init; }
+
     /// <summary>Frames decoded and converted ahead of the pacing thread.</summary>
     public int DecodeAhead { get; init; } = 4;
 

@@ -34,6 +34,14 @@ internal sealed class TelemetryCollector
     private long _periodNs;
     private VerifierRow[] _rows = [];
     private int _rowCount;
+    private long _lastKeptTargetNs = long.MinValue;
+
+    // Every slot the live accounting missed and the last show, kept apart from the verifier's rows (which can fill up on a
+    // long run): the refreshes without a new present are explained from these over the whole run (fixed refresh only:
+    // under variable refresh there are none to explain).
+    private long[] _missedTargets = new long[4096];
+    private int _missedCount;
+    private long _lastShowNs = long.MinValue;
 
     // What is on screen, from the shows in present order (feedback comes in present order): a dropped repeat is judged
     // by the image the refresh it was meant for showed (the latest timed show at or before it), as the verifier does.
@@ -95,8 +103,25 @@ internal sealed class TelemetryCollector
     /// <summary>Variable refresh: shows are not on a refresh grid (no refreshes without a present, no off-grid intervals).</summary>
     public bool Vrr { get; set; }
 
-    /// <summary>Sizes the verifier's buffer (before playback: no allocation while it runs).</summary>
-    public void ReserveVerifierRows(int rows) => _rows = new VerifierRow[Math.Max(rows, 1024)];
+    /// <summary>The latest slot target among the rows kept for the verifier (long.MinValue before the first).</summary>
+    public long LastKeptTargetNs => _lastKeptTargetNs;
+
+    /// <summary>
+    /// Missed slots beyond the buffer of their targets (fixed refresh; it holds as many as the verifier's rows, so these
+    /// lie beyond what the verifier judged; the live explanation of refreshes after them is incomplete).
+    /// </summary>
+    public long MissedTargetsDropped { get; private set; }
+
+    /// <summary>
+    /// Sizes the verifier's buffer and, on fixed refresh, the missed slots' targets (as many as the rows: every slot the
+    /// verifier can judge has room); before playback, no allocation while it runs (set <see cref="Vrr"/> first). Rows are
+    /// 40 B and targets 8 B each, in fresh memory: their pages become resident as they are written, not here.
+    /// </summary>
+    public void ReserveVerifierRows(int rows)
+    {
+        _rows = GC.AllocateUninitializedArray<VerifierRow>(Math.Max(rows, 1024));
+        _missedTargets = Vrr ? [] : GC.AllocateUninitializedArray<long>(_rows.Length);
+    }
 
     public void Drain(PacingLoop pacing, RingWriter writer, PresentLoop presenter)
     {
@@ -722,9 +747,27 @@ internal sealed class TelemetryCollector
 
     private void Keep(in VerifierRow row)
     {
+        if (row.ActualNs > 0)
+        {
+            _lastShowNs = Math.Max(_lastShowNs, row.ActualNs);
+        }
+
+        if (row.Slot >= 0 && row.LiveMiss && !Vrr)
+        {
+            if (_missedCount < _missedTargets.Length)
+            {
+                _missedTargets[_missedCount++] = row.TargetNs;
+            }
+            else
+            {
+                MissedTargetsDropped++;
+            }
+        }
+
         if (_rowCount < _rows.Length)
         {
             _rows[_rowCount++] = row;
+            _lastKeptTargetNs = Math.Max(_lastKeptTargetNs, row.TargetNs);
         }
         else
         {
@@ -740,29 +783,22 @@ internal sealed class TelemetryCollector
     /// last show plus half a refresh, as the verifier judges): between consecutive timed shows, the refreshes the untimed
     /// shows in between cannot account for (<see cref="PlaybackStatistics.RefreshesWithoutPresent"/>); those no missed slot
     /// explains (one scheduled for it, or for the refresh before it) are counted as the pipeline's
-    /// (<see cref="MissKind.MissedRefresh"/>). Returns how many. At the end of a run, with the last refresh period.
+    /// (<see cref="MissKind.MissedRefresh"/>). Returns how many; <paramref name="unexplainedThrough"/> is how many of them
+    /// lie in intervals starting at or before <paramref name="compareToNs"/> (the span the verifier judged, to compare with
+    /// its count, which takes an interval that starts in its span). At the end of a run, with the last refresh period.
     /// </summary>
-    public int ExplainGaps(long fromNs, long toNs)
+    public int ExplainGaps(long fromNs, long toNs, long compareToNs, out int unexplainedThrough)
     {
+        unexplainedThrough = 0;
         if (_gapCount == 0 || _periodNs <= 0 || fromNs == long.MaxValue)
         {
             return 0;
         }
 
         var half = _periodNs / 2;
-        var lastShow = long.MinValue;
-        var missedTargets = new List<long>();
-        for (var i = 0; i < _rowCount; i++)
-        {
-            lastShow = Math.Max(lastShow, _rows[i].ActualNs > 0 ? _rows[i].ActualNs : long.MinValue);
-            if (_rows[i].Slot >= 0 && _rows[i].LiveMiss)
-            {
-                missedTargets.Add(_rows[i].TargetNs);
-            }
-        }
-
-        toNs = Math.Min(toNs, lastShow == long.MinValue ? long.MinValue : lastShow + half);
-        missedTargets.Sort();
+        var missedTargets = _missedTargets[.._missedCount];
+        Array.Sort(missedTargets);
+        toNs = Math.Min(toNs, _lastShowNs == long.MinValue ? long.MinValue : _lastShowNs + half);
         var unexplained = 0;
         for (var g = 0; g < _gapCount; g++)
         {
@@ -776,11 +812,12 @@ internal sealed class TelemetryCollector
             {
                 Statistics.RefreshesWithoutPresent++;
                 var refresh = _gapFrom[g] + (long)Math.Round(k * (double)_periodNs);
-                var from = missedTargets.BinarySearch(refresh - _periodNs - half);
+                var from = Array.BinarySearch(missedTargets, refresh - _periodNs - half);
                 from = from >= 0 ? from : ~from;
-                if (from >= missedTargets.Count || missedTargets[from] > refresh + half)
+                if (from >= missedTargets.Length || missedTargets[from] > refresh + half)
                 {
                     unexplained++;
+                    unexplainedThrough += _gapFrom[g] <= compareToNs ? 1 : 0; // as the verifier: a gap that starts in its span
                     Statistics.AddMiss(refresh - _originNs, MissKind.MissedRefresh, 1);
                 }
             }

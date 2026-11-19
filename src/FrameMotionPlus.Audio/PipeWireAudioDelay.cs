@@ -18,7 +18,7 @@ public sealed record AudioSetup
 
     public string? SourceDescription { get; init; }
 
-    /// <summary>The sink the sound plays to: named, or the configured default at the start. It plays nowhere else.</summary>
+    /// <summary>The sink the sound plays to: named, or the configured default at the start. It plays to no other output device (a recorder may take a copy).</summary>
     public string? Sink { get; init; }
 
     public string? SinkDescription { get; init; }
@@ -32,7 +32,7 @@ public sealed record AudioSetup
     /// </summary>
     public string? AbsentSelectedDefault { get; init; }
 
-    /// <summary>The playback stream is linked to <see cref="Sink"/> (and nothing else) as it starts.</summary>
+    /// <summary>The playback stream is linked to <see cref="Sink"/> (and no other output device) as it starts.</summary>
     public bool SinkLinked { get; init; }
 
     public bool Streaming { get; init; }
@@ -81,7 +81,7 @@ public sealed record AudioReport
     /// <summary>Times the chosen sink went away (the sound muted until it came back).</summary>
     public int SinkLosses { get; init; }
 
-    /// <summary>Times the playback stream was found linked to another node than the chosen sink (muted and cut).</summary>
+    /// <summary>Times the playback stream was found linked to another output device than the chosen sink, or to a node not announced (muted and cut).</summary>
     public int WrongSinkLinks { get; init; }
 
     public int SourceLosses { get; init; }
@@ -110,7 +110,8 @@ public sealed record AudioReport
 /// stream is pinned to it (target.object, node.dont-reconnect, node.dont-move, node.dont-fallback: WirePlumber neither
 /// follows the default with it nor moves it on request). A supervisor thread (not real-time, sleeping 50 ms between looks)
 /// watches the graph: the sound is muted unless the capture stream is linked to exactly the intended source (never a
-/// microphone instead) and the playback stream to exactly the chosen sink (never a headset instead); a wrong link is cut;
+/// microphone instead) and the playback stream to the chosen sink and no other output device (never a headset instead;
+/// a recorder taking a copy, such as a screen share's sound, is left alone); a wrong link is cut;
 /// a source or sink that goes away and comes back is connected again. <see cref="Stop"/> fades out and returns at once;
 /// <see cref="Dispose"/> waits (bounded) for the teardown, after which nothing of it is left in the PipeWire graph.
 /// </summary>
@@ -157,6 +158,7 @@ public sealed class PipeWireAudioDelay : IAudioDelay
     private int _sinkChanges;
     private int _sinkLosses;
     private int _wrongSinkLinks;
+    private int _recorders;
     private int _sourceLosses;
     private int _captureRestarts;
     private int _playbackRestarts;
@@ -425,6 +427,10 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         new(PwKeys.NodeName, node),
         new(PwKeys.NodeDescription, description),
         new(PwKeys.AppName, "fmp"),
+        // Which process this stream belongs to: a screen share that takes an application's sound (Discord's reads the
+        // sink inputs through the PulseAudio API and groups them by process) finds the stream by these.
+        new("application.process.id", Environment.ProcessId.ToString(CultureInfo.InvariantCulture)),
+        new("application.process.binary", Path.GetFileName(Environment.ProcessPath) ?? "fmp"),
         new(PwKeys.NodeLatency, string.Create(CultureInfo.InvariantCulture, $"{_o.Quantum}/{PwStream.Rate}")),
         // Nothing of this stream is saved in WirePlumber's state (volume, target): it plays at unity every time.
         new("state.restore-props", "false"),
@@ -463,11 +469,13 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         return new PlaybackStream(_connection, _o.NodePrefix + "-playback", props, _line, _o.Quantum);
     }
 
-    private void Event(string text)
+    /// <summary>An event for stderr and the report; <paramref name="minor"/> ones (recorders coming and going, which a
+    /// share toggled often repeats) keep the last 16 of the report's 64 places for the others (a wrong link, a lost sink).</summary>
+    private void Event(string text, bool minor = false)
     {
         lock (_eventsGate)
         {
-            if (_events.Count < 64)
+            if (_events.Count < (minor ? 48 : 64))
             {
                 _events.Add(string.Create(CultureInfo.InvariantCulture, $"{Clock.NowNs / 1e9:0.000} s: {text}"));
             }
@@ -573,17 +581,19 @@ public sealed class PipeWireAudioDelay : IAudioDelay
 
     /// <summary>
     /// Something changed in the graph or a stream's state: who is linked to whom. The sound plays only while the capture
-    /// stream takes exactly the intended source and the playback stream feeds exactly the chosen sink; a wrong link on
+    /// stream takes exactly the intended source and the playback stream feeds the chosen sink and no other output device
+    /// (<see cref="ClassifyPlaybackPeers"/>: recorders are left alone); a wrong link on
     /// either side mutes at once and the stream is cut and made again (backing off from 250 ms to 2 s). Events are emitted
     /// after the loop lock is released.
     /// </summary>
     private void Examine(long now, int captureState, int playbackState)
     {
-        var events = (List<string>?)null;
-        void Say(string text) => (events ??= []).Add(text);
+        var events = (List<(string Text, bool Minor)>?)null;
+        void Say(string text, bool minor = false) => (events ??= []).Add((text, minor));
 
         PwNode? source, sink, configured = null;
-        List<uint> into = [], outOf = [];
+        List<uint> into = [];
+        var peers = new List<(uint Id, bool Known, string Name, string? MediaClass)>();
         string? configuredName = null;
         using (_connection.Lock())
         {
@@ -604,7 +614,11 @@ public sealed class PipeWireAudioDelay : IAudioDelay
 
             if (playbackNode != PwDefs.IdAny)
             {
-                outOf = _connection.PeersOutOfLocked(playbackNode);
+                foreach (var peer in _connection.PeersOutOfLocked(playbackNode))
+                {
+                    var known = _connection.TryNodeKindLocked(peer, out var name, out var mediaClass);
+                    peers.Add((peer, known, name, mediaClass));
+                }
             }
         }
 
@@ -660,16 +674,17 @@ public sealed class PipeWireAudioDelay : IAudioDelay
             }
         }
 
-        // The playback: linked to exactly the chosen sink, or muted (and a wrong link cut).
-        var playbackLinked = sink is not null && outOf.Count > 0;
-        var playbackWrong = false;
-        foreach (var peer in outOf)
+        // The playback: it feeds the chosen sink and no other output device, or it is muted (and the wrong link cut).
+        var route = ClassifyPlaybackPeers(peers, sink?.Id ?? PwDefs.IdAny);
+        var playbackLinked = route.ToChosen && route.Foreign is null;
+        var playbackWrong = route.Foreign is not null;
+        if (!playbackWrong && route.Recorders.Count != _recorders)
         {
-            if (sink is null || peer != sink.Id)
-            {
-                playbackLinked = false;
-                playbackWrong = true;
-            }
+            Say(route.Recorders.Count == 0
+                ? "no recorder takes a copy of the sound any more"
+                : $"{route.Recorders.Count} recorder(s) take a copy of the sound ({string.Join(", ", route.Recorders)}): left alone, the sound still plays to {_sink} only",
+                minor: true);
+            _recorders = route.Recorders.Count;
         }
 
         if (captureWrong || playbackWrong)
@@ -689,7 +704,7 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         if (playbackWrong && now >= _nextPlaybackWrongNs)
         {
             _wrongSinkLinks++;
-            Say($"the playback stream was linked to another node than {_sink}: muted, cut, connected to {_sink} again");
+            Say($"the playback stream was linked to another node than {_sink} ({route.Foreign}): muted, cut, connected to {_sink} again");
             _nextPlaybackWrongNs = now + _playbackWrongBackoffNs;
             _playbackWrongBackoffNs = Math.Min(RetryNs, _playbackWrongBackoffNs * 2);
             restartPlayback = true;
@@ -751,11 +766,48 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         _line.SetMuted(!(captureOk && playbackOk) || Volatile.Read(ref _stop) != 0);
         if (events is not null)
         {
-            foreach (var e in events)
+            foreach (var (text, minor) in events)
             {
-                Event(e);
+                Event(text, minor);
             }
         }
+    }
+
+    /// <summary>What the playback stream feeds, peer by peer (<see cref="ClassifyPlaybackPeers"/>).</summary>
+    internal readonly record struct PlaybackRoute(bool ToChosen, string? Foreign, IReadOnlyList<string> Recorders);
+
+    /// <summary>
+    /// The guard's rule for the playback stream's peers (the nodes its outputs are linked to). The chosen sink: linked. An
+    /// output device (a sink of any kind, a null sink, a duplex device) other than it: wrong, the sound must not reach it.
+    /// A node the registry has not announced: wrong too (where the sound goes is unknown; the registry announces a node
+    /// before any link to it, so this is no race). Any other node is a recorder taking a copy of the sound (a capture
+    /// stream such as a screen share's or OBS's, a PulseAudio monitor of the stream): left alone. Not caught: a loopback or
+    /// filter whose capture half is a plain stream and whose playback half plays to another sink (its two halves are not
+    /// linked in the graph and the registry does not say they belong together); filters that show themselves as a sink
+    /// (an equaliser's virtual sink) are output devices and are caught. The route's Foreign names the first wrong peer.
+    /// </summary>
+    internal static PlaybackRoute ClassifyPlaybackPeers(IReadOnlyList<(uint Id, bool Known, string Name, string? MediaClass)> peers, uint chosenSink)
+    {
+        var toChosen = false;
+        string? foreign = null;
+        var recorders = new List<string>();
+        foreach (var (id, known, name, mediaClass) in peers)
+        {
+            if (chosenSink != PwDefs.IdAny && id == chosenSink)
+            {
+                toChosen = true;
+            }
+            else if (!known || PwNode.IsOutputDevice(mediaClass))
+            {
+                foreign ??= known ? $"{name}, {mediaClass}" : $"node {id}, not announced";
+            }
+            else
+            {
+                recorders.Add($"{name}, {mediaClass ?? "no media class"}");
+            }
+        }
+
+        return new PlaybackRoute(toChosen, foreign, recorders);
     }
 
     private void RestartCapture()

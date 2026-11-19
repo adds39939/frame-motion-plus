@@ -336,6 +336,12 @@ public sealed class PlaybackReport
     /// <summary>Slots the verifier's buffer had no room for (its verdict then covers the rest only).</summary>
     public long VerifierRowsDropped { get; set; }
 
+    /// <summary>When its buffer filled: how much of the measured window the verifier judged (from its start), ns; else 0.</summary>
+    public long VerifierJudgedNs { get; set; }
+
+    /// <summary>When its buffer filled: measured slots after the span it judged (the live counters' alone); else 0.</summary>
+    public long VerifierBeyondSlots { get; set; }
+
     public int ValidationProblems { get; set; }
 
     public string? ValidationReport { get; set; }

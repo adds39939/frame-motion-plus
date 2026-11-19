@@ -42,6 +42,9 @@ namespace FrameMotionPlus.Pipeline;
 public sealed class PlaybackSession : IDisposable
 {
     private const long StartDelayNs = 100 * Nanoseconds.PerMillisecond;
+
+    /// <summary>A run without a duration reserves the verifier's rows for this long at the display's rate.</summary>
+    private const double VerifierUnlimitedSeconds = 4 * 3600;
     private const int RingWriterQueue = 32;
     private const int PresentQueue = 16;
 
@@ -500,9 +503,11 @@ public sealed class PlaybackSession : IDisposable
             var (scheduler, startNs) = CreateScheduler(report);
             collector.Vrr = _vrr;
 
-            // The verifier's rows, sized before playback (one per slot and filler; 30 minutes when the run has no limit).
-            var seconds = _o.DurationNs > 0 ? _o.DurationNs / 1e9 : 1800;
-            collector.ReserveVerifierRows((int)Math.Min(4_000_000, (seconds * report.DisplayRate.Hz * 1.25) + 8192));
+            // The verifier's rows, sized before playback (one per slot and filler, 40 B each, resident only as they are
+            // written; 4 hours at the display's rate when the run has no limit). A longer run is judged by the verifier
+            // over what fits and by the live counters alone after it (said in the summary, never counted as a disagreement).
+            var seconds = _o.DurationNs > 0 ? _o.DurationNs / 1e9 : VerifierUnlimitedSeconds;
+            collector.ReserveVerifierRows(_o.VerifierRows > 0 ? _o.VerifierRows : (int)Math.Min(4_000_000, (seconds * report.DisplayRate.Hz * 1.25) + 8192));
             var origin = startNs + StartDelayNs;
             var nominal = _source!.NominalRate.IsValid ? (long)_source.NominalRate.PeriodNs : Nanoseconds.PerSecond / 30;
             var feedAhead = Math.Max(4 * nominal, 50 * Nanoseconds.PerMillisecond) + report.MarginNs;
@@ -1019,7 +1024,14 @@ public sealed class PlaybackSession : IDisposable
     /// </summary>
     private void Verify(PlaybackReport report, TelemetryCollector collector)
     {
-        var liveUnexplained = collector.ExplainGaps(collector.MeasureFromNs, collector.Statistics.LastMeasuredNs);
+        // The span the verifier can judge: all of the measured window, or (its buffer full) up to a second before the last
+        // row it kept, so that no slot it judges lacks the shows that came after it. The live counters are compared with
+        // it over that span only; the slots after it are the live counters' alone.
+        var stats = collector.Statistics;
+        var judgedTo = collector.VerifierRowsDropped > 0 && collector.LastKeptTargetNs != long.MinValue
+            ? Math.Min(stats.LastMeasuredNs, collector.LastKeptTargetNs - Nanoseconds.PerSecond)
+            : stats.LastMeasuredNs;
+        _ = collector.ExplainGaps(collector.MeasureFromNs, stats.LastMeasuredNs, judgedTo, out var liveUnexplained);
         if (!WindowTiming || _o.Clock != PlaybackClock.Real || _presenter is not { ReportsPresentTimes: true } || collector.PeriodNs <= 0
             || collector.MeasureFromNs == long.MaxValue)
         {
@@ -1027,18 +1039,21 @@ public sealed class PlaybackSession : IDisposable
             return;
         }
 
-        var stats = collector.Statistics;
-        var result = TelemetryVerifier.Verify(collector.VerifierRows, collector.PeriodNs, collector.MeasureFromNs, stats.LastMeasuredNs, _vrr);
+        var result = TelemetryVerifier.Verify(collector.VerifierRows, collector.PeriodNs, collector.MeasureFromNs, judgedTo, _vrr);
         if (result.UnexplainedRefreshes != liveUnexplained)
         {
             result.Disagreements += Math.Abs(result.UnexplainedRefreshes - liveUnexplained);
         }
 
-        // Rows or gap candidates that did not fit their buffers: the two could not be compared on those.
-        result.Disagreements += (int)Math.Min(int.MaxValue, collector.VerifierRowsDropped + collector.GapsDropped);
+        // Gap candidates that did not fit their buffer: the live explanation of refreshes is incomplete. (The missed slots'
+        // targets are kept for at least as many slots as the verifier's rows, so any that did not fit lie beyond the span
+        // compared here.)
+        result.Disagreements += (int)Math.Min(int.MaxValue, collector.GapsDropped);
 
         report.Verification = result;
         report.VerifierRowsDropped = collector.VerifierRowsDropped;
+        report.VerifierJudgedNs = collector.VerifierRowsDropped > 0 ? Math.Max(0, judgedTo - collector.MeasureFromNs) : 0;
+        report.VerifierBeyondSlots = collector.VerifierRowsDropped > 0 ? Math.Max(0, stats.Slots - stats.Empty - result.Judged) : 0;
     }
 
     private void Collect(PlaybackReport report, TelemetryCollector collector)

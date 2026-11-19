@@ -3,8 +3,9 @@
 Scope as set on 2026-11-18 (capture card first, forward progress over perfection). The session was cut short by the
 owner at 22:37 ("I want to start using this at 12am, so no 2 hour test please"): the card, the GPU and the screen had to be
 free from 23:30. So this phase delivers **saved settings and a bare `fmp capture`**, fully tested, plus two small
-leftovers; the live quality switch, the soak instrumentation and the two-hour soak are **not built or run** and are listed
-under "Known issues / not done" with what was found and the exact commands.
+leftovers; the live quality switch and the soak instrumentation are **not built** and are listed under "Known issues /
+not done" with what was found and the exact commands. The two-hour soak was the owner's own session on 2026-11-19 (section
+1c).
 
 Machine: RTX 5090, driver 620.70.06, Plasma 6.8.2 Wayland, DP-3 4K 240 Hz and HDMI-A-1 4K 119.88 Hz, Elgato 4K X on
 `/dev/video0` with a PS5. Every run below used a scratch config directory (`XDG_CONFIG_HOME=<scratch>`), never
@@ -98,6 +99,28 @@ every 30 s (`/proc/<pid>/status`, `/proc/<pid>/fd`, `nvidia-smi`):
 | GPU memory (this process) | 2,991 MiB from the first sample to the last |
 | RSS | 476.9 MB → 488.1 MB in 571 s, in steps of about 2 MB roughly every 200 s after the first minute (about +35 MB/h if it kept on; managed heap not growing: GC 0). **Open:** whether it levels off needs the two-hour run |
 
+## 1c. Two-hour soak (the owner's session, 2026-11-19)
+
+The owner played for 2 h 16 min through the app (`fmp capture`, 4K HDR 30 → 60, VFG, fullscreen, **variable refresh on
+the 119.88 Hz output HDMI-A-1**, sound to the headset) while streaming it on Discord, with the Discord patch of
+`PipeWireAudioDelay` (phase8-audio.md, "Screen shares and recorders") in the binary. Resources sampled from outside.
+
+| | Result |
+| --- | --- |
+| Duration | 8,148.6 s played, 8,146.5 s measured after 2 s of warm-up; stopped by the user; teardown clean |
+| RSS | 481–493 MB at 118 minutes (476.9 → 488.1 MB in the 10-minute run of 1b): the creep levelled off, it was warm-up |
+| Threads, descriptors | 21 and 120, unchanged |
+| GPU memory (this process) | 3,069 MiB |
+| GC | measured window 0/0/0 (one collection in the whole run, after the stop); 0 B allocated on the pacing, generator, present, control and capture threads |
+| Capture | 244,488 frames, 0 dropped by the driver |
+| HDR | followed: 244,258 frames read 10-bit, 0 read 8-bit, 0 switches |
+| Audio | 8,148.6 s to the headset with a Discord recorder attached: error mean 0.01 ms, rms 0.27 ms; underruns 0, overruns 0, resyncs 0; drift correction −22.0 ppm against a measured clock difference of −25.2 ppm; re-locks 2 (path changes 1); no "linked to another node" line |
+| Latency | a real frame shown 48.7 ms after its capture timestamp (p99 57.2) |
+| Slots | 487,483 measured (243,826 real, 243,657 generated, 0 repeated); 59.8 presents/s; intervals mean 16.711 ms, p99 17.140 ms |
+| Missed slots | 37,201 by the definition (first pixel more than half the shortest refresh period, 4.17 ms, after the slot's time): **the live counters and the verifier agreed on every one of the 277,908 slots the verifier held** (its buffer: the first 77 minutes; 3,929 missed there); the 209,575 after it were the live counters' alone. Of the 37,201 nearly all were labelled the pipeline's "late present" because hand-overs ran 0.43–0.56 ms before their time against an expected display delay of 0.85 ms; they were handed over in time, the display was late (fixed since: phase6-pacing.md, Known issues). With a p99 interval of 17.14 ms, at most about 1% of the intervals can be uneven, so almost all of these late slots came in runs of consecutive late slots shown at an even cadence: a steady extra latency of 4–8 ms while it lasted, not a judder (inferred from the summary; no CSV of the run). The TV itself, measured afterwards with a steady 29.97 fps source under variable refresh, made none: 0 late in 23,014 slots, first pixel at most 3 ms after the hand-over; the owner's session had a Discord screen share running, the leading suspect (phase6-pacing.md, Known issues 3b) |
+| Generated slots skipped | 767 in 8,146 s (one every 10.6 s; variable refresh, the next real frame came too late for them: known) |
+| Verdict as printed | FAIL, for bookkeeping only: the 209,575 slots beyond the verifier's buffer were counted as disagreements. Fixed: they are now reported as the live counters' alone, and a run without a duration reserves 4 hours of rows |
+
 ## 2. Small leftovers
 
 - **H ignored on 8-bit captures:** H now acts only on a P010 capture (`PlaybackSession.cs`, `CaptureIsTenBit`); it used to
@@ -118,9 +141,8 @@ HDMI-A-1 TV (VRR, HDR) or DP-3, and switch back with Ctrl+Alt+F1/F2. No mode is 
 
 ## Known issues / not done
 
-1. **The two-hour soak has not been run** (the owner needed the machine at midnight); only the 10-minute run in 1b, whose
-   RSS crept up about 2 MB every 200 s. Nothing in the summary measures RSS, GPU memory or descriptors yet (see 3). For
-   the owner to run another time, silent, on the card:
+1. **The two-hour soak**: done as the owner's session (1c); the RSS creep of 1b levelled off. Nothing in the summary
+   measures RSS, GPU memory or descriptors yet (see 3): they were sampled from outside. To repeat it silently on the card:
    ```sh
    pactl load-module module-null-sink sink_name=fmp-soak     # prints a module number
    fmp capture --mode 4k30-hdr --window 960x540 --duration-s 7200 --audio-sink fmp-soak > soak.log 2>&1 &
@@ -154,8 +176,8 @@ HDMI-A-1 TV (VRR, HDR) or DP-3, and switch back with Ctrl+Alt+F1/F2. No mode is 
 
 ## What should change in `docs/implementation-plan.md` (not edited here)
 
-Under Phase 9: saved settings done (CLI, no window); hitch-free quality switching, the soak instrumentation and the
-two-hour soak still open; the direct-display finding above (KWin leases no desktop connector: a TTY is needed).
+Under Phase 9: saved settings done (CLI, no window); the two-hour soak done (the owner's session, 1c); hitch-free
+quality switching and the soak instrumentation still open; the direct-display finding above (KWin leases no desktop connector: a TTY is needed).
 
 ## Found by the independent review (2026-11-18)
 

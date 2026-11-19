@@ -391,8 +391,9 @@ internal static class CommandDispatcher
           --audio-sink <name>       Where the sound goes: any sink, by its node name or a part of its name or description
                                     ("inzone"; several matches are refused and listed). Without it: the default output
                                     you selected in the desktop's sound settings, followed when you select another.
-                                    Either way it plays only there: muted (and said) while that device is gone, never
-                                    moved to another by PipeWire (a link anywhere else is muted and cut); implies on
+                                    Either way it plays to no other output device: muted (and said) while that device
+                                    is gone, never moved to another by PipeWire (a link to another output is muted and
+                                    cut; a recorder, such as a screen share's sound, may take a copy); implies on
           --audio-offset-ms <n>     Trim on top of the measured latency, -200 to 500 ms: positive plays the sound later,
                                     for what the timestamps cannot see (the TV's processing, the card itself)     (0)
                                     Diagnostics: FMP_AUDIO_LOG=<s> prints the delay, its target, the ratio and the learned
