@@ -161,7 +161,9 @@ internal sealed class CaptureAudio : IDisposable
             $"  audio       {played:0.0} s played from {r.Setup.SourceDescription ?? r.Setup.Source} to {r.FinalSink ?? r.Setup.Sink ?? "no sink"}" +
             $"{(r.SinkChanges > 0 ? $" (moved {r.SinkChanges}x as you selected another default output)" : "")}" +
             $"{(r.SinkLosses > 0 ? $"; the sink went away {r.SinkLosses}x (muted until it was back)" : "")}" +
-            $"{(r.WrongSinkLinks > 0 ? $"; linked to another output device {r.WrongSinkLinks}x (muted and cut each time)" : "")}"));
+            $"{(r.WrongSinkLinks > 0 ? $"; linked to another output device {r.WrongSinkLinks}x (muted and cut each time)" : "")}" +
+            $"{(r.RegistryResyncs > 0 ? $"; linked to a node not announced {r.RegistryResyncs}x (muted while the registry was read again; {r.UnannouncedRecorders} of them a recorder, not cut)" : "")}" +
+            $"{(r.RegistryHandlerErrors > 0 ? $"; registry objects lost to a handler error: {r.RegistryHandlerErrors}" : "")}"));
         if (s.MeasuredBlocks == 0)
         {
             o.WriteLine("              nothing measured (the run ended before the sound had followed the video's latency for 6 s)");

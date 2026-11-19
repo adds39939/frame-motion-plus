@@ -18,10 +18,19 @@ namespace FrameMotionPlus.TestSupport;
 /// for its whole run, and they queue behind each other (the GPU suites dominate the wall time either way). The
 /// operating system drops the lock when the test host exits, however it exits, so a leftover file means nothing. Without
 /// a GPU the hardware tests skip and the lock is held for as long as the remaining tests take.
+/// <para>
+/// <c>dotnet test</c> does not show a test host's stderr, so what the lock has to say goes to xunit's diagnostic messages
+/// too (shown with <c>diagnosticMessages</c> on), and a lock not obtained in <see cref="MaxWait"/> fails the assembly's
+/// tests with that reason (every test reports it) instead of running them unlocked, where their real-time windows would
+/// fail for no reason of their own.
+/// </para>
 /// </remarks>
 public sealed class GpuMachineLock : IDisposable
 {
-    private static readonly TimeSpan MaxWait = TimeSpan.FromMinutes(30);
+    /// <summary>30 minutes (the last of ten assemblies can wait long); <c>FMP_TEST_LOCK_WAIT_S</c> shortens it (to try the give-up path).</summary>
+    private static readonly TimeSpan MaxWait = double.TryParse(Environment.GetEnvironmentVariable("FMP_TEST_LOCK_WAIT_S"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var s) && s > 0
+        ? TimeSpan.FromSeconds(s)
+        : TimeSpan.FromMinutes(30);
     private static readonly TimeSpan SayAfter = TimeSpan.FromSeconds(5);
 
     private readonly FileStream? _held;
@@ -41,7 +50,7 @@ public sealed class GpuMachineLock : IDisposable
             catch (Exception e) when (e is UnauthorizedAccessException or DirectoryNotFoundException or PathTooLongException or NotSupportedException)
             {
                 // Not a held lock: someone else's file, or a temp directory that cannot hold one. Run without it.
-                Console.Error.WriteLine($"GPU test lock unavailable ({e.GetType().Name}: {path}); running without it, so hardware suites may overlap.");
+                Say($"GPU test lock unavailable ({e.GetType().Name}: {path}); running without it, so hardware suites may overlap.");
                 return;
             }
             catch (IOException)
@@ -50,14 +59,15 @@ public sealed class GpuMachineLock : IDisposable
                 var waited = Stopwatch.GetElapsedTime(started);
                 if (waited > MaxWait)
                 {
-                    Console.Error.WriteLine($"GPU test lock not obtained after {waited.TotalMinutes:F0} min ({path}); running without it, so hardware suites may overlap.");
-                    return;
+                    var why = $"the machine-wide test lock ({path}) was not obtained in {waited.TotalMinutes:0.#} min: another test assembly, or a test host left running, holds it. These tests are not run unlocked (beside another suite their real-time windows fail for that reason alone): run them again when it has finished.";
+                    Say(why);
+                    throw new InvalidOperationException(why);
                 }
 
                 if (!said && waited > SayAfter)
                 {
                     said = true;
-                    Console.Error.WriteLine($"Waiting for another test assembly to finish ({path}).");
+                    Say($"Waiting for another test assembly to finish ({path}).");
                 }
 
                 Thread.Sleep(100);
@@ -66,4 +76,18 @@ public sealed class GpuMachineLock : IDisposable
     }
 
     public void Dispose() => _held?.Dispose();
+
+    /// <summary>To stderr and to xunit's diagnostic messages (what <c>dotnet test</c> can show).</summary>
+    private static void Say(string text)
+    {
+        Console.Error.WriteLine(text);
+        try
+        {
+            Xunit.TestContext.Current.SendDiagnosticMessage(text);
+        }
+        catch (Exception e) when (e is InvalidOperationException or NullReferenceException)
+        {
+            // No test context to send to (stderr has it).
+        }
+    }
 }

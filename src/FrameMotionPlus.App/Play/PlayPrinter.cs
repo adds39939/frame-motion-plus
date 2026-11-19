@@ -462,10 +462,12 @@ internal static class PlayPrinter
     {
         string[] lines =
         [
-            "  quality     now Low (Q): the generator switched between two frames, no load",
-            "  quality     now Medium (Q): the generator switched between two frames, no load",
-            "  quality     now High (Q): the generator switched between two frames, no load",
-            "  quality     Q: the generator could not switch (its other instance is unusable); it stays where it was",
+            // Unmistakable in a scrolling terminal (there is nothing on the screen to show it in fullscreen): capitals, and
+            // what it costs. The latency figure is the 4K one measured for Phase 9c (D rises by High's extra generation time).
+            "  quality     >>> NOW LOW (Q pressed) <<<  the generator switched between two frames, no load; Q switches back",
+            "  quality     >>> NOW MEDIUM (Q pressed) <<<  the generator switched between two frames, no load; Q switches back",
+            "  quality     >>> NOW HIGH (Q pressed) <<<  the generator switched between two frames, no load; the picture now runs about 5 ms later at 4K (High's longer generation time); Q switches back",
+            "  quality     >>> Q: NOT SWITCHED <<<  the generator's other instance is unusable; it stays where it was",
         ];
         return n => o.WriteLine(lines[!n.Switched ? 3 : n.Commit.To switch { FrameGenQuality.Low => 0, FrameGenQuality.High => 2, _ => 1 }]);
     }

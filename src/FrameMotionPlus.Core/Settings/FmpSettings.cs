@@ -314,8 +314,11 @@ public sealed class GeneratorSettings
     /// <summary>Accepted values of <see cref="Backend"/>.</summary>
     public static IReadOnlyList<string> KnownBackends { get; } = ["vfg", "repeat", "blend", "auto", "none"];
 
-    /// <summary>Generator backend name: "vfg", "repeat", "blend", "auto" (VFG when the SDK is there) or "none".</summary>
-    public string Backend { get; set; } = "vfg";
+    /// <summary>
+    /// Generator backend name: "vfg", "repeat", "blend", "auto" (VFG when the SDK is there) or "none". The default is the
+    /// command line's (<c>--generator auto</c>), so the defaults <c>fmp settings</c> prints, used as a settings file, run as no file.
+    /// </summary>
+    public string Backend { get; set; } = "auto";
 
     /// <summary><c>--multiplier</c> of fmp capture and fmp play, 1 to 8 (null: not set).</summary>
     public int? Multiplier { get; set; }

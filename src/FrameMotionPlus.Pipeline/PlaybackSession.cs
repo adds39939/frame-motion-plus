@@ -401,7 +401,11 @@ public sealed class PlaybackSession : IDisposable
         var generatorBytes = Math.Max(0, freeBefore - _cuda.MemoryInfo.FreeBytes);
         if (switchQuality is not null && _generator is not null)
         {
-            _qualitySwitch = new QualitySwitchControl(startQuality, otherQuality, q => InitialGenerationTime(GeneratorKind.Vfg, q));
+            // The other quality's estimate starts from its own instance's warm-up (this frame size, this GPU), not the table.
+            var otherWarmup = secondLoad;
+            _qualitySwitch = new QualitySwitchControl(startQuality, otherQuality, q => q == otherQuality && otherWarmup is { } w
+                ? SeededGenerationTime(GeneratorKind.Vfg, q, w.WarmupNs, w.WarmupRuns)
+                : InitialGenerationTime(GeneratorKind.Vfg, q));
         }
         else
         {
@@ -1611,6 +1615,26 @@ public sealed class PlaybackSession : IDisposable
         GeneratorKind.Blend or GeneratorKind.Repeat => 200 * Nanoseconds.PerMicrosecond,
         _ => 200 * Nanoseconds.PerMicrosecond,
     };
+
+    /// <summary>
+    /// The generation time to start a quality's estimate from, given its instance's warm-up at load (<paramref name="warmupRuns"/>
+    /// back-to-back runs at the real frame size, <paramref name="warmupNs"/> until the GPU finished them): the mean run
+    /// plus a quarter (at 4K on this machine High warmed up at 5.7-5.8 ms a run and ran at p99 6.4 ms fullscreen, 7.0 ms in
+    /// a window; Medium 1.5 ms and 1.5-1.6 ms), kept between half and twice <see cref="InitialGenerationTime"/> (a cold
+    /// first run must not make the scheduler give up generating after a switch; the measured times replace the seed).
+    /// No warm-up measured: the table.
+    /// </summary>
+    public static long SeededGenerationTime(GeneratorKind kind, FrameGenQuality quality, long warmupNs, int warmupRuns)
+    {
+        var table = InitialGenerationTime(kind, quality);
+        if (warmupRuns <= 0 || warmupNs <= 0)
+        {
+            return table;
+        }
+
+        var perRun = warmupNs / warmupRuns;
+        return Math.Clamp(perRun + (perRun / 4), table / 2, table * 2);
+    }
 
     /// <summary>
     /// CUDA operations one ring write enqueues on the generator stream, for the bridge's budget (a stream holds about

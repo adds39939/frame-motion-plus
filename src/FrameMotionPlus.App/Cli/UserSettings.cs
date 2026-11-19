@@ -162,13 +162,21 @@ internal static class UserSettings
         {
             if (present.Contains(key.Name) && key.Read(settings) is { } value)
             {
+                string saved;
                 try
                 {
-                    Check(key, value);
+                    saved = Check(key, value);
                 }
                 catch (UsageException e)
                 {
                     throw new UsageException($"Invalid settings '{path}': {key.Name}: {e.Message}", e);
+                }
+
+                // The two keys the file model never leaves unset (fmp settings prints them): a value equal to the command
+                // line's default changes nothing and is not counted as saved (the printed defaults run as no file).
+                if (key.Name is "generator.backend" or "generator.quality" && saved == key.Default)
+                {
+                    continue;
                 }
 
                 values[key.Name] = value;
@@ -467,6 +475,15 @@ internal static class UserSettings
         return new AppliedSettings(result, applied, overridden);
     }
 
+    /// <summary>
+    /// For a command that failed after the file was applied: which saved values it ran with and from which file (a saved
+    /// device or mode that does not work otherwise reads like a typed one); null when no value came from a file.
+    /// </summary>
+    public static string? Blame(LoadedSettings loaded, AppliedSettings applied) =>
+        !loaded.Exists || applied.Applied.Count == 0
+            ? null
+            : $"saved settings used from {loaded.Path}: {string.Join(", ", applied.Applied)} (fmp settings show lists them; --no-settings runs without the file)";
+
     /// <summary>The start-up line: which file, and every value taken from it (nothing is applied unseen).</summary>
     public static string Describe(LoadedSettings loaded, AppliedSettings applied)
     {
@@ -487,9 +504,11 @@ internal static class UserSettings
     }
 
     /// <summary><c>fmp settings set</c>: checks the value as its option is, then writes it into the file (created with its
-    /// directory if need be), keeping every other key, atomically (a temporary file renamed over it).</summary>
-    public static string Set(string path, string name, string value)
+    /// directory if need be), keeping every other key, atomically (a temporary file renamed over it). Comments in a
+    /// hand-edited file are not kept: <paramref name="droppedComments"/> says the file had some.</summary>
+    public static string Set(string path, string name, string value, out bool droppedComments)
     {
+        droppedComments = false;
         var key = Find(name);
         string saved;
         try
@@ -501,7 +520,7 @@ internal static class UserSettings
             throw new UsageException($"{key.Name}: {e.Message}", e);
         }
 
-        var root = ReadNode(path);
+        var root = ReadNode(path, out droppedComments);
         var parts = key.Name.Split('.');
         if (root[parts[0]] is not JsonObject section)
         {
@@ -525,16 +544,18 @@ internal static class UserSettings
         return saved;
     }
 
-    /// <summary><c>fmp settings unset</c>: removes the key (and its section once empty); false when it was not set.</summary>
-    public static bool Unset(string path, string name)
+    /// <summary><c>fmp settings unset</c>: removes the key (and its section once empty); false when it was not set (the
+    /// file is then left as it was). <paramref name="droppedComments"/>: the rewritten file's comments were not kept.</summary>
+    public static bool Unset(string path, string name, out bool droppedComments)
     {
         var key = Find(name);
+        droppedComments = false;
         if (!File.Exists(path))
         {
             return false;
         }
 
-        var root = ReadNode(path);
+        var root = ReadNode(path, out var hadComments);
         var parts = key.Name.Split('.');
         if (root[parts[0]] is not JsonObject section || !section.Remove(parts[1]))
         {
@@ -547,11 +568,13 @@ internal static class UserSettings
         }
 
         Write(path, root);
+        droppedComments = hadComments;
         return true;
     }
 
-    private static JsonObject ReadNode(string path)
+    private static JsonObject ReadNode(string path, out bool hasComments)
     {
+        hasComments = false;
         if (!File.Exists(path))
         {
             return [];
@@ -560,6 +583,7 @@ internal static class UserSettings
         // The whole file must still load (a malformed one is reported, never overwritten).
         _ = Load(path, mustExist: true);
         var text = File.ReadAllText(path);
+        hasComments = HasComments(text);
         try
         {
             return JsonNode.Parse(text, documentOptions: new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true }) as JsonObject
@@ -569,6 +593,28 @@ internal static class UserSettings
         {
             throw new UsageException($"Invalid settings '{path}': {Describe(e)}", e);
         }
+    }
+
+    /// <summary>Whether the JSON text holds a comment (outside strings: the reader's own tokens).</summary>
+    internal static bool HasComments(string text)
+    {
+        try
+        {
+            var reader = new Utf8JsonReader(Encoding.UTF8.GetBytes(text), new JsonReaderOptions { CommentHandling = JsonCommentHandling.Allow, AllowTrailingCommas = true });
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.Comment)
+                {
+                    return true;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            // Malformed: Load has already refused it before this is asked.
+        }
+
+        return false;
     }
 
     private static void Write(string path, JsonObject root)

@@ -19,9 +19,10 @@ public sealed class PipeWireLoopbackTests
 {
     private const long Ms = 1_000_000;
 
-    internal static PwConnection RequireServer()
+    /// <param name="registryLog">Keep this many registry events of the test's connection (a failing test can show them).</param>
+    internal static PwConnection RequireServer(int registryLog = 0)
     {
-        if (!PwConnection.TryConnect("fmp-audio-tests", out var connection, out var reason))
+        if (!PwConnection.TryConnect("fmp-audio-tests", out var connection, out var reason, registryLogCapacity: registryLog))
         {
             Assert.Skip($"needs a PipeWire server: {reason}");
         }

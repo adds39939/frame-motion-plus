@@ -60,7 +60,7 @@ fmp capture --no-settings                  # exactly as before this phase
   the strict reader used by `fmp settings --validate` and `fmp simulate --settings` is unchanged).
 - **`set`/`unset`:** validate first, keep every other key, create the directory, write a temporary file, check that it
   loads, rename it over the old one. A malformed existing file is reported and never overwritten. Comments in a
-  hand-edited file are not kept by `set`.
+  hand-edited file are not kept by `set`/`unset`; since the hardening pass they say so (`note: the file had comments; …`).
 - **Tests never touch the owner's file:** every test process sets `XDG_CONFIG_HOME` and `APPDATA` to a temporary
   directory of its own before any test runs (`tests/Shared/IsolatedSettings.cs`, a module initializer compiled into every
   test project by `Directory.Build.props`); child processes inherit it. `Tests_never_see_the_owners_config_directory`
@@ -151,8 +151,9 @@ not run with Q on the card.
 
 - **Q in the window** (`fmp play` and `fmp capture`; key-down, no repeat) switches VFG between Medium and High (between
   the start quality and High, or Medium when started with `--quality high`). One line per switch:
-  `quality     now High (Q): the generator switched between two frames, no load` (preformatted: the control thread
-  allocates nothing). A start-up `keys` line lists the keys (capture: Esc, H, A, Q; play: Esc, Q), and a `quality` line
+  `quality     >>> NOW HIGH (Q pressed) <<<  the generator switched between two frames, no load; the picture now runs
+  about 5 ms later at 4K (High's longer generation time); Q switches back` (capitals since the hardening pass, so a stray
+  Q in fullscreen is seen in the terminal; preformatted: the control thread allocates nothing). A start-up `keys` line lists the keys (capture: Esc, H, A, Q; play: Esc, Q), and a `quality` line
   says what the second instance cost or why Q does nothing. `--generator blend|repeat|none`, `--no-quality-switch` and a
   failed second load answer Q with one line (`quality     Q ignored: the blend generator has one quality`).
 - **`--quality-switch` / `--no-quality-switch`** (both commands; both together is a usage error) and the saved setting
@@ -306,6 +307,82 @@ passed 3 of 3 alone afterwards. Then two more whole-solution runs with that chan
 So runs 5, 6 and 7 are three in a row with no failure (10 min 20 s each); the Audio test above did not fail again in
 them, but it is not fixed.
 
+## 6. Hardening pass (2026-11-19)
+
+Leftovers of the two reviews, each done as far as it was contained and testable.
+
+**The audio guard reads the registry again before cutting for a node it does not know** (`PipeWireAudioDelay.Examine`,
+`PwConnection.ResyncRegistryLocked`). A playback peer the registry has not announced used to be cut at once (mute,
+destroy, re-make: a screen share's link broken with it). Now, when the only wrong peers are unannounced ones (an output
+device other than the chosen sink is still cut at once, without a resync), the guard keeps the mute, destroys its registry
+proxy, makes a fresh one, and waits for a core round trip (at most 250 ms, `ResyncTimeoutMs`; the loop thread runs while
+it waits, the audio callbacks never take the loop lock) so the fresh registry has announced everything; the rebuilt model
+replaces the old one only then (readers see the old one meanwhile), and the peers are classified again. A recorder after
+all: the sound resumes, nothing cut; still unknown, or an output device: cut and re-made as before. One resync per
+unannounced peer while it stays linked, at most one per look. The old registry proxy's hook memory is kept until the
+connection is disposed (the library may touch it until the proxy is freed). Measured: the resync took **1.4, 1.4 and
+1.6 ms** (three runs of the new test); **worst case muted: 250 ms (the round-trip limit) plus the fade-out (one block) and
+the delay line's restart with its 10 ms fade-in**; when the server does not answer in time the fresh model is used anyway
+and fills in as the late announcements arrive. The summary's audio line adds `linked to a node not announced Nx (…; M of
+them a recorder, not cut)` when it happened.
+
+**What the registry handler's catch swallows is counted** (`PwConnection.HandlerErrors`, the metadata handler's too):
+`registry objects lost to a handler error: N` on the summary's audio line when N > 0, and the first one's type and
+message once on stderr (`fmp: audio: the PipeWire registry handler failed on an object (…)`), said by the supervisor
+outside the loop lock.
+
+**Registry event log for tests**: `PwConnection.TryConnect(…, registryLogCapacity)` keeps a ring of the last N
+registry events (`+id Node name (class)`, `+id Link a->b`, `+id Client`, `-id`, resyncs, handler errors), off in the app
+(capacity 0; the guard's through the internal `AudioDelayOptions.RegistryLogCapacity`). `SinkGuardTests` keep 8,192 on
+both connections and the recorder tests dump both logs (the lines about the peers and the playback node, then the last 60
+of each) when they fail, so the next intermittent failure explains itself.
+
+**The cause of the test's missed node was not found.** Reading `OnGlobal` again: nothing in the node path can throw on a
+well-formed announcement (the name and class are copied before anything is parsed), and both connections receive the
+same ordered stream from the server. One untested hypothesis remains: PipeWire keeps a client's per-object permissions
+by global id, so a permission entry left for a recycled id could hide the new object from one client but not another (the
+link, at a fresh id, stays visible); a fresh registry would then not announce it either, and the guard would cut as before.
+Not reproduced in this pass (the monitor test passed in every run here).
+
+Tests (`SinkGuardTests`, null sinks only): a recorder whose first announcement the guard's connection drops (the test
+seam `HideNodeOnceForTests`) → one resync, classified a recorder, 0 wrong links, no restart, not muted, clicks on the
+chosen sink and to the recorder afterwards; a recorder the guard never knows (`HideNodeAlwaysForTests`) → resync, then
+cut (wrong links ≥ 1), the sound back on the chosen sink; a link by hand to another null sink → cut with **no** resync; the
+classifier's new fields (output device, unannounced ids) without a server.
+
+**Saved settings.** `fmp settings > file` used as a settings file now runs as no file: the file model's backend
+default is `auto` (the command line's), and a saved `generator.backend: auto` or `generator.quality: medium` (the two keys
+the model always holds) is not counted as saved. A file written by an older `fmp settings` (with `"vfg"`) still forces
+VFG: it cannot be told from a chosen `vfg`. A failure after the file was applied (no such device, a mode the device does
+not offer, the generator unavailable, a V4L2 error) is followed by `fmp: capture: saved settings used
+from <file>: capture.device=/dev/video99, … (fmp settings show lists them; --no-settings runs without the file)`, and a
+usage error from the combined command line carries the same text in parentheses; the start-up order is unchanged when
+nothing fails. `set`/`unset` on a file with comments say `note: the file had comments;
+set and unset rewrite it without them` (comments are detected with the JSON reader's own tokens, not by searching for
+`//`). Verified on the AOT binary with a scratch `XDG_CONFIG_HOME` (no `~/.config/fmp` created).
+
+**Test lock** (`tests/Shared/GpuMachineLock.cs`): what it says goes to stderr and to xunit's diagnostic messages, and a
+lock not obtained in 30 minutes now **fails** the assembly's tests with the reason instead of running them unlocked.
+Proved by holding the lock with `flock` and `FMP_TEST_LOCK_WAIT_S=3` (an override for trying it): the test failed with
+`Assembly fixture type 'GpuMachineLock' threw in its constructor … the machine-wide test lock (/tmp/frame-motion-plus-gpu-tests.lock)
+was not obtained in 0.1 min: …`. The "waiting" notice is shown only where diagnostic messages are on.
+
+**High's generation-time seed** (`PlaybackSession.SeededGenerationTime`): the other quality's estimate starts from its
+own instance's warm-up at load (8 back-to-back runs at the real size): the mean run plus a quarter, kept between half and
+twice the table's figure (a cold first run must not make the scheduler give up generating). At 4K here High warmed up at
+5.7–5.8 ms a run (45.3–46.7 ms for 8), so the seed is 7.2 ms against the measured windowed p99 of 6.996 ms (the table's
+6.5 ms was below it). No warm-up measured (the instance was already loaded): the table. In the switch model a High
+costing 9.5 ms (a slower GPU) made 1 late and 1 skipped slot at the first up-switch with the table seed, and none with
+the warm-up seed (8 runs at 7.6 ms). The start quality's estimate is unchanged.
+
+**Q in fullscreen**: there is no periodic status line or overlay to put the quality in, so the switch line is now in
+capitals with its cost: `quality     >>> NOW HIGH (Q pressed) <<<  …; the picture now runs about 5 ms later at 4K …;
+Q switches back`. No overlay was built.
+
+**Test runs**: the Audio project five times in a row, all green (77 each, 53 s; the recorder count's last one-line
+refinement came after them); then the whole solution once, all green: Core 711, Platform 100 + 1 skip, Audio 77, Cuda
+144, Vulkan 108, Gpu 129, Vfx 93 + 1 skip, Sources.File 154, Pipeline 158 + 1 skip, Sources.V4l2 86 + 35 skips.
+
 ## Known issues / not done
 
 1. **The two-hour soak**: done as the owner's session (1c); the RSS creep of 1b levelled off. Nothing in the summary
@@ -333,9 +410,10 @@ them, but it is not fixed.
 6. `fmp capture --list` with `--settings` is refused ("--list takes no other option"), as before.
 7. Direct display: only the probe above.
 8. **The audio guard's loopback hole** (phase8-audio.md, "Screen shares and recorders"): not done in Phase 9c (time).
-9. **`SinkGuardTests.A_pulseaudio_monitor_of_the_stream_is_left_alone` fails intermittently** (section 5): the test's
-   registry connection loses a recorder node at a recycled id; suspected id reuse against `PwConnection`'s id-keyed maps
-   (`object.serial` would be the fix), which could also make the guard itself take a recorder for a wrong link.
+9. **`SinkGuardTests.A_pulseaudio_monitor_of_the_stream_is_left_alone` failed intermittently** (section 5) and the cause
+   is still unknown (section 6: the id-reuse ordering fault was refuted in review; a stale per-id permission is an
+   untested hypothesis). The guard no longer cuts for a node it does not know without reading the registry again, and the
+   test now dumps both connections' registry events when it fails. Not reproduced in this pass.
 10. Quality switching, not done or not measured: Q on the capture card (PS5 off); switching during a hold or a cut on the
    card; Q under variable refresh on the owner's 119.88 Hz TV (only DP-3 was used); the per-switch window counts the live
    accounting's misses, not the verifier's; a switch made while the scheduler makes no decisions (a long hold) waits 1 s
@@ -353,13 +431,10 @@ Approved with no must-fix. Fixed afterwards: a saved `capture.device` or `genera
 is refused (it would have been read as an option), and `fmp settings set` gives a plain error when the config directory
 cannot be created. Not fixed:
 
-- `fmp settings > file` used as a settings file forces VFG: the printed defaults contain `generator.backend: "vfg"`
-  and `quality: "Medium"`, which then count as saved (`FmpSettings.cs` against `UserSettings.cs:61`, default `auto`).
-- A saved value that fails after parsing does not name its key or file: a saved `/dev/video99` gives `no such capture
-  device /dev/video99` with no hint that it came from the file (`CaptureCommand.cs:180` prints the settings line only
-  after setup succeeds).
 - `set` on a symlinked `settings.json` replaces the link with a regular file; a symlinked directory is fine.
-- `set` and `unset` drop comments from a hand-edited file without saying so; unknown keys are kept.
+- `set` and `unset` still drop comments from a hand-edited file (they now say so; section 6). Fixed in section 6: the
+  printed defaults forcing VFG, and a saved value that fails after parsing not naming its key and file (`fmp play` does
+  not tag its errors that way yet: only `fmp capture` does).
 - No lock and no fsync on write: two `set`s at once can lose one update.
 - An existing but unreadable settings file stops a capture with one error before any device is opened.
 - JSON errors give a zero-based line number and .NET type names.
@@ -375,19 +450,30 @@ afterwards: the windowed tests' skip rule could clear every miss when no slot ma
 
 - **Recycled node ids and the audio guard:** the intermittent failure of `SinkGuardTests.A_pulseaudio_monitor_of_
   the_stream_is_left_alone` did not reproduce in 106 attachments with every registry event logged (1,810 id reuses,
-  none mis-tracked), and the suspected ordering fault is contradicted by that evidence. Sound reaching an unchosen
-  device through id reuse is not reachable by reading. A wrong mute needs a lost node announcement, which could not
-  be produced; the cause of the original failures is unknown. To do: before cutting a stream for an unannounced
-  peer, enumerate again with a fresh registry proxy and rebuild the maps; count what the catch at
-  `PwConnection.cs:396-399` swallows; have the test dump the registry events when it fails.
-- **The test lock's fallback is invisible:** `dotnet test` does not show the hosts' stderr, so an assembly that
-  gives up waiting after 30 minutes runs unlocked with nothing to say why its timing tests then fail.
-- **High's generation time is seeded at 6.5 ms** whatever the size or GPU (`PlaybackSession.cs:1603-1608`); the
-  measured windowed p99 is 6.996 ms, covered only by the 0.5 ms margin. Seed it from the second instance's warm-up.
+  none mis-tracked), and the suspected ordering fault is contradicted by that evidence. The cause of the original
+  failures is still unknown. Done in section 6: a resync before cutting for an unannounced peer, the swallowed
+  handler errors counted, the test's registry dump. A node hidden from the guard by the server itself (if that is the
+  cause) would still be cut after the resync.
+- Done in section 6: the test lock's fallback (now a failure with its reason), High's seed (from its warm-up).
 - **Video memory short:** a second load that fails falls back to one instance; one that succeeds and starves a
   later allocation would break a start that one instance survived (not tested; nor a cold CUDA JIT cache).
-- **Q is silent in fullscreen:** a stray Q with the window focused moves to High (about 4.8 ms more latency) with
-  only a line in the terminal to show it.
+- **Q in fullscreen** still shows nothing on the screen (no overlay): the terminal line is now in capitals with the
+  cost (section 6).
 - 60 fps at 4x on fixed 240 Hz drops to stride 2 with 6 starved slots at an up-switch (simulated).
 - Not exercised: Q on the capture card, during a hold or a cut, and H while a switch is pending.
+
+## Found by the independent review of the hardening pass (2026-11-19)
+
+Approved with no must-fix. Corrections and what was done about them:
+
+- **The registry re-read can wait about 1 s, not 250 ms, when the server does not answer.** The wait used
+  (`pw_thread_loop_timed_wait`) counts in whole seconds and the deadline is only checked on wake-up: against a
+  stopped server the re-read returned after 1,001 ms three times out of three. Where this document or
+  `phase8-audio.md` says "at most 250 ms", read "about 1 s if the server has stalled; 0.4 to 1.6 ms measured
+  otherwise". Not changed: an absolute-deadline wait (`pw_thread_loop_timed_wait_full`) would honour 250 ms.
+- **Fixed afterwards: a re-read that timed out no longer lets the guard conclude anything.** The reviewer showed by
+  reading that the incomplete model could hold the link to the chosen sink but not yet a link to another output
+  device, so the sound could resume until the late link arrived. Now, when the server did not answer in time, the
+  stream is cut and made again, as an unannounced peer always was before the re-read existed.
+- One retired listener hook per re-read is kept until the connection is disposed (about 64 bytes each).
 

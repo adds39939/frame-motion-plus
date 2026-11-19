@@ -170,6 +170,62 @@ public class QualitySwitchControlTests
         Assert.InRange(control.Log[2].EstimateNs, HighD, HighD + (Ms / 10));
     }
 
+    /// <summary>
+    /// The other quality's estimate is seeded from its own instance's warm-up at load: the mean run plus a quarter, kept
+    /// between half and twice the table's figure; with no warm-up measured, the table.
+    /// </summary>
+    [Fact]
+    public void The_other_quality_is_seeded_from_its_warm_up()
+    {
+        var table = PlaybackSession.InitialGenerationTime(GeneratorKind.Vfg, FrameGenQuality.High);
+        Assert.Equal(6_500 * Nanoseconds.PerMicrosecond, table);
+
+        // 4K High on this machine: 8 warm-up runs in 46 ms (5.75 ms a run): 7.19 ms, above the windowed p99 of 6.996 ms.
+        var fourK = PlaybackSession.SeededGenerationTime(GeneratorKind.Vfg, FrameGenQuality.High, 46 * Ms, 8);
+        Assert.InRange(fourK, 7_100 * Nanoseconds.PerMicrosecond, 7_300 * Nanoseconds.PerMicrosecond);
+        Assert.Equal(table / 2, PlaybackSession.SeededGenerationTime(GeneratorKind.Vfg, FrameGenQuality.High, 8 * Ms, 8)); // floor
+        Assert.Equal(table * 2, PlaybackSession.SeededGenerationTime(GeneratorKind.Vfg, FrameGenQuality.High, 800 * Ms, 8)); // a cold first run: ceiling
+        Assert.Equal(table, PlaybackSession.SeededGenerationTime(GeneratorKind.Vfg, FrameGenQuality.High, 0, 0));
+        Assert.Equal(table, PlaybackSession.SeededGenerationTime(GeneratorKind.Vfg, FrameGenQuality.High, 46 * Ms, 0));
+    }
+
+    /// <summary>
+    /// On a GPU where High costs 9.5 ms (half as fast again as the 4K figure), the first up-switch seeded from the warm-up
+    /// (8 runs at 7.6 ms) raises D far enough before anything is generated at High: no slot late or skipped.
+    /// </summary>
+    [Fact]
+    public void A_slower_high_seeded_from_its_warm_up_makes_no_slot_late_at_the_first_switch()
+    {
+        const long slowHigh = 9_500_000;
+        var warmed = PlaybackSession.SeededGenerationTime(GeneratorKind.Vfg, FrameGenQuality.High, 8 * 7_600_000, 8);
+        Assert.True(warmed >= slowHigh, $"seed {warmed}");
+        long SeedFromWarmup(FrameGenQuality q) => q == FrameGenQuality.High ? warmed : Seed(q);
+        var sim = new Sim(new SchedulerOptions { ClockMode = ClockMode.Vrr, DisplayRate = FrameRate.FromHz(120), MaxMultiplier = 2, InitialGenerationTimeNs = Seed(FrameGenQuality.Medium) })
+        {
+            HighCost = slowHigh,
+        };
+        var control = new QualitySwitchControl(FrameGenQuality.Medium, FrameGenQuality.High, SeedFromWarmup);
+        sim.Run(control, 3 * Nanoseconds.PerSecond);
+        control.Toggle();
+        sim.Run(control, 3 * Nanoseconds.PerSecond);
+        Assert.Equal(1, control.Commits);
+        Assert.Equal(warmed, control.Log[0].EstimateNs);
+        Assert.Equal(0, sim.Late);
+        Assert.Equal(0, sim.Skipped);
+        Assert.True(sim.GeneratedAt[FrameGenQuality.High] > 50);
+
+        // The table's 6.5 ms for the same GPU (what was seeded before): the first up-switch is late (the model is deterministic).
+        var table = new Sim(new SchedulerOptions { ClockMode = ClockMode.Vrr, DisplayRate = FrameRate.FromHz(120), MaxMultiplier = 2, InitialGenerationTimeNs = Seed(FrameGenQuality.Medium) })
+        {
+            HighCost = slowHigh,
+        };
+        var fixedSeed = new QualitySwitchControl(FrameGenQuality.Medium, FrameGenQuality.High, Seed);
+        table.Run(fixedSeed, 3 * Nanoseconds.PerSecond);
+        fixedSeed.Toggle();
+        table.Run(fixedSeed, 3 * Nanoseconds.PerSecond);
+        Assert.True(table.Late + table.Skipped > 0, $"table seed: {table.Late} late, {table.Skipped} skipped");
+    }
+
     [Fact]
     public void Two_different_qualities_are_needed()
     {
@@ -211,6 +267,9 @@ public class QualitySwitchControlTests
         public FrameScheduler Scheduler { get; } = new(options);
 
         public FrameGenQuality Quality { get; set; } = FrameGenQuality.Medium;
+
+        /// <summary>What a High run costs here (a slower GPU or a larger frame than the 4K one: more).</summary>
+        public long HighCost { get; init; } = HighD;
 
         public long Now { get; private set; } = 1;
 
@@ -254,7 +313,7 @@ public class QualitySwitchControlTests
 
                 if (d.Kind == SlotKind.Generated)
                 {
-                    var cost = Quality == FrameGenQuality.High ? HighD : MediumD;
+                    var cost = Quality == FrameGenQuality.High ? HighCost : MediumD;
                     GeneratedAt[Quality]++;
                     if (Now + cost > d.TargetTimeNs)
                     {

@@ -284,7 +284,8 @@ and High with `--quality low`). Both instances are loaded at start, so the switc
 swap on the generator thread between two frames, with no load (loading during playback would stall the whole GPU for
 50 to 200 ms). Going up, the pipeline delay D first rises by High's extra cost (about 5 ms at 4K, in about 100 ms) and the
 decisions move earlier step by step, then the generator switches, so no slot is late; going down it switches at once and D
-falls back over about a second. Each switch prints one line; the summary lists every switch (when, what it cost, the
+falls back over about a second. Each switch prints one line in capitals (`quality     >>> NOW HIGH (Q pressed) <<<  …`:
+nothing on the screen shows it in fullscreen); the summary lists every switch (when, what it cost, the
 slots around it) and each quality's latency and generation time. The cost of having it: about 90 ms more start-up and
 the second instance's GPU memory (High: about 1.5 GB at 4K, 1.3 GB at 1440p; printed at start); `--no-quality-switch`
 (or `fmp settings set generator.qualitySwitch false`) keeps one instance. Measured in
@@ -359,7 +360,9 @@ keys are `capture.device`, `capture.mode`, `generator.backend`, `generator.quali
 `display.clock`, `display.fullscreen` (true or false), `display.window` (the window's size when windowed), `audio.mode`,
 `audio.sink`, `audio.source`, `audio.offsetMs`, `hdr.mode`, `hdr.peakNits`, `hdr.maxCll`, `hdr.maxFall` and
 `generator.vfxSdkDirectory` (`fmp --help`, "saved settings"). `set` writes the file atomically and keeps the other keys
-(comments in a hand-edited file are not kept).
+(comments in a hand-edited file are not kept: `set` and `unset` say so when the file had some). If the command then
+fails on a saved value (a saved device that is not there), the error is followed by a line naming the file and the
+values used from it. The defaults `fmp settings` prints, saved as a file, run exactly as no file.
 
 ### HDR test patterns
 

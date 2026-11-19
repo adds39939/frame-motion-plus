@@ -81,8 +81,20 @@ public sealed record AudioReport
     /// <summary>Times the chosen sink went away (the sound muted until it came back).</summary>
     public int SinkLosses { get; init; }
 
-    /// <summary>Times the playback stream was found linked to another output device than the chosen sink, or to a node not announced (muted and cut).</summary>
+    /// <summary>Times the playback stream was found linked to another output device than the chosen sink, or to a node still not announced after the registry was read again (muted and cut).</summary>
     public int WrongSinkLinks { get; init; }
+
+    /// <summary>
+    /// Times the playback stream was found linked to a node the registry had not announced and the guard read the whole
+    /// registry again before judging it (muted meanwhile; <see cref="UnannouncedRecorders"/> of them were then recorders).
+    /// </summary>
+    public int RegistryResyncs { get; init; }
+
+    /// <summary>Of <see cref="RegistryResyncs"/>: the node was a recorder after all (the sound resumed; nothing was cut).</summary>
+    public int UnannouncedRecorders { get; init; }
+
+    /// <summary>Registry objects (or metadata properties) whose handling threw on the guard's connection (each missed by its model).</summary>
+    public int RegistryHandlerErrors { get; init; }
 
     public int SourceLosses { get; init; }
 
@@ -122,6 +134,14 @@ public sealed class PipeWireAudioDelay : IAudioDelay
     /// <summary>A stream found linked to the wrong node is re-made after this, doubling each time up to <see cref="RetryNs"/>.</summary>
     private const long WrongLinkBackoffNs = 250 * Nanoseconds.PerMillisecond;
 
+    /// <summary>
+    /// The longest a resync of the registry may wait for the server (a fresh registry announcing everything takes a few
+    /// milliseconds on a desktop): the bound on how long a peer not announced keeps the sound muted before it is judged.
+    /// With a server that does not answer the wait ends after about a second, not this: the loop's timed wait counts in
+    /// whole seconds and the deadline is checked when it wakes. A resync that timed out concludes nothing (the stream is cut).
+    /// </summary>
+    internal const int ResyncTimeoutMs = 250;
+
     private readonly AudioDelayOptions _o;
     private readonly DelayLine _line;
     private readonly PwConnection _connection;
@@ -158,6 +178,12 @@ public sealed class PipeWireAudioDelay : IAudioDelay
     private int _sinkChanges;
     private int _sinkLosses;
     private int _wrongSinkLinks;
+    private int _registryResyncs;
+    private int _unannouncedRecorders;
+    private bool _handlerErrorsReported;
+
+    // Peers not announced that a resync has already been spent on (each gets one while it stays linked).
+    private readonly HashSet<uint> _resyncedPeers = [];
     private int _recorders;
     private int _sourceLosses;
     private int _captureRestarts;
@@ -203,6 +229,20 @@ public sealed class PipeWireAudioDelay : IAudioDelay
 
     public long CurrentDelayNs => _line.CurrentDelayNs;
 
+    /// <summary>Tests: the guard connection's registry events (<see cref="AudioDelayOptions.RegistryLogCapacity"/>), oldest first.</summary>
+    internal List<string> RegistryLog()
+    {
+        if (_connection.Lost || _tornDown)
+        {
+            return [];
+        }
+
+        using (_connection.Lock())
+        {
+            return _connection.RegistryLogLocked();
+        }
+    }
+
     /// <summary>What it connected to (after <see cref="Start"/>).</summary>
     public AudioSetup? Setup => _setup;
 
@@ -215,10 +255,13 @@ public sealed class PipeWireAudioDelay : IAudioDelay
     {
         ArgumentNullException.ThrowIfNull(options);
         delay = null;
-        if (!PwConnection.TryConnect("fmp-audio", out var connection, out reason))
+        if (!PwConnection.TryConnect("fmp-audio", out var connection, out reason, registryLogCapacity: options.RegistryLogCapacity))
         {
             return false;
         }
+
+        connection.HideNodeOnceForTests = options.HideNodeOnceForTests;
+        connection.HideNodeAlwaysForTests = options.HideNodeAlwaysForTests;
 
         string? sink = null;
         using (connection.Lock())
@@ -371,6 +414,9 @@ public sealed class PipeWireAudioDelay : IAudioDelay
             FinalSink = Volatile.Read(ref _sink),
             SinkLosses = _sinkLosses,
             WrongSinkLinks = _wrongSinkLinks,
+            RegistryResyncs = _registryResyncs,
+            UnannouncedRecorders = _unannouncedRecorders,
+            RegistryHandlerErrors = _connection.HandlerErrors,
             SourceLosses = _sourceLosses,
             CaptureRestarts = _captureRestarts,
             PlaybackRestarts = _playbackRestarts,
@@ -505,6 +551,7 @@ public sealed class PipeWireAudioDelay : IAudioDelay
                 }
 
                 Look();
+                ReportHandlerErrors();
                 Log();
             }
 
@@ -557,6 +604,18 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         }
     }
 
+    /// <summary>The first registry handler failure on the guard's connection, said once (outside the loop lock).</summary>
+    private void ReportHandlerErrors()
+    {
+        if (_handlerErrorsReported || _connection.HandlerErrors == 0)
+        {
+            return;
+        }
+
+        _handlerErrorsReported = true;
+        Event($"the PipeWire registry handler failed on an object ({_connection.FirstHandlerError}); the guard's model may miss a node: a node it does not know is looked up again before anything is cut (the count is in the summary)");
+    }
+
     /// <summary>Diagnostics (<see cref="AudioDelayOptions.LogIntervalS"/>): the delay line as it stands, every few seconds.</summary>
     private void Log()
     {
@@ -606,21 +665,55 @@ public sealed class PipeWireAudioDelay : IAudioDelay
             }
 
             var captureNode = _capture?.NodeIdLocked() ?? PwDefs.IdAny;
-            var playbackNode = _playback?.NodeIdLocked() ?? PwDefs.IdAny;
             if (captureNode != PwDefs.IdAny)
             {
                 into = _connection.PeersIntoLocked(captureNode);
             }
 
-            if (playbackNode != PwDefs.IdAny)
+            PlaybackPeersLocked(peers);
+        }
+
+        // A peer the registry has not announced and no output device besides: before it is judged (and the stream cut,
+        // which would also break a screen share's link), the registry is read again from scratch, once per such peer, with
+        // the sound muted meanwhile (at most ResyncTimeoutMs plus the fade). An output device is cut at once, as before.
+        var route = ClassifyPlaybackPeers(peers, sink?.Id ?? PwDefs.IdAny);
+        var registryIncomplete = false;
+        if (route.OutputDevice is null && route.Unannounced.Count > 0 && !_resyncedPeers.IsSupersetOf(route.Unannounced))
+        {
+            _line.SetMuted(true);
+            var unknown = route.Unannounced;
+            var resyncStartNs = Clock.NowNs;
+            bool caughtUp;
+            using (_connection.Lock())
             {
-                foreach (var peer in _connection.PeersOutOfLocked(playbackNode))
-                {
-                    var known = _connection.TryNodeKindLocked(peer, out var name, out var mediaClass);
-                    peers.Add((peer, known, name, mediaClass));
-                }
+                caughtUp = _connection.ResyncRegistryLocked(ResyncTimeoutMs);
+                source = _connection.FindNodeLocked(_o.Source);
+                sink = _connection.FindNodeLocked(_sink);
+                into = _connection.PeersIntoLocked(_capture?.NodeIdLocked() ?? PwDefs.IdAny);
+                peers.Clear();
+                PlaybackPeersLocked(peers);
+            }
+
+            // The server did not answer in time: the model may lack the very link that would show an output device, so
+            // nothing is concluded from it. The stream is cut and made again, as an unannounced peer always was before.
+            registryIncomplete = !caughtUp;
+            var took = string.Create(CultureInfo.InvariantCulture, $"{(Clock.NowNs - resyncStartNs) / 1e6:0.0} ms");
+            _registryResyncs++;
+            _resyncedPeers.UnionWith(unknown);
+            route = ClassifyPlaybackPeers(peers, sink?.Id ?? PwDefs.IdAny);
+            var nowKnown = peers.Where(p => p.Known && unknown.Contains(p.Id)).ToList();
+            if (route.Foreign is null)
+            {
+                _unannouncedRecorders += nowKnown.Count > 0 ? 1 : 0; // known now (no output device: a recorder), not merely gone
+                Say($"the playback stream was linked to a node the registry had not announced ({string.Join(", ", unknown.Select(u => $"node {u}"))}): muted while the registry was read again ({took}{(caughtUp ? "" : ", it did not catch up in time")}); it is {(nowKnown.Count == 0 ? "gone" : string.Join(", ", nowKnown.Select(p => $"{p.Name}, {p.MediaClass ?? "no media class"}")))}: nothing cut");
+            }
+            else
+            {
+                Say($"the playback stream was linked to a node the registry had not announced ({string.Join(", ", unknown.Select(u => $"node {u}"))}); after reading the registry again ({took}{(caughtUp ? "" : ", it did not catch up in time")}): {route.Foreign}");
             }
         }
+
+        _resyncedPeers.IntersectWith(route.Unannounced);
 
         var restartPlayback = false;
 
@@ -675,9 +768,8 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         }
 
         // The playback: it feeds the chosen sink and no other output device, or it is muted (and the wrong link cut).
-        var route = ClassifyPlaybackPeers(peers, sink?.Id ?? PwDefs.IdAny);
-        var playbackLinked = route.ToChosen && route.Foreign is null;
-        var playbackWrong = route.Foreign is not null;
+        var playbackLinked = route.ToChosen && route.Foreign is null && !registryIncomplete;
+        var playbackWrong = route.Foreign is not null || registryIncomplete;
         if (!playbackWrong && route.Recorders.Count != _recorders)
         {
             Say(route.Recorders.Count == 0
@@ -704,7 +796,7 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         if (playbackWrong && now >= _nextPlaybackWrongNs)
         {
             _wrongSinkLinks++;
-            Say($"the playback stream was linked to another node than {_sink} ({route.Foreign}): muted, cut, connected to {_sink} again");
+            Say($"the playback stream was linked to another node than {_sink} ({route.Foreign ?? "a node the registry did not confirm in time"}): muted, cut, connected to {_sink} again");
             _nextPlaybackWrongNs = now + _playbackWrongBackoffNs;
             _playbackWrongBackoffNs = Math.Min(RetryNs, _playbackWrongBackoffNs * 2);
             restartPlayback = true;
@@ -773,14 +865,35 @@ public sealed class PipeWireAudioDelay : IAudioDelay
         }
     }
 
-    /// <summary>What the playback stream feeds, peer by peer (<see cref="ClassifyPlaybackPeers"/>).</summary>
-    internal readonly record struct PlaybackRoute(bool ToChosen, string? Foreign, IReadOnlyList<string> Recorders);
+    /// <summary>The playback stream's peers as the model knows them (loop locked).</summary>
+    private void PlaybackPeersLocked(List<(uint Id, bool Known, string Name, string? MediaClass)> peers)
+    {
+        var playbackNode = _playback?.NodeIdLocked() ?? PwDefs.IdAny;
+        if (playbackNode == PwDefs.IdAny)
+        {
+            return;
+        }
+
+        foreach (var peer in _connection.PeersOutOfLocked(playbackNode))
+        {
+            var known = _connection.TryNodeKindLocked(peer, out var name, out var mediaClass);
+            peers.Add((peer, known, name, mediaClass));
+        }
+    }
+
+    /// <summary>
+    /// What the playback stream feeds, peer by peer (<see cref="ClassifyPlaybackPeers"/>): <see cref="Foreign"/> names the
+    /// first wrong peer, <see cref="OutputDevice"/> the first output device other than the chosen sink, and
+    /// <see cref="Unannounced"/> lists the peers the registry has not announced.
+    /// </summary>
+    internal readonly record struct PlaybackRoute(bool ToChosen, string? Foreign, IReadOnlyList<string> Recorders, string? OutputDevice, IReadOnlyList<uint> Unannounced);
 
     /// <summary>
     /// The guard's rule for the playback stream's peers (the nodes its outputs are linked to). The chosen sink: linked. An
     /// output device (a sink of any kind, a null sink, a duplex device) other than it: wrong, the sound must not reach it.
     /// A node the registry has not announced: wrong too (where the sound goes is unknown; the registry announces a node
-    /// before any link to it, so this is no race). Any other node is a recorder taking a copy of the sound (a capture
+    /// before any link to it, so this is no race), but <see cref="Examine"/> reads the registry again before acting on it
+    /// (a lost or mishandled announcement must not cut a screen share's link). Any other node is a recorder taking a copy of the sound (a capture
     /// stream such as a screen share's or OBS's, a PulseAudio monitor of the stream): left alone. Not caught: a loopback or
     /// filter whose capture half is a plain stream and whose playback half plays to another sink (its two halves are not
     /// linked in the graph and the registry does not say they belong together); filters that show themselves as a sink
@@ -789,17 +902,24 @@ public sealed class PipeWireAudioDelay : IAudioDelay
     internal static PlaybackRoute ClassifyPlaybackPeers(IReadOnlyList<(uint Id, bool Known, string Name, string? MediaClass)> peers, uint chosenSink)
     {
         var toChosen = false;
-        string? foreign = null;
+        string? foreign = null, device = null;
         var recorders = new List<string>();
+        var unannounced = new List<uint>();
         foreach (var (id, known, name, mediaClass) in peers)
         {
             if (chosenSink != PwDefs.IdAny && id == chosenSink)
             {
                 toChosen = true;
             }
-            else if (!known || PwNode.IsOutputDevice(mediaClass))
+            else if (!known)
             {
-                foreign ??= known ? $"{name}, {mediaClass}" : $"node {id}, not announced";
+                foreign ??= $"node {id}, not announced";
+                unannounced.Add(id);
+            }
+            else if (PwNode.IsOutputDevice(mediaClass))
+            {
+                device ??= $"{name}, {mediaClass}";
+                foreign ??= device;
             }
             else
             {
@@ -807,7 +927,7 @@ public sealed class PipeWireAudioDelay : IAudioDelay
             }
         }
 
-        return new PlaybackRoute(toChosen, foreign, recorders);
+        return new PlaybackRoute(toChosen, foreign, recorders, device, unannounced);
     }
 
     private void RestartCapture()

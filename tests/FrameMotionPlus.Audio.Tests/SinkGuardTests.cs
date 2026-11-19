@@ -19,6 +19,7 @@ namespace FrameMotionPlus.Audio.Tests;
 public sealed class SinkGuardTests
 {
     private const long Ms = 1_000_000;
+    private const int RegistryLog = 8192;
 
     private sealed class Rig : IDisposable
     {
@@ -27,10 +28,15 @@ public sealed class SinkGuardTests
         private readonly Thread _sampler;
         private volatile bool _sampling = true;
 
-        public Rig(string name)
+        /// <param name="hideShare">
+        /// The test seam: the guard's connection leaves the recorder <c>fmp-test-share-{Id}</c> out of its model on its
+        /// first announcement ("once": a lost announcement a resync recovers) or always ("always": it stays unknown).
+        /// </param>
+        public Rig(string name, string? hideShare = null)
         {
-            Test = PipeWireLoopbackTests.RequireServer();
+            Test = PipeWireLoopbackTests.RequireServer(RegistryLog);
             Id = $"{Environment.ProcessId}-{name}";
+            Share = $"fmp-test-share-{Id}";
             A = $"fmp-test-a-{Id}";
             B = $"fmp-test-b-{Id}";
             C = $"fmp-test-c-{Id}";
@@ -53,6 +59,9 @@ public sealed class SinkGuardTests
                     SettleNs = 1_000 * Ms,
                     InitialVideoLatencyNs = 40 * Ms,
                     OnEvent = e => { lock (_events) { _events.Add(e); } },
+                    RegistryLogCapacity = RegistryLog,
+                    HideNodeOnceForTests = hideShare == "once" ? Share : null,
+                    HideNodeAlwaysForTests = hideShare == "always" ? Share : null,
                 },
                 out var delay,
                 out var why), why);
@@ -70,6 +79,9 @@ public sealed class SinkGuardTests
         public PwConnection Test { get; }
 
         public string Id { get; }
+
+        /// <summary>The node name the recorder tests give their recorder.</summary>
+        public string Share { get; }
 
         public string A { get; }
 
@@ -136,6 +148,27 @@ public sealed class SinkGuardTests
             {
                 return Test.TryNodeKindLocked(id, out var name, out var mediaClass) ? $"{id} {name} ({mediaClass ?? "no media.class"})" : $"{id} not announced";
             }
+        }
+
+        /// <summary>
+        /// Both connections' registry events about <paramref name="ids"/> (and the playback node), then the last 60 of each:
+        /// what a failing test shows, so that a node one of them missed explains itself.
+        /// </summary>
+        public string RegistryDump(IEnumerable<uint> ids)
+        {
+            var playback = Delay.PlaybackNodeId;
+            var tokens = ids.Append(playback).Distinct().SelectMany(i => new[] { $"+{i} ", $"-{i}", $"!{i} ", $"->{i}", $" {i}->" }).ToList();
+            List<string> test;
+            using (Test.Lock())
+            {
+                test = Test.RegistryLogLocked();
+            }
+
+            var guard = Delay.RegistryLog();
+            string Of(List<string> log) =>
+                string.Join("\n  ", log.Where(l => tokens.Exists(t => l.Contains(t, StringComparison.Ordinal)) || l.Contains("resync", StringComparison.Ordinal)))
+                + "\n  ... last 60:\n  " + string.Join("\n  ", log.TakeLast(60));
+            return $"\nplayback node {playback}; the guard connection's registry ({guard.Count} events kept):\n  {Of(guard)}\nthe test connection's registry ({test.Count} kept):\n  {Of(test)}";
         }
 
         public List<uint> PlaybackPeers()
@@ -281,6 +314,9 @@ public sealed class SinkGuardTests
         Thread.Sleep(3000);
         Assert.Contains($"linked to another node than {rig.B}", rig.Events, StringComparison.Ordinal);
         Assert.True(rig.Delay.Report().WrongSinkLinks >= 1);
+
+        // A known output device is cut at once: the registry is not read again for it.
+        Assert.Equal(0, rig.Delay.Report().RegistryResyncs);
         var b = rig.Node(rig.B)!.Id;
         Assert.NotEmpty(rig.PlaybackPeers());
         Assert.All(rig.PlaybackPeers(), p => Assert.Equal(b, p));
@@ -401,10 +437,12 @@ public sealed class SinkGuardTests
         monitor.Kill();
         monitor.WaitForExit(2000);
         reader.Join(2000);
-        Assert.True(peers.Any(rig.IsRecorder), $"no recorder among the playback stream's peers after 3 s: {described}; one announced {announcedAfterMs} ms later (-1: not within 5 s); muted {muted}, wrong links {report.WrongSinkLinks}; events: {rig.Events}");
+        var ok = peers.Any(rig.IsRecorder) && report.WrongSinkLinks == 0 && !muted;
+        var dump = ok ? "" : rig.RegistryDump(peers);
+        Assert.True(peers.Any(rig.IsRecorder), $"no recorder among the playback stream's peers after 3 s: {described}; one announced {announcedAfterMs} ms later (-1: not within 5 s); muted {muted}, wrong links {report.WrongSinkLinks}; events: {rig.Events}{dump}");
         Assert.True(peak > ClickGenerator.Height / 2, $"the monitor's peak {peak} over {bytes} B; events: {rig.Events}");
-        Assert.Equal(0, report.WrongSinkLinks);
-        Assert.False(muted, $"muted with a monitor attached; events: {rig.Events}");
+        Assert.True(report.WrongSinkLinks == 0, $"wrong links {report.WrongSinkLinks}; events: {rig.Events}{dump}");
+        Assert.False(muted, $"muted with a monitor attached; events: {rig.Events}{dump}");
         Assert.Empty(rig.Foreign);
         Assert.Equal(0, rig.Bystander.Count);
     }
@@ -440,6 +478,71 @@ public sealed class SinkGuardTests
         Assert.True(rig.Bystander.Count <= 1, $"{rig.Bystander.Count} clicks reached the other sink");
     }
 
+    /// <summary>
+    /// A recorder whose announcement the guard's connection lost (the test seam drops it from the guard's model once): the
+    /// link to a node not announced mutes, the registry is read again, the node is a recorder after all, and the sound
+    /// resumes on the chosen sink with nothing cut (no wrong link, no re-made stream) and the recorder still receiving.
+    /// </summary>
+    [Fact]
+    public void A_recorder_whose_announcement_was_lost_is_looked_up_again_and_not_cut()
+    {
+        using var rig = new Rig("lost", hideShare: "once");
+        using var onB = new ClickRecorder(rig.Test, $"fmp-test-onb-{rig.Id}", rig.B);
+        _ = onB.Connect(capture: true);
+        Thread.Sleep(1500);
+        var output = $"fmp-test-delay-{rig.Id}-playback";
+        var restartsBefore = rig.Delay.Report().PlaybackRestarts;
+        using var recorder = new ClickRecorder(rig.Test, rig.Share, output, captureSink: false);
+        _ = recorder.Connect(capture: true);
+        LinkByHandIfNeeded(rig, output, rig.Share);
+        Thread.Sleep(1000);
+        var clicksBefore = onB.Count;
+        var recordedBefore = recorder.Count;
+        Thread.Sleep(2500);
+        var report = rig.Delay.Report();
+        var dump = report.RegistryResyncs == 1 && report.WrongSinkLinks == 0 ? "" : rig.RegistryDump(rig.PlaybackPeers());
+        Assert.True(report.RegistryResyncs == 1, $"{report.RegistryResyncs} resyncs; events: {rig.Events}{dump}");
+        Assert.Equal(1, report.UnannouncedRecorders);
+        Assert.True(report.WrongSinkLinks == 0, $"{report.WrongSinkLinks} wrong links; events: {rig.Events}{dump}");
+        Assert.Equal(restartsBefore, report.PlaybackRestarts);
+        Assert.Contains("had not announced", rig.Events, StringComparison.Ordinal);
+        Assert.Contains($"it is {rig.Share}, Stream/Input/Audio: nothing cut", rig.Events, StringComparison.Ordinal);
+        Assert.DoesNotContain("the sound is muted", rig.Events, StringComparison.Ordinal);
+        Assert.False(rig.Delay.Line.Muted, $"still muted after the resync; events: {rig.Events}");
+        Assert.True(onB.Count - clicksBefore >= 18, $"{onB.Count - clicksBefore} clicks on the chosen sink after the resync; events: {rig.Events}");
+        Assert.True(recorder.Count - recordedBefore >= 18, $"the recorder got {recorder.Count - recordedBefore} clicks after the resync; events: {rig.Events}");
+        Assert.Empty(rig.Foreign);
+        Assert.Equal(0, rig.Bystander.Count);
+        TestContext.Current.TestOutputHelper?.WriteLine($"events: {rig.Events}");
+    }
+
+    /// <summary>
+    /// A peer that stays unknown after the registry is read again (the seam hides it from every announcement): muted, cut
+    /// and made again to the chosen sink, as before the resync existed; one resync per appearance, never an output device.
+    /// </summary>
+    [Fact]
+    public void A_peer_still_not_announced_after_the_resync_is_cut_as_before()
+    {
+        using var rig = new Rig("unknown", hideShare: "always");
+        Thread.Sleep(1500);
+        var output = $"fmp-test-delay-{rig.Id}-playback";
+        using var recorder = new ClickRecorder(rig.Test, rig.Share, output, captureSink: false);
+        _ = recorder.Connect(capture: true);
+        LinkByHandIfNeeded(rig, output, rig.Share);
+        Thread.Sleep(3000);
+        var report = rig.Delay.Report();
+        var dump = report.WrongSinkLinks >= 1 ? "" : rig.RegistryDump(rig.PlaybackPeers());
+        Assert.True(report.WrongSinkLinks >= 1, $"no wrong link counted; events: {rig.Events}{dump}");
+        Assert.True(report.RegistryResyncs >= 1);
+        Assert.Equal(0, report.UnannouncedRecorders);
+        Assert.Contains("after reading the registry again", rig.Events, StringComparison.Ordinal);
+        Assert.Contains("not announced", rig.Events, StringComparison.Ordinal);
+        var b = rig.Node(rig.B)!.Id;
+        Assert.Contains(b, rig.PlaybackPeers());
+        Assert.Empty(rig.Foreign);
+        Assert.Equal(0, rig.Bystander.Count);
+    }
+
     /// <summary>The guard's rule, without a server: chosen sink, other output devices, recorders, nodes not announced.</summary>
     [Fact]
     public void The_playback_peers_are_classified_by_what_they_are()
@@ -459,7 +562,13 @@ public sealed class SinkGuardTests
         Assert.NotNull(Of((40, true, "headset", "Audio/Sink"), (41, true, "speakers", "Audio/Sink")).Foreign);
         Assert.NotNull(Of((40, true, "headset", "Audio/Sink"), (42, true, "hdmi", "Audio/Duplex")).Foreign);
         Assert.NotNull(Of((40, true, "headset", "Audio/Sink"), (43, true, "eq", "Audio/Sink/Virtual")).Foreign);
-        Assert.NotNull(Of((40, true, "headset", "Audio/Sink"), (44, false, "node 44", null)).Foreign);
+        var unannounced = Of((40, true, "headset", "Audio/Sink"), (44, false, "node 44", null));
+        Assert.NotNull(unannounced.Foreign);
+        Assert.Null(unannounced.OutputDevice);
+        Assert.Equal([44u], unannounced.Unannounced);
+        var both = Of((44, false, "node 44", null), (41, true, "speakers", "Audio/Sink"));
+        Assert.Equal("node 44, not announced", both.Foreign);
+        Assert.Equal("speakers, Audio/Sink", both.OutputDevice);
         Assert.NotNull(Of((40, true, "headset", "Audio/Sink"), (77, true, "rec", "Stream/Input/Audio"), (41, true, "speakers", "Audio/Sink")).Foreign);
 
         var recorderOnly = Of((77, true, "rec", "Stream/Input/Audio"));

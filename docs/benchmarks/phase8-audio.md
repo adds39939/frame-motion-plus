@@ -306,7 +306,7 @@ playback stream's outputs are linked to:
 | --- | --- |
 | the chosen sink | linked: the sound plays |
 | another output device: `Audio/Sink*` (a sink, a null sink, an equaliser's or EasyEffects' virtual sink, a combined sink), `Audio/Duplex` | **wrong**: muted at once, cut, the stream made again to the chosen sink (as before) |
-| a node the registry has not announced | **wrong** as well (where the sound goes is unknown). The registry announces a node before any link to it (the server registers a node before its ports and links), so this is no race with a recorder appearing |
+| a node the registry has not announced | **wrong** as well (where the sound goes is unknown). The registry announces a node before any link to it (the server registers a node before its ports and links), so this is no race with a recorder appearing. Since the hardening pass (phase9-polish.md, section 6) the guard first mutes and reads the whole registry again (a fresh registry proxy and a round trip, at most 250 ms; 1.4–1.6 ms measured), then judges the peer again: a recorder after all is left alone and the sound resumes with nothing cut; still unknown, it is cut as before. An output device is cut at once, with no resync |
 | any other node: a capture stream (`Stream/Input/Audio`: a screen share's sound, OBS, `pw-record` aimed at the stream, `parec --monitor-stream`), a virtual source | a recorder taking a copy: left alone. Said once on stderr ("N recorder(s) take a copy of the sound (...): left alone") |
 
 A recorder attaching changes nothing on the sound's path to the sink: no mute, no re-made stream, no re-lock beyond what
@@ -400,6 +400,10 @@ Found by the re-check of the output-device fix, not fixed:
 - A loopback or filter with a plain-stream capture half, or any other non-sink node (a virtual microphone, a JACK
   client, a patchbay's restored link to something that plays on), linked to fmp's stream and passing the sound to
   another output, is not caught by the guard (see "Screen shares and recorders").
+- A node announcement lost on the guard's connection no longer cuts a recorder's link straight away (a resync first:
+  phase9-polish.md, section 6), but the sound is muted for the resync (1.4–1.6 ms measured, at most 250 ms plus the
+  fades), and a node the server never shows this client would still be cut. Why the test connection once missed a
+  `parec` node is unknown; registry handler failures are now counted in the summary.
 - Each recorder attach or detach is a path change and usually a cross-faded re-lock: a share toggled often is heard.
 - On a change of the selected default, a spurious "linked to another node" line and a wrong-link count follow the
   "your selected default output is now…" line, because the old stream's link is judged against the new sink.

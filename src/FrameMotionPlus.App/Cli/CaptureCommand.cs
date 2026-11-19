@@ -26,7 +26,25 @@ internal static class CaptureCommand
         // Saved settings (the default file, or --settings): added as the options they stand for, the command line winning.
         var loaded = UserSettings.LoadFor(args, out args);
         var applied = UserSettings.Apply(SettingsTarget.Capture, args, loaded);
-        var options = CaptureOptions.Parse(applied.Args);
+        CaptureOptions options;
+        try
+        {
+            options = CaptureOptions.Parse(applied.Args);
+        }
+        catch (UsageException e) when (UserSettings.Blame(loaded, applied) is { } saved)
+        {
+            throw new UsageException($"{e.Message} ({saved})", e);
+        }
+
+        // A failure below can come from a saved value (a device or mode that does not work here): say which ones were used.
+        void Blame()
+        {
+            if (UserSettings.Blame(loaded, applied) is { } saved)
+            {
+                error.WriteLine($"fmp: capture: {saved}");
+            }
+        }
+
         if (!CaptureDevices.IsAvailable(out var unavailable))
         {
             error.WriteLine($"fmp: {unavailable}");
@@ -82,6 +100,7 @@ internal static class CaptureCommand
         if (!File.Exists(device))
         {
             error.WriteLine($"fmp: capture: no such capture device {device} (fmp capture --list shows the devices)");
+            Blame();
             return PatternCommand.ExitUnavailable;
         }
 
@@ -89,6 +108,7 @@ internal static class CaptureCommand
         if (generator is null)
         {
             error.WriteLine($"fmp: capture {why}");
+            Blame();
             return PatternCommand.ExitUnavailable;
         }
 
@@ -166,16 +186,19 @@ internal static class CaptureCommand
                 catch (PlaybackUnavailableException e)
                 {
                     error.WriteLine($"fmp: capture{(e.InnerException is CaptureUnavailableException ? ":" : "")} {e.Message}");
+                    Blame();
                     return PatternCommand.ExitUnavailable;
                 }
                 catch (CaptureFormatException e)
                 {
                     error.WriteLine($"fmp: capture: {e.Message} (fmp capture --list shows the modes)");
+                    Blame();
                     return CommandDispatcher.ExitUsage;
                 }
                 catch (V4l2Exception e)
                 {
                     error.WriteLine($"fmp: capture: {e.Message}");
+                    Blame();
                     return CommandDispatcher.ExitCheckFailed;
                 }
 

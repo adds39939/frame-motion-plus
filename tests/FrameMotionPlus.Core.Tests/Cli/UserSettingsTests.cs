@@ -304,6 +304,88 @@ public sealed class UserSettingsTests : IDisposable
         Assert.Throws<UsageException>(() => UserSettings.LoadFor(["--settings", "x.json", "--no-settings"], out _));
     }
 
+    /// <summary>
+    /// What <c>fmp settings</c> prints, saved and used as a settings file, runs exactly as no file: the generator's backend
+    /// and quality (which the file model always holds) at the command line's defaults are not counted as saved.
+    /// </summary>
+    [Fact]
+    public void The_printed_defaults_used_as_a_settings_file_run_as_no_file()
+    {
+        var (exit, printed, _) = Run("settings");
+        Assert.Equal(0, exit);
+        Assert.Contains("\"backend\": \"auto\"", printed, StringComparison.Ordinal);
+        var path = Write(printed);
+        var loaded = UserSettings.Load(path, mustExist: true);
+        Assert.Empty(loaded.Values);
+        var capture = UserSettings.Apply(SettingsTarget.Capture, [], loaded);
+        Assert.Empty(capture.Args);
+        Assert.Empty(capture.Applied);
+        Assert.Equal(CaptureOptions.Parse([]), CaptureOptions.Parse(capture.Args));
+        Assert.Contains("no value used from it", UserSettings.Describe(loaded, capture), StringComparison.Ordinal);
+        var play = UserSettings.Apply(SettingsTarget.Play, ["clip.mkv"], loaded);
+        Assert.Equal(["clip.mkv"], play.Args);
+        Assert.Null(UserSettings.Blame(loaded, capture));
+
+        // A backend or quality other than the default is still a saved value.
+        var vfg = UserSettings.Load(Write("""{ "generator": { "backend": "vfg", "quality": "High" } }"""), mustExist: true);
+        Assert.Equal("vfg", vfg.Values["generator.backend"]);
+        Assert.Equal("high", vfg.Values["generator.quality"]);
+    }
+
+    /// <summary>
+    /// A saved value that fails only once the command runs (a device that is not there) is reported with the key and the
+    /// file it came from; without a file nothing extra is said.
+    /// </summary>
+    [Fact]
+    public void A_failure_from_a_saved_value_names_the_key_and_the_file()
+    {
+        var path = Write("""{ "capture": { "device": "/dev/video99" }, "audio": { "mode": "off" } }""");
+        var loaded = UserSettings.Load(path, mustExist: true);
+        var blame = UserSettings.Blame(loaded, UserSettings.Apply(SettingsTarget.Capture, [], loaded));
+        Assert.NotNull(blame);
+        Assert.Contains("capture.device=/dev/video99", blame, StringComparison.Ordinal);
+        Assert.Contains(path, blame, StringComparison.Ordinal);
+
+        // The command itself (it stops at the device check, before anything is opened; skipped where capture or CUDA is absent).
+        var (exit, _, err) = Run("capture", "--settings", path, "--windowed");
+        if (!err.Contains("no such capture device", StringComparison.Ordinal))
+        {
+            Assert.Skip($"capture stopped earlier here (exit {exit}): {err.Trim()}");
+        }
+
+        Assert.Contains("/dev/video99", err, StringComparison.Ordinal);
+        Assert.Contains($"saved settings used from {path}: capture.device=/dev/video99", err, StringComparison.Ordinal);
+        var (_, _, plain) = Run("capture", "/dev/video99", "--no-settings", "--audio", "off", "--windowed");
+        Assert.Contains("no such capture device /dev/video99", plain, StringComparison.Ordinal);
+        Assert.DoesNotContain("saved settings", plain, StringComparison.Ordinal);
+    }
+
+    /// <summary><c>set</c> and <c>unset</c> on a hand-edited file with comments say the comments were not kept.</summary>
+    [Fact]
+    public void Set_and_unset_say_when_they_drop_a_files_comments()
+    {
+        var path = Write("""
+            // my settings
+            { "audio": { "sink": "inzone" /* the headset */ }, "hdr": { "peakNits": 2000 } }
+            """);
+        var (exit, output, _) = Run("settings", "set", "capture.mode", "4k30-hdr", "--settings", path);
+        Assert.Equal(0, exit);
+        Assert.Contains(SettingsCommand.CommentsDropped, output, StringComparison.Ordinal);
+        Assert.DoesNotContain("//", File.ReadAllText(path), StringComparison.Ordinal);
+        Assert.Equal("inzone", UserSettings.Load(path, mustExist: true).Values["audio.sink"]);
+
+        // Now without comments: nothing said.
+        Assert.DoesNotContain("comments", Run("settings", "set", "hdr.peakNits", "1000", "--settings", path).Out, StringComparison.Ordinal);
+        var commented = Write("""{ "hdr": { "peakNits": 2000 } } // end""");
+        var unset = Run("settings", "unset", "hdr.peakNits", "--settings", commented);
+        Assert.Contains("removed", unset.Out, StringComparison.Ordinal);
+        Assert.Contains(SettingsCommand.CommentsDropped, unset.Out, StringComparison.Ordinal);
+
+        // A "//" inside a string is not a comment.
+        Assert.False(UserSettings.HasComments("""{ "audio": { "sink": "a//b /* c */" } }"""));
+        Assert.True(UserSettings.HasComments("""{ "a": 1 /* c */ }"""));
+    }
+
     [Fact]
     public void Every_key_is_known_to_the_settings_file()
     {

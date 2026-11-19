@@ -5,6 +5,9 @@ namespace FrameMotionPlus.App.Cli;
 
 internal static class SettingsCommand
 {
+    /// <summary>Said after <c>set</c>/<c>unset</c> rewrote a file that had comments (the values are kept, the comments not).</summary>
+    internal const string CommentsDropped = "note: the file had comments; set and unset rewrite it without them (every value and unknown key is kept)";
+
     public static int Run(string[] args, TextWriter output)
     {
         if (args.Length > 0 && args[0] is "show" or "path" or "set" or "unset")
@@ -85,16 +88,29 @@ internal static class SettingsCommand
                 return CommandDispatcher.ExitOk;
             case "set":
                 {
-                    var saved = UserSettings.Set(path, positional[0], positional[1]);
+                    var saved = UserSettings.Set(path, positional[0], positional[1], out var dropped);
                     output.WriteLine($"{positional[0]} = {saved} (saved in {path})");
+                    if (dropped)
+                    {
+                        output.WriteLine(CommentsDropped);
+                    }
+
                     return CommandDispatcher.ExitOk;
                 }
 
             case "unset":
-                output.WriteLine(UserSettings.Unset(path, positional[0])
-                    ? $"{positional[0]} removed from {path} (the default applies)"
-                    : $"{positional[0]} was not set in {path}");
-                return CommandDispatcher.ExitOk;
+                {
+                    var removed = UserSettings.Unset(path, positional[0], out var dropped);
+                    output.WriteLine(removed
+                        ? $"{positional[0]} removed from {path} (the default applies)"
+                        : $"{positional[0]} was not set in {path}");
+                    if (dropped)
+                    {
+                        output.WriteLine(CommentsDropped);
+                    }
+
+                    return CommandDispatcher.ExitOk;
+                }
             default:
                 Show(path, output);
                 return CommandDispatcher.ExitOk;

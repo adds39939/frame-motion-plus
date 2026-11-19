@@ -44,4 +44,13 @@ public sealed record AudioDelayOptions
 
     /// <summary>Where the diagnostic lines go (the supervisor thread; allocates a little per line).</summary>
     public Action<string>? OnLog { get; init; }
+
+    /// <summary>Tests: keep the last this many registry events of the guard's connection (<c>PipeWireAudioDelay.RegistryLog</c>); 0: none.</summary>
+    internal int RegistryLogCapacity { get; init; }
+
+    /// <summary>Tests: the guard's connection leaves the node of this name out on its first announcement (a lost announcement).</summary>
+    internal string? HideNodeOnceForTests { get; init; }
+
+    /// <summary>Tests: the guard's connection never knows the node of this name (it stays not announced).</summary>
+    internal string? HideNodeAlwaysForTests { get; init; }
 }
