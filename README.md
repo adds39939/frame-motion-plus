@@ -268,6 +268,7 @@ fmp play clip-1440p60.mp4 --loop --multiplier 4        # 4x where the display al
 fmp play clip-1440p60.mp4 --generator blend --csv play.csv   # blend, per-slot timeline as CSV
 fmp play clip-1440p60.mp4 --fullscreen                 # borderless fullscreen on the window's output (variable refresh)
 fmp play clip-1440p60.mp4 --loop --no-quality-switch   # one VFG instance: Q does nothing, 1.3-1.5 GB less GPU memory
+fmp play clip-1440p60.mp4 --loop --scd off             # VFG's shot-change detection off: fast motion keeps its generated frames
 fmp play clip-1440p60.mp4 --gate                       # the Phase 4 gate: 10 minutes VFG Medium 2x, no miss of the pipeline's
 fmp play clip.mkv --offscreen --generator blend --duration-s 5   # no window: offscreen on a virtual clock
 fmp verify play.csv                                    # recompute a run's verdict from its telemetry CSV alone
@@ -292,7 +293,17 @@ nothing on the screen shows it in fullscreen); the summary lists every switch (w
 slots around it) and each quality's latency and generation time. The cost of having it: about 90 ms more start-up and
 the second instance's GPU memory (High: about 1.5 GB at 4K, 1.3 GB at 1440p; printed at start); `--no-quality-switch`
 (or `fmp settings set generator.qualitySwitch false`) keeps one instance. Measured in
-[`docs/benchmarks/phase9-polish.md`](docs/benchmarks/phase9-polish.md), "Live quality switching". A published binary outside a checkout does not find
+[`docs/benchmarks/phase9-polish.md`](docs/benchmarks/phase9-polish.md), "Live quality switching".
+
+**`--scd on|off`: VFG's automatic shot-change detection** (`fmp play` and `fmp capture`). On, VFG takes large, uneven
+change between two frames for a cut, and fast motion is that too (foliage rushing past, an object close to the camera,
+fast driving): it then shows a real frame in the generated frame's place, so the picture drops to the source's rate for as
+long as the motion lasts. Off, every pair is interpolated; a real cut then shows one generated frame that is a morph of
+the two shots (a seek or a loop is still never interpolated across). On by default for `fmp play` (films cut often), **off
+for `fmp capture`** (games have fast motion and few cuts); `fmp settings set generator.shotChangeDetection on|off` saves it.
+The start-up line says which. Measured in [`docs/benchmarks/shot-change.md`](docs/benchmarks/shot-change.md).
+
+A published binary outside a checkout does not find
 the VFX SDK in `lib/VideoFX`: set `$FMP_VFX_SDK` (or `--vfx-sdk`). See `fmp --help` for every option.
 
 ## Capturing from a capture card
@@ -319,6 +330,7 @@ fmp capture --mode 4k30-hdr --capture-fps 30         # ask the card for 30.000 (
 fmp capture --mode 1440p60-hdr --multiplier 4        # a 30 fps game in that signal to 120
 fmp capture /dev/video0 --size 1920x1080 --fps 120 --format nv12 --hdr off   # any offered mode, SDR
 fmp capture --mode 4k30-hdr --duration-s 180 --csv capture.csv --frames-csv frames.csv   # timelines for fmp verify
+fmp capture --mode 4k30-hdr --scd on                 # VFG's shot-change detection back on (off by default for a capture)
 ```
 
 The presets ask the card for the console's own rates: 29.97 and 59.94 (exactly 30000/1001 and 60000/1001), as a PS5
@@ -375,7 +387,8 @@ print one `settings` line naming the file and every value taken from it, and wha
 stops the command with one error naming the file and the line; a key this fmp does not know is reported and skipped. The
 keys are `capture.device`, `capture.mode`, `capture.fps` (`--capture-fps`; not used when `--mode` is typed: the mode
 brings its own rate), `generator.backend`, `generator.quality`, `generator.multiplier`,
-`generator.qualitySwitch` (true or false: `--quality-switch` / `--no-quality-switch`),
+`generator.qualitySwitch` (true or false: `--quality-switch` / `--no-quality-switch`), `generator.shotChangeDetection`
+(on or off: `--scd`; unset, capture off and play on),
 `display.clock`, `display.fullscreen` (true or false), `display.window` (the window's size when windowed), `audio.mode`,
 `audio.sink`, `audio.source`, `audio.offsetMs`, `hdr.mode`, `hdr.peakNits`, `hdr.maxCll`, `hdr.maxFall` and
 `generator.vfxSdkDirectory` (`fmp --help`, "saved settings"). `set` writes the file atomically and keeps the other keys

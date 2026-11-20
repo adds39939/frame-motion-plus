@@ -86,6 +86,17 @@ public sealed record PlaybackOptions
     public bool QualitySwitch { get; init; }
 
     /// <summary>
+    /// VFG only: its automatic shot-change detection (on by default). VFG has no setting for how readily it calls a cut,
+    /// and it takes large frame-to-frame change (fast motion, an object close to the camera, foliage rushing past) for
+    /// one: the generated frame is then a copy of a real frame, so the picture falls back to the source's rate until the
+    /// motion calms down. Off, every pair is interpolated: fast motion keeps its generated frames, and a real cut shows
+    /// one generated frame that is a morph of the two shots (the app has no cut detector of its own; a source's own
+    /// discontinuities, a seek or a loop, are still never interpolated across). Off, VFG's call only enqueues instead of
+    /// blocking the generator thread for the generation. Both of Q's instances are loaded the same way.
+    /// </summary>
+    public bool ShotChangeDetection { get; init; } = true;
+
+    /// <summary>
     /// The cap on output frames per source frame (the scheduler's maximum multiplier). The scheduler picks the largest
     /// ratio up to this the display allows: a 60 fps file at 2 on a 120 Hz panel shows a new frame every refresh, on a
     /// 240 Hz panel every other refresh; at 4 on the 240 Hz panel every refresh. 1 shows real frames only.

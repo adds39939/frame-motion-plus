@@ -14,11 +14,15 @@ namespace FrameMotionPlus.Pipeline.Tests;
 /// </summary>
 public class QualitySwitchPlaybackTests
 {
-    [Fact]
+    /// <summary>With automatic shot-change detection on (play's default) and off (a capture's): both instances loaded alike.</summary>
+    [Theory]
     [Trait(Category.Name, Category.Vfx)]
-    public void Vfg_switched_mid_run_keeps_every_generated_frame_right()
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Vfg_switched_mid_run_keeps_every_generated_frame_right(bool detection)
     {
         var cuda = Hardware.RequireVfx();
+        Vfx.VfgGenerator? vfg = null;
         var even = Clips.Get("even-60");
         var truth = ReferenceFrames.Decode(cuda, Clips.Get("truth-120"), 240, loop: false);
         var reference = ReferenceFrames.Decode(cuda, even, 120, loop: false);
@@ -37,8 +41,13 @@ public class QualitySwitchPlaybackTests
                     Assert.True(session!.RequestQualityToggle());
                 }
             },
+            WrapGenerator = (h, s, k) =>
+            {
+                vfg = Assert.IsType<Vfx.VfgGenerator>(h.Generator);
+                return h;
+            },
         };
-        var options = Playback.Virtual(even, GeneratorKind.Vfg, 2, 120, 1.8) with { QualitySwitch = true };
+        var options = Playback.Virtual(even, GeneratorKind.Vfg, 2, 120, 1.8) with { QualitySwitch = true, ShotChangeDetection = detection };
         var report = Playback.Run(cuda, options, hooks, onOpen: s =>
         {
             checker.Session = s;
@@ -48,6 +57,13 @@ public class QualitySwitchPlaybackTests
         Assert.True(checker.Problems.Count == 0, string.Join("\n", checker.Problems.Take(10)));
         Assert.Equal((FrameGenQuality.Medium, FrameGenQuality.High), report.Setup.QualitySwitch);
         Assert.NotNull(report.Setup.SecondVfgLoad);
+
+        // Both instances come from the one generator's options: loaded with detection as asked (its call blocks only with it on).
+        Assert.NotNull(vfg);
+        Assert.Equal(2, vfg.Loads);
+        Assert.Equal(detection, vfg.Options.AutomaticShotChangeDetection);
+        Assert.Equal(detection, vfg.Capabilities.EnqueueMayBlock);
+        Assert.Equal(detection, report.Setup.GeneratorMayBlock);
         Assert.Equal(2, report.QualitySwitches.Count);
         Assert.All(report.QualitySwitches, n => Assert.True(n.Switched));
         Assert.Equal(FrameGenQuality.High, report.QualitySwitches[0].Commit.To);

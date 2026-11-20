@@ -88,6 +88,17 @@ internal sealed record CaptureOptions
     /// <summary>VFG: load the other quality too at start, so Q switches live (<c>--quality-switch</c> / <c>--no-quality-switch</c>).</summary>
     public bool QualitySwitch { get; init; } = Play.PlayOptions.QualitySwitchDefault;
 
+    /// <summary>
+    /// A capture's default for <c>--scd</c>: off. A game's fast motion (driving, foliage close to the camera) is what VFG's
+    /// automatic shot-change detection takes for a cut, repeating real frames for as long as it lasts; a game has few
+    /// real cuts, and with the detection off each shows one morphed frame (the owner's judgement on a 46-minute session,
+    /// 2026-11-20: "it now looks perfect", no issue noticed at cuts). File playback keeps it on: films cut often.
+    /// </summary>
+    public const bool ShotChangeDetectionDefault = false;
+
+    /// <summary>VFG's automatic shot-change detection (<c>--scd on|off</c>): off keeps generated frames through fast motion.</summary>
+    public bool ShotChangeDetection { get; init; } = ShotChangeDetectionDefault;
+
     public int Multiplier { get; init; } = 2;
 
     public double? OutputHz { get; init; }
@@ -250,6 +261,7 @@ internal sealed record CaptureOptions
             Generator = ParseGenerator(r.String("generator")),
             Quality = r.String("quality") is { } quality ? Vfg.VfgBenchOptions.ParseMode(quality) : FrameGenQuality.Medium,
             QualitySwitch = Play.PlayOptions.ParseQualitySwitch(r),
+            ShotChangeDetection = r.String("scd") is { } scd ? Vfg.VfgBenchOptions.ParseOnOff(scd, "scd") : ShotChangeDetectionDefault,
             Multiplier = (int)r.Int64("multiplier", 2, 1, 8),
             OutputHz = r.Has("output-hz") ? r.Double("output-hz", 0, 1, 1000) : null,
             DurationS = r.Double("duration-s", 0, 0.05, 86_400),

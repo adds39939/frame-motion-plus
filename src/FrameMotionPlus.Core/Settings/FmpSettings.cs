@@ -334,6 +334,13 @@ public sealed class GeneratorSettings
     public bool? QualitySwitch { get; set; }
 
     /// <summary>
+    /// <c>--scd</c> of fmp capture and fmp play: "on" or "off", VFG's automatic shot-change detection (null: not set, each
+    /// command's default: off for fmp capture, on for fmp play). Off keeps generated frames through fast motion, which VFG
+    /// otherwise takes for a cut.
+    /// </summary>
+    public string? ShotChangeDetection { get; set; }
+
+    /// <summary>
     /// Directory of the NVIDIA VFX SDK (the one holding lib/ and features/), which is never shipped with the app; null to
     /// look in $FMP_VFX_SDK, a repository checkout's lib/VideoFX and then the installer's /usr/local/VideoFX.
     /// </summary>

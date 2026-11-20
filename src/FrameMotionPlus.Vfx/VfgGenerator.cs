@@ -10,8 +10,9 @@ namespace FrameMotionPlus.Vfx;
 public sealed record VfgOptions
 {
     /// <summary>
-    /// VFG's automatic shot-change detection (the SDK's default, the design doc's choice, and the one to use until the
-    /// app has a cut detector of its own). Measured cost: with it on, every <c>NvVFX_Run</c> blocks the calling thread
+    /// VFG's automatic shot-change detection (the SDK's default and the design doc's choice; `fmp play` keeps it on,
+    /// `fmp capture` turns it off: it takes a game's large, uneven motion for a cut and outputs copies of real frames for
+    /// as long as it lasts, docs/benchmarks/shot-change.md). Measured cost: with it on, every <c>NvVFX_Run</c> blocks the calling thread
     /// until the work queued on the generator's stream and the generation itself have finished (spinning, under the
     /// default context scheduling), so <see cref="FrameGenCapabilities.EnqueueMayBlock"/> is set. With it off a run only
     /// enqueues (40 to 90 µs), but a hard cut that nobody reports through

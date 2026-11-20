@@ -322,7 +322,7 @@ public sealed class PlaybackSession : IDisposable
             {
                 case GeneratorKind.Vfg:
                     {
-                        var vfg = new VfgGenerator(_cuda, new VfgOptions { Stream = _generatorStream, AutomaticShotChangeDetection = true });
+                        var vfg = new VfgGenerator(_cuda, new VfgOptions { Stream = _generatorStream, AutomaticShotChangeDetection = _o.ShotChangeDetection });
                         try
                         {
                             vfg.Configure(config);

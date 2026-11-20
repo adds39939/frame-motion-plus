@@ -63,6 +63,7 @@ internal static class UserSettings
         new("generator.quality", "--quality", SettingKind.Text, false, "medium", s => s.Generator.Quality.ToString().ToLowerInvariant()),
         new("generator.multiplier", "--multiplier", SettingKind.Integer, false, "2", s => s.Generator.Multiplier?.ToString(Ic)),
         new("generator.qualitySwitch", "--quality-switch", SettingKind.Boolean, false, Play.PlayOptions.QualitySwitchDefault ? "true" : "false", s => s.Generator.QualitySwitch is { } q ? (q ? "true" : "false") : null),
+        new("generator.shotChangeDetection", "--scd", SettingKind.Text, false, "capture: off, play: on", s => s.Generator.ShotChangeDetection),
         new("display.clock", "--clock", SettingKind.Text, false, "auto", s => s.Display.Clock),
         new("display.fullscreen", "--fullscreen", SettingKind.Boolean, false, "capture: true, play: false", s => s.Display.Fullscreen is { } f ? (f ? "true" : "false") : null),
         new("display.window", "--window", SettingKind.Text, false, "1280x720", s => s.Display.Window),
@@ -215,6 +216,9 @@ internal static class UserSettings
                     "false" or "off" or "no" or "0" => "false",
                     _ => throw new UsageException($"'generator.qualitySwitch' expects true (load both VFG qualities at start, Q switches) or false (one instance), got '{value}'."),
                 };
+            case "generator.shotChangeDetection":
+                // Checked as --scd is (on/off, true/false, 1/0) and saved as the option's own words.
+                return Vfg.VfgBenchOptions.ParseOnOff(value, "scd") ? "on" : "off";
             case "display.window":
                 // --window also chooses a window on the command line; here it is only the size.
                 _ = CaptureOptions.Parse(["--window", value]);
@@ -334,6 +338,7 @@ internal static class UserSettings
             ("generator.backend", "--generator", ["generator"]),
             ("generator.quality", "--quality", ["quality"]),
             ("generator.multiplier", "--multiplier", ["multiplier", "output-hz"]),
+            ("generator.shotChangeDetection", "--scd", ["scd"]),
             ("display.clock", "--clock", ["clock"]),
         })
         {

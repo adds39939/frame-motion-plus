@@ -130,6 +130,7 @@ internal static class CaptureCommand
             Generator = generator.Value,
             Quality = options.Quality,
             QualitySwitch = options.QualitySwitch,
+            ShotChangeDetection = options.ShotChangeDetection,
             Multiplier = options.Multiplier,
             OutputHz = options.OutputHz,
             DurationNs = (long)(options.DurationS * Nanoseconds.PerSecond),

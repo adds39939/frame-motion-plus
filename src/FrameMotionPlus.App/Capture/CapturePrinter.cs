@@ -130,7 +130,7 @@ internal static class CapturePrinter
         {
             o.WriteLine(string.Create(Ic,
                 $"              {s.VfxSdk}; loaded in {load.LoadNs / 1e6:0.0} ms, warmed up in {load.WarmupNs / 1e6:0.0} ms, {load.DeviceBytes / 1048576.0:0} MiB; " +
-                $"automatic shot-change detection on; output written straight into the ring slots"));
+                $"{Play.PlayPrinter.DescribeShotChangeDetection(playback.ShotChangeDetection, capture: true)}; output written straight into the ring slots"));
         }
 
         Play.PlayPrinter.PrintQualitySetup(o, s, playback);

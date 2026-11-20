@@ -442,6 +442,10 @@ on the same consumer reads the finished frame as well (the call itself returns o
   the host, and on a cut copies the nearer real frame over the output.
 - No false cut was seen in any run of this phase: none of the 1,080 checked outputs of the matrix, nor the 2,000+
   generated frames scored by `fmp pattern --vfg`, was a copy.
+- **Later (2026-11-20): fast, uneven motion is taken for a cut.** In a game, foliage rushing past and fast driving lost
+  their generated frames (every one a copy of a real frame); measured from about 48 px a frame of unevenly moving detail at
+  4K, while a uniform pan of 384 px a frame is still interpolated. `fmp capture` now runs with detection off by default
+  (`--scd on|off` on both commands, `fmp play` keeps it on): [shot-change.md](shot-change.md).
 
 ### 6. t near 0 and 1; changing the mode
 

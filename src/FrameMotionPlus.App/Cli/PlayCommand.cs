@@ -81,6 +81,7 @@ internal static class PlayCommand
             Generator = generator.Value,
             Quality = options.Quality,
             QualitySwitch = options.QualitySwitch,
+            ShotChangeDetection = options.ShotChangeDetection,
             Multiplier = options.Multiplier,
             OutputHz = options.OutputHz,
             Loop = options.Loop,

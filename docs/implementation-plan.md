@@ -707,6 +707,18 @@ playback audio is left for later and Remote Play is left out entirely (both are 
   - The start-up probe retries up to three times before settling for fixed refresh; the pointer is
     hidden over the fullscreen picture.
 
+- **VFG's shot-change detection is off for captures (2026-11-20, `docs/benchmarks/shot-change.md`):**
+  the owner found that fast scenes, objects close to the camera and foliage "seem to disable the
+  frame generation until they go away". VFG's automatic shot-change detection takes large, uneven
+  motion for a cut and outputs copies of real frames (measured at 4K: 2, 6 and 9 of 9 generated
+  frames are copies at 48, 64 and 96 px per frame of foliage-like motion; a uniform pan of 384 px is
+  still interpolated); the SDK has no sensitivity setting. `--scd on|off` (setting
+  `generator.shotChangeDetection`) now exists on `fmp capture`, where it defaults to off, and
+  `fmp play`, where it stays on. With it off a real cut shows one morphed frame, and `NvVFX_Run`
+  only enqueues. The owner's verdict after 46 minutes at 3x: "it now looks perfect", with nothing
+  noticed at cuts, and no app-side cut detector wanted. This departs from the design doc's "leave
+  automatic shot-change detection on".
+
 ### Phase 10: Windows portability
 
 *Design doc: milestone 7.* **Left for now by the owner on 2026-11-18** (listed under "Deferred"). The

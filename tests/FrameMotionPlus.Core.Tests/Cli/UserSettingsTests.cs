@@ -92,6 +92,7 @@ public sealed class UserSettingsTests : IDisposable
     [InlineData("display.window", "huge", "--window")]
     [InlineData("generator.quality", "ultra", "")]
     [InlineData("display.fullscreen", "maybe", "display.fullscreen")]
+    [InlineData("generator.shotChangeDetection", "nonsense", "'--scd' expects on or off")]
     public void Set_checks_a_value_as_the_command_line_does_and_leaves_the_file_alone(string key, string value, string message)
     {
         Assert.Equal(0, Run("settings", "set", "capture.mode", "1440p60-hdr", "--settings", FilePath).Exit);
@@ -240,6 +241,92 @@ public sealed class UserSettingsTests : IDisposable
         Assert.Contains("--no-quality-switch", help, StringComparison.Ordinal);
         Assert.Contains("generator.qualitySwitch", help, StringComparison.Ordinal);
         Assert.Contains(" Q ", help, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>--scd on|off</c> (VFG's automatic shot-change detection) on both commands, off by default for a capture (a game's
+    /// fast motion is what it takes for a cut) and on for a file; <c>generator.shotChangeDetection</c> saves it.
+    /// </summary>
+    [Fact]
+    public void Shot_change_detection_is_an_option_of_both_commands_and_a_saved_setting()
+    {
+        // The two defaults, both values, the option's other spellings and a bad value.
+        Assert.False(CaptureOptions.ShotChangeDetectionDefault);
+        Assert.True(PlayOptions.ShotChangeDetectionDefault);
+        Assert.False(CaptureOptions.Parse([]).ShotChangeDetection);
+        Assert.True(PlayOptions.Parse(["clip.mkv"]).ShotChangeDetection);
+        Assert.True(CaptureOptions.Parse(["--scd", "on"]).ShotChangeDetection);
+        Assert.False(CaptureOptions.Parse(["--scd", "off"]).ShotChangeDetection);
+        Assert.True(CaptureOptions.Parse(["--scd=ON"]).ShotChangeDetection);
+        Assert.False(PlayOptions.Parse(["clip.mkv", "--scd", "off"]).ShotChangeDetection);
+        Assert.True(PlayOptions.Parse(["clip.mkv", "--scd", "on"]).ShotChangeDetection);
+        Assert.False(PlayOptions.Parse(["clip.mkv", "--scd", "false"]).ShotChangeDetection);
+        Assert.Contains("'--scd' expects on or off, got 'sometimes'", Assert.Throws<UsageException>(() => CaptureOptions.Parse(["--scd", "sometimes"])).Message, StringComparison.Ordinal);
+        Assert.Contains("'--scd' expects on or off", Assert.Throws<UsageException>(() => PlayOptions.Parse(["clip.mkv", "--scd", "maybe"])).Message, StringComparison.Ordinal);
+        Assert.Throws<UsageException>(() => CaptureOptions.Parse(["--scd"]));
+
+        // The gate is the milestone run as it was measured (detection on): --scd is refused with it, like --quality.
+        Assert.True(PlayOptions.Parse(["clip.mkv", "--gate"]).ShotChangeDetection);
+        Assert.Contains("--scd", Assert.Throws<UsageException>(() => PlayOptions.Parse(["clip.mkv", "--gate", "--scd", "off"])).Message, StringComparison.Ordinal);
+
+        // Saved: checked as --scd is, kept in the option's words, applied to both commands unless --scd is typed.
+        Assert.Equal(0, Run("settings", "set", "generator.shotChangeDetection", "TRUE", "--settings", FilePath).Exit);
+        Assert.Contains("\"shotChangeDetection\": \"on\"", File.ReadAllText(FilePath), StringComparison.Ordinal);
+        var loaded = UserSettings.Load(FilePath, mustExist: true);
+        Assert.Equal("on", loaded.Settings.Generator.ShotChangeDetection);
+        var applied = UserSettings.Apply(SettingsTarget.Capture, [], loaded);
+        Assert.True(CaptureOptions.Parse(applied.Args).ShotChangeDetection);
+        Assert.Contains("generator.shotChangeDetection=on", applied.Applied);
+        Assert.Contains("generator.shotChangeDetection=on", UserSettings.Describe(loaded, applied), StringComparison.Ordinal);
+        applied = UserSettings.Apply(SettingsTarget.Capture, ["--scd", "off"], loaded);
+        Assert.False(CaptureOptions.Parse(applied.Args).ShotChangeDetection);
+        Assert.Contains(applied.Overridden, o => o.StartsWith("generator.shotChangeDetection (--scd given", StringComparison.Ordinal));
+
+        Assert.Equal(0, Run("settings", "set", "generator.shotChangeDetection", "off", "--settings", FilePath).Exit);
+        loaded = UserSettings.Load(FilePath, mustExist: true);
+        Assert.Equal("off", loaded.Values["generator.shotChangeDetection"]);
+        Assert.False(PlayOptions.Parse(UserSettings.Apply(SettingsTarget.Play, ["clip.mkv"], loaded).Args).ShotChangeDetection);
+        Assert.True(PlayOptions.Parse(UserSettings.Apply(SettingsTarget.Play, ["clip.mkv", "--scd=on"], loaded).Args).ShotChangeDetection);
+        Assert.False(CaptureOptions.Parse(UserSettings.Apply(SettingsTarget.Capture, [], loaded).Args).ShotChangeDetection);
+
+        // --gate keeps its own (VFG Medium 2x as measured): the saved value is reported unused.
+        var gate = UserSettings.Apply(SettingsTarget.Play, ["clip.mkv", "--gate"], loaded);
+        Assert.True(PlayOptions.Parse(gate.Args).ShotChangeDetection);
+        Assert.Contains(gate.Overridden, o => o.StartsWith("generator.shotChangeDetection (--gate", StringComparison.Ordinal));
+
+        // A bad value is refused and the file left alone; a hand-edited one is checked at load.
+        Assert.Equal(CommandDispatcher.ExitUsage, Run("settings", "set", "generator.shotChangeDetection", "nonsense", "--settings", FilePath).Exit);
+        Assert.Equal("off", UserSettings.Load(FilePath, mustExist: true).Settings.Generator.ShotChangeDetection);
+        var bad = Run("capture", "--settings", Write("""{ "generator": { "shotChangeDetection": "sometimes" } }"""));
+        Assert.Equal(CommandDispatcher.ExitUsage, bad.Exit);
+        Assert.Contains("generator.shotChangeDetection: Option '--scd' expects on or off", bad.Err, StringComparison.Ordinal);
+        Assert.Matches(@"generator\.shotChangeDetection\s+off\s+from the file", Run("settings", "show", "--settings", FilePath).Out);
+        Assert.Matches(@"generator\.shotChangeDetection\s+\(capture: off, play: on\)\s+default", Run("settings", "show", "--settings", Write("{}")).Out);
+
+        // The help names the option for both commands, the defaults and the key.
+        var help = Run("--help").Out;
+        Assert.Contains("--scd <on|off>            VFG's automatic shot-change detection. On,", help, StringComparison.Ordinal);
+        Assert.Contains("(play: on; capture: off)", help, StringComparison.Ordinal);
+        Assert.Contains("--latch-ms, --scd, --late-generated-ms", help, StringComparison.Ordinal);
+        Assert.Contains("generator.shotChangeDetection (--scd: on or off)", help, StringComparison.Ordinal);
+    }
+
+    /// <summary>The start-up line says whether VFG's shot-change detection is on, and names each command's default.</summary>
+    [Fact]
+    public void The_start_up_line_says_how_shot_change_detection_is_set()
+    {
+        var captureOff = PlayPrinter.DescribeShotChangeDetection(on: false, capture: true);
+        var captureOn = PlayPrinter.DescribeShotChangeDetection(on: true, capture: true);
+        var playOn = PlayPrinter.DescribeShotChangeDetection(on: true, capture: false);
+        var playOff = PlayPrinter.DescribeShotChangeDetection(on: false, capture: false);
+        Assert.StartsWith("automatic shot-change detection off (--scd off, a capture's default:", captureOff, StringComparison.Ordinal);
+        Assert.Contains("a real cut shows one morphed frame", captureOff, StringComparison.Ordinal);
+        Assert.StartsWith("automatic shot-change detection on (--scd on:", captureOn, StringComparison.Ordinal);
+        Assert.Contains("--scd off keeps generating", captureOn, StringComparison.Ordinal);
+        Assert.StartsWith("automatic shot-change detection on (--scd on, play's default:", playOn, StringComparison.Ordinal);
+        Assert.StartsWith("automatic shot-change detection off (--scd off:", playOff, StringComparison.Ordinal);
+        Assert.DoesNotContain("default", playOff, StringComparison.Ordinal);
+        Assert.DoesNotContain("default", captureOn, StringComparison.Ordinal);
     }
 
     [Fact]

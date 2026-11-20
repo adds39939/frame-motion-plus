@@ -108,15 +108,28 @@ public sealed class CliTests : IDisposable
         Assert.True(lines.Length > 100, $"{lines.Length} CSV lines");
     }
 
-    [Fact]
+    /// <summary>VFG with shot-change detection at play's default (on) and off (<c>--scd off</c>): the start-up line says which.</summary>
+    [Theory]
     [Trait(Category.Name, Category.Vfx)]
-    public void A_short_offscreen_vfg_run_passes()
+    [InlineData(null)]
+    [InlineData("off")]
+    public void A_short_offscreen_vfg_run_passes(string? scd)
     {
         Hardware.RequireVfx();
-        var (exit, output, err) = Run("play", Clips.Get("c60"), "--offscreen", "--generator", "vfg", "--duration-s", "1.5", "--warmup-s", "0.3", "--loop");
+        string[] args = ["play", Clips.Get("c60"), "--offscreen", "--generator", "vfg", "--duration-s", "1.5", "--warmup-s", "0.3", "--loop", "--no-settings"];
+        var (exit, output, err) = Run(scd is null ? args : [.. args, "--scd", scd]);
         Assert.True(exit == CommandDispatcher.ExitOk, output + err);
         Assert.Contains("VFG Medium", output, StringComparison.Ordinal);
         Assert.Contains("verdict     PASS", output, StringComparison.Ordinal);
+        Assert.Contains(scd is null ? "automatic shot-change detection on (--scd on, play's default:" : "automatic shot-change detection off (--scd off:", output, StringComparison.Ordinal);
+        if (scd is null)
+        {
+            Assert.Contains("its Enqueue blocks for the generation", output, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.DoesNotContain("its Enqueue blocks for the generation", output, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -309,23 +322,27 @@ public sealed class CliTests : IDisposable
     [Trait(Category.Name, Category.Gpu)]
     [InlineData("blend")]
     [InlineData("vfg")]
+    [InlineData("vfg-scd-off")]
     public async Task A_gpu_wait_that_never_completes_still_ends_fmp_play_with_its_summary(string generator)
     {
+        // vfg-scd-off: VFG without shot-change detection, whose call only enqueues: the generator thread is not stuck in the
+        // SDK, the stream is; the stall check must catch that as well.
         if (!OperatingSystem.IsLinux())
         {
             Assert.Skip("the fault is injected through the Linux pipeline");
         }
 
         Hardware.RequireGpu();
-        if (generator == "vfg")
+        if (generator.StartsWith("vfg", StringComparison.Ordinal))
         {
             Hardware.RequireVfx();
         }
 
         var environment = new Dictionary<string, string> { ["FMP_PLAY_FAULT"] = "gpu-wait@40" };
         var watch = Stopwatch.StartNew();
+        string[] chosen = generator == "vfg-scd-off" ? ["--generator", "vfg", "--scd", "off"] : ["--generator", generator];
         var (exit, output, err) = await RunOutOfProcess(environment, null, 90,
-            "play", Clips.Get("c60-long"), "--offscreen", "--realtime", "--duration-s", "60", "--warmup-s", "0.5", "--generator", generator);
+            ["play", Clips.Get("c60-long"), "--offscreen", "--realtime", "--duration-s", "60", "--warmup-s", "0.5", .. chosen]);
         Log.WriteLine($"ended after {watch.Elapsed.TotalSeconds:0.0} s");
         Assert.Equal(CommandDispatcher.ExitCheckFailed, exit);
         Assert.Contains("teardown    ABANDONED", output, StringComparison.Ordinal);

@@ -38,6 +38,15 @@ internal sealed record PlayOptions
     /// <summary>VFG: load the other quality too at start, so Q switches live (<c>--quality-switch</c> / <c>--no-quality-switch</c>).</summary>
     public bool QualitySwitch { get; init; } = QualitySwitchDefault;
 
+    /// <summary>
+    /// File playback's default for <c>--scd</c>: on. Films cut often, and VFG's detection shows each cut as a real frame;
+    /// a capture's default is off (<see cref="Capture.CaptureOptions.ShotChangeDetectionDefault"/>).
+    /// </summary>
+    public const bool ShotChangeDetectionDefault = true;
+
+    /// <summary>VFG's automatic shot-change detection (<c>--scd on|off</c>): off keeps generated frames through fast motion.</summary>
+    public bool ShotChangeDetection { get; init; } = ShotChangeDetectionDefault;
+
     public int Multiplier { get; init; } = 2;
 
     /// <summary>Asked for as an output rate (Hz) instead of a multiplier: the multiplier is this over the file's rate.</summary>
@@ -116,6 +125,7 @@ internal sealed record PlayOptions
             Generator = ParseGenerator(r.String("generator")),
             Quality = r.String("quality") is { } quality ? Vfg.VfgBenchOptions.ParseMode(quality) : FrameGenQuality.Medium,
             QualitySwitch = ParseQualitySwitch(r),
+            ShotChangeDetection = r.String("scd") is { } scd ? Vfg.VfgBenchOptions.ParseOnOff(scd, "scd") : ShotChangeDetectionDefault,
             Multiplier = (int)r.Int64("multiplier", 2, 1, 8),
             OutputHz = r.Has("output-hz") ? r.Double("output-hz", 0, 1, 1000) : null,
             Loop = r.Flag("loop"),
@@ -176,9 +186,10 @@ internal sealed record PlayOptions
 
             if (o.Generator is not (GeneratorChoice.Auto or GeneratorChoice.Vfg)
                 || args.Any(static a => a.StartsWith("--quality", StringComparison.Ordinal) || a.StartsWith("--multiplier", StringComparison.Ordinal)
-                    || a.StartsWith("--output-hz", StringComparison.Ordinal) || a.StartsWith("--frames", StringComparison.Ordinal)))
+                    || a.StartsWith("--output-hz", StringComparison.Ordinal) || a.StartsWith("--frames", StringComparison.Ordinal)
+                    || a.StartsWith("--scd", StringComparison.Ordinal)))
             {
-                throw new UsageException("'--gate' runs exactly VFG Medium at 2x, looped, for 10 minutes: no --generator, --quality, --multiplier, --output-hz or --frames.");
+                throw new UsageException("'--gate' runs exactly VFG Medium at 2x, looped, for 10 minutes: no --generator, --quality, --multiplier, --output-hz, --scd or --frames.");
             }
 
             o = o with

@@ -26,7 +26,7 @@ internal static class PlayPrinter
         {
             o.WriteLine(string.Create(Ic,
                 $"              {s.VfxSdk}; loaded in {load.LoadNs / 1e6:0.0} ms, warmed up in {load.WarmupNs / 1e6:0.0} ms, {load.DeviceBytes / 1048576.0:0} MiB; " +
-                $"automatic shot-change detection on; output written straight into the ring slots"));
+                $"{DescribeShotChangeDetection(playback.ShotChangeDetection, capture: false)}; output written straight into the ring slots"));
         }
 
         PrintQualitySetup(o, s, playback);
@@ -46,6 +46,16 @@ internal static class PlayPrinter
             $"warm-up {playback.WarmupNs / 1e9:0.#} s{(playback.DurationNs > 0 ? $", duration {playback.DurationNs / 1e9:0.###} s" : "")}" +
             $"{(playback.MaxSlots > 0 ? $", {playback.MaxSlots} slots" : "")}"));
     }
+
+    /// <summary>
+    /// The start-up line's account of VFG's automatic shot-change detection (<c>--scd</c>) as the run has it, naming the
+    /// command's default (capture off, play on) when it is that.
+    /// </summary>
+    internal static string DescribeShotChangeDetection(bool on, bool capture) => on
+        ? $"automatic shot-change detection on (--scd on{(capture ? "" : ", play's default")}: what it takes for a cut, fast motion too, " +
+          "shows a real frame instead of a generated one; --scd off keeps generating)"
+        : $"automatic shot-change detection off (--scd off{(capture ? ", a capture's default" : "")}: every pair is interpolated, " +
+          "fast motion too; a real cut shows one morphed frame)";
 
     /// <summary>"PQ (SMPTE ST 2084), BT.2020 primaries, limited range, 10-bit, BT.2020 matrix; mastering ...": the file's signal.</summary>
     private static string DescribeFileSignal(Sources.File.FileStreamInfo info)
